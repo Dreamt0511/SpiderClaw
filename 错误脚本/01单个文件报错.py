@@ -20,6 +20,7 @@ def parse_config(config_dict, key):
 PASS = 0
 FAIL = 0
 
+if:
 
 def test(name, func, *args, **kwargs):
     global PASS, FAIL
@@ -33,7 +34,6 @@ def test(name, func, *args, **kwargs):
         FAIL += 1
     finally:
         print(f"{name} {PASS}/{FAIL}")
-
 
 test("divide_normal", divide, 10, 2, expected=5.0)
 test("divide_by_zero", divide, 10, 0)
