@@ -20,7 +20,6 @@ def parse_config(config_dict, key):
 PASS = 0
 FAIL = 0
 
-if:
 
 def test(name, func, *args, **kwargs):
     global PASS, FAIL
@@ -52,3 +51,4 @@ sys.exit(FAIL)
 
 
 hdhd =
+
