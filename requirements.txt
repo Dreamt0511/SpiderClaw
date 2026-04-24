@@ -33,3 +33,5 @@ tiktoken>=0.12,<1.0
 regex>=2024.0
 orjson>=3.11,<4.0
 aiofiles>=25.1,<26.0
+structlog>=24.4,<25.0
+python-jose[cryptography]>=3.3,<4.0
