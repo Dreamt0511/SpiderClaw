@@ -45,5 +45,5 @@ test("get_item_oob", get_item, [1, 2, 3], 10)
 test("config_exists", parse_config, {"host": "localhost"}, "host", expected="localhost")
 test("config_missing", parse_config, {}, "port")
 
-# 输出测试结果
+
 sys.exit(FAIL)
