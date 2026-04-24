@@ -31,6 +31,8 @@ def test(name, func, *args, **kwargs):
         PASS += 1
     except Exception:
         FAIL += 1
+    finally:
+        print(f"{name} {PASS}/{FAIL}")
 
 
 test("divide_normal", divide, 10, 2, expected=5.0)
