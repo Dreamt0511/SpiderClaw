@@ -22,8 +22,9 @@ class RepairState(TypedDict):
 
     # 修复阶段
     fix_description: str  # 修复方案描述
-    modified_files: Annotated[List[str], operator.add]  # 修改的文件路径列表，支持追加
+    modified_files: List[str]  # 修改的文件路径列表（节点返回时直接替换，不追加）
     code_changes: Dict[str, str]  # 代码变更内容，key为文件路径，value为修改后的完整内容
+    original_codes: Dict[str, str]  # 原始代码，key为文件路径，value为修复前的原始内容
     diff_content: str  # 修复的diff内容
 
     # 审查阶段
@@ -44,6 +45,6 @@ class RepairState(TypedDict):
     error_message: str  # 流程失败时的错误信息
 
     # 流程控制字段
-    retry_count: Annotated[int, operator.add]  # 修复重试次数，默认0
+    retry_count: int  # 修复重试次数，默认0（不使用operator.add，节点返回直接替换）
     max_retries: int  # 最大重试次数，默认3
 

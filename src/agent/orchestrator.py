@@ -532,6 +532,7 @@ SyntaxError: {e.msg}
 
             # 先读取所有需要修改文件的原始内容
             from src.agent.tools.langchain_tools import read_file, write_file, get_diff
+            import difflib
             original_codes = {}
             for file_path in fix_result["code_changes"].keys():
                 try:
@@ -540,6 +541,42 @@ SyntaxError: {e.msg}
                         original_codes[file_path] = original_content
                 except Exception as e:
                     logger.warning(f"读取原始文件 {file_path} 失败: {str(e)}")
+
+            # 验证修复是否真的修改了代码
+            logger.info("=== 代码变更验证 ===")
+            for file_path in fix_result["code_changes"].keys():
+                original = original_codes.get(file_path, "")
+                fixed = fix_result["code_changes"].get(file_path, "")
+                original_len = len(original)
+                fixed_len = len(fixed)
+                is_identical = (original == fixed)
+                logger.info(f"文件 {file_path}: 原始={original_len}字符, 修复={fixed_len}字符, 完全相同={is_identical}")
+                if not is_identical:
+                    # 显示实际差异（前后各50字符）
+                    diff = difflib.unified_diff(
+                        original.splitlines(True), fixed.splitlines(True),
+                        fromfile=f"原始/{file_path}", tofile=f"修复/{file_path}",
+                        n=2
+                    )
+                    diff_text = "".join(diff)
+                    logger.info(f"文件 {file_path} 的差异:\n{diff_text[:1000]}")
+
+            # 检查是否所有修复文件都没有变化
+            unchanged_files = [
+                fp for fp in fix_result["code_changes"].keys()
+                if original_codes.get(fp, "") == fix_result["code_changes"].get(fp, "")
+            ]
+            if unchanged_files and len(unchanged_files) == len(fix_result["code_changes"]):
+                logger.error(f"修复Agent返回的代码与原始代码完全一致，没有实际修改！文件: {unchanged_files}")
+                # 直接让审查阶段处理（auto_compare_codes会检测到并拒绝）
+                # 但为了更好的错误信息，修改fix_description
+                fix_result["fix_description"] = f"WARNING: 所有修复文件代码与原始代码完全一致，没有实际修改"
+                error_details = []
+                for err in state.get("error_locations", []):
+                    error_details.append(
+                        f"  {err.get('file_path','?')}:{err.get('line_number','?')} {err.get('error_type','?')}: {err.get('error_message','?')[:100]}"
+                    )
+                logger.error(f"检测到的原始错误:\n" + "\n".join(error_details))
 
             # 应用修复到本地仓库
             for file_path, content in fix_result["code_changes"].items():
@@ -852,6 +889,7 @@ SyntaxError: {e.msg}
                 "fix_description": "",
                 "modified_files": [],
                 "code_changes": {},
+                "original_codes": {},
                 "diff_content": "",
                 "review_passed": False,
                 "review_comments": "",
@@ -907,6 +945,7 @@ SyntaxError: {e.msg}
                 "fix_description": "",
                 "modified_files": [],
                 "code_changes": {},
+                "original_codes": {},
                 "diff_content": "",
                 "review_passed": False,
                 "review_comments": "",

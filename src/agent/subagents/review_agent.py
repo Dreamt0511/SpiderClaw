@@ -2,6 +2,7 @@
 
 from typing import Dict, Any, List
 import logging
+import difflib
 import re
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_openai import ChatOpenAI
@@ -116,6 +117,54 @@ class ReviewAgent:
             "dangerous_operations": dangerous_operations,
         }
 
+    def _auto_compare_codes(
+        self, original_codes: Dict[str, str], code_changes: Dict[str, str], modified_files: List[str]
+    ) -> Dict[str, Any]:
+        """
+        自动对比原始代码和修复后代码，独立于LLM判断
+
+        Returns:
+            Dict: 包含每文件的对比结果和总体判断
+        """
+
+        all_identical = True
+        changed_files_count = 0
+        comparison_details = []
+
+        for file_path in modified_files:
+            original = original_codes.get(file_path, "")
+            fixed = code_changes.get(file_path, "")
+
+            if original == fixed:
+                comparison_details.append({
+                    "file_path": file_path,
+                    "changed": False,
+                    "reason": "代码完全相同"
+                })
+            else:
+                all_identical = False
+                changed_files_count += 1
+
+                # 计算差异行数
+                diff_lines = list(difflib.unified_diff(
+                    original.splitlines(), fixed.splitlines(),
+                    n=0
+                ))
+                added = sum(1 for l in diff_lines if l.startswith('+') and not l.startswith('+++'))
+                removed = sum(1 for l in diff_lines if l.startswith('-') and not l.startswith('---'))
+                comparison_details.append({
+                    "file_path": file_path,
+                    "changed": True,
+                    "added_lines": added,
+                    "removed_lines": removed,
+                })
+
+        return {
+            "all_identical": all_identical,
+            "changed_files_count": changed_files_count,
+            "details": comparison_details
+        }
+
     async def review_changes(
         self,
         error_locations: List[Dict],
@@ -185,7 +234,28 @@ class ReviewAgent:
                     except Exception as e:
                         original_codes[file_path] = f"读取原始文件失败: {str(e)}"
 
-            # 构建代码对比部分
+            # 3. 自动化代码对比（独立于LLM，确保基本正确性）
+            auto_result = self._auto_compare_codes(original_codes, code_changes, modified_files)
+            logger.info(f"自动代码对比结果: 完全相同={auto_result['all_identical']}, "
+                        f"已修改文件数={auto_result['changed_files_count']}/{len(modified_files)}")
+            for detail in auto_result["details"]:
+                if detail["changed"]:
+                    logger.info(f"  ✓ {detail['file_path']}: 修改了 {detail.get('added_lines',0)} 行增加, "
+                                f"{detail.get('removed_lines',0)} 行删除")
+                else:
+                    logger.warning(f"  ✗ {detail['file_path']}: 未修改 (代码完全相同)")
+
+            # 如果代码完全相同，自动拒绝，不需要调用LLM
+            if auto_result["all_identical"]:
+                logger.warning("自动对比发现所有文件代码完全相同，拒绝通过审查")
+                return {
+                    "review_passed": False,
+                    "review_comments": "修复后的代码与原始代码完全相同，没有做任何有效修改。请实际修改代码中的错误行。",
+                    "change_lines": static_result["change_lines"],
+                    "risk_warnings": static_result["risk_warnings"] + ["所有文件代码完全相同，未做任何有效修改"],
+                }
+
+            # 4. 构建代码对比部分
             code_comparison_sections = []
             for file_path in modified_files:
                 code_comparison_sections.append(f"\n## 原始代码 - {file_path}")
@@ -197,6 +267,14 @@ class ReviewAgent:
                 code_comparison_sections.append("```python")
                 code_comparison_sections.append(code_changes.get(file_path, "无修复代码"))
                 code_comparison_sections.append("```")
+
+                # 添加差异摘要
+                if not auto_result["all_identical"]:
+                    for detail in auto_result["details"]:
+                        if detail["file_path"] == file_path and detail["changed"]:
+                            code_comparison_sections.append(
+                                f"\n> 差异：{detail.get('added_lines', 0)} 行增加, {detail.get('removed_lines', 0)} 行删除"
+                            )
             code_comparison_section = "\n".join(code_comparison_sections)
 
             # 构建静态警告部分
@@ -217,6 +295,10 @@ class ReviewAgent:
                 fix_description=fix_description,
                 static_warnings_section=static_warnings_section
             )
+
+            # 诊断日志：记录发送给LLM的完整对比内容
+            logger.info(f"发送给审查LLM的用户输入前500字符:\n{user_input[:500]}...")
+            logger.info(f"对比部分前1000字符:\n{code_comparison_section[:1000]}...")
 
             # 直接调用LLM，不使用Agent框架，避免工具调用
             messages = [
@@ -250,8 +332,16 @@ class ReviewAgent:
             review_result["risk_warnings"].extend(static_result["risk_warnings"])
 
             # 最终review_passed由LLM判断，静态警告不强制拦截
-            review_result["review_passed"] = bool(review_result.get("review_passed", False))
+            llm_passed = bool(review_result.get("review_passed", False))
 
+            # 关键逻辑：如果LLM说未通过但自动对比确认代码已修改，记录警告但仍然信任LLM
+            if not llm_passed and not auto_result["all_identical"]:
+                logger.warning(
+                    f"LLM审查未通过，但自动对比确认代码已修改 "
+                    f"({auto_result['changed_files_count']}/{len(modified_files)} 文件已修改)"
+                )
+
+            review_result["review_passed"] = llm_passed
             logger.info(f"审查完成. 通过: {review_result['review_passed']}")
             return review_result
 

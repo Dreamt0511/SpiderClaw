@@ -741,7 +741,9 @@ def create_pull_request(
         from github import Github, GithubException
         logger.info(f"创建PR: {repo_full_name} {head_branch} → {base_branch}")
 
-        g = Github(github_token)
+        # 遵循SSL_VERIFY环境变量（与download_ci_logs保持一致）
+        verify_ssl = os.getenv("SSL_VERIFY", "true").lower() != "false"
+        g = Github(github_token, verify=verify_ssl)
         repo = g.get_repo(repo_full_name)
 
         pr = repo.create_pull(
