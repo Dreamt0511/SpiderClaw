@@ -1,0 +1,47 @@
+# SpiderClaw 配置文件示例
+# 复制此文件为 config/agent-config.yaml 并根据实际情况修改
+
+# Webhook服务配置
+webhook:
+  secret: "your-github-webhook-secret-here"  # GitHub Webhook密钥
+  host: "0.0.0.0"                            # 监听地址
+  port: 8000                                 # 监听端口
+  reload: false                              # 开发环境热重载
+  allowed_events:                            # 允许的GitHub事件类型
+    - "workflow_run"
+    - "pull_request"
+    - "check_run"
+  event_queue_maxsize: 1000                  # 事件队列最大容量
+  max_processed_ids: 10000                   # 已处理事件ID最大保存数量
+
+# Agent配置
+agent:
+  enabled: true                              # 是否启用自动修复功能
+  max_retries: 3                              # 最大修复重试次数
+  max_change_lines: 20                        # 最大允许变更行数
+  auto_create_pr: true                        # 是否自动创建PR
+  require_human_approval: false               # 创建PR前是否需要人工审批
+
+# GitHub配置
+github:
+  token: "your-github-personal-access-token"  # GitHub个人访问令牌，需要repo权限
+  api_url: "https://api.github.com"           # GitHub API地址
+  default_branch: "main"                      # 默认分支名称
+
+# OpenAI配置
+openai:
+  api_key: "your-openai-api-key"              # OpenAI API密钥
+  base_url: "https://api.openai.com/v1"        # API基础地址（可修改为兼容OpenAI API的其他服务）
+  model_name: "gpt-4o"                         # LLM模型名称（如gpt-4o、gpt-3.5-turbo、claude-3-opus等）
+  timeout: 60                                  # API请求超时时间（秒）
+
+# 日志配置
+logging:
+  level: "INFO"                               # 日志级别：DEBUG/INFO/WARNING/ERROR
+  dir: "logs"                                  # 日志目录
+  retention_days: 30                           # 日志保留天数
+  json_format: true                            # 是否使用JSON格式输出
+
+# 环境配置
+environment: "development"                    # 运行环境：development/production
+debug: false                                  # 是否开启调试模式

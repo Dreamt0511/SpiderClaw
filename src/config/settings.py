@@ -20,6 +20,7 @@ class WebhookConfig(BaseModel):
     event_queue_maxsize: int = Field(default=1000, description="事件队列最大容量")
     max_processed_ids: int = Field(default=10000, description="最大保存的已处理事件ID数量")
     shutdown_timeout: int = Field(default=30, description="优雅关闭超时时间（秒）")
+    ssl_verify: bool = Field(default=True, description="是否验证SSL证书")
 
 
 class LoggingConfig(BaseModel):
@@ -28,6 +29,30 @@ class LoggingConfig(BaseModel):
     dir: str = Field(default="logs", description="日志目录")
     retention_days: int = Field(default=30, description="日志保留天数")
     json_format: bool = Field(default=True, description="是否使用JSON格式输出")
+
+
+class AgentConfig(BaseModel):
+    """Agent配置"""
+    enabled: bool = Field(default=False, description="是否启用自动修复功能")
+    max_retries: int = Field(default=3, description="最大修复重试次数")
+    max_change_lines: int = Field(default=20, description="最大允许变更行数")
+    auto_create_pr: bool = Field(default=True, description="是否自动创建PR")
+    require_human_approval: bool = Field(default=False, description="创建PR前是否需要人工审批")
+
+
+class GitHubConfig(BaseModel):
+    """GitHub配置"""
+    token: str = Field(default="", description="GitHub访问令牌")
+    api_url: str = Field(default="https://api.github.com", description="GitHub API地址")
+    default_branch: str = Field(default="main", description="默认分支名称")
+
+
+class OpenAIConfig(BaseModel):
+    """OpenAI配置"""
+    api_key: str = Field(default="", description="OpenAI API密钥")
+    base_url: str = Field(default="https://api.openai.com/v1", description="API基础地址")
+    model_name: str = Field(default="gpt-4o", description="LLM模型名称")
+    timeout: int = Field(default=60, description="API请求超时时间（秒）")
 
 
 class Settings(BaseSettings):
@@ -43,6 +68,15 @@ class Settings(BaseSettings):
 
     # 日志配置
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+
+    # Agent配置
+    agent: AgentConfig = Field(default_factory=AgentConfig)
+
+    # GitHub配置
+    github: GitHubConfig = Field(default_factory=GitHubConfig)
+
+    # OpenAI配置
+    openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
 
     # 环境
     environment: str = Field(default="development", description="运行环境")
@@ -69,6 +103,17 @@ class Settings(BaseSettings):
         try:
             with open(config_path, "r", encoding="utf-8") as f:
                 config_data = yaml.safe_load(f) or {}
+
+            # 向后兼容：如果agent段有llm_model，自动迁移到openai段的model_name
+            if "agent" in config_data and "llm_model" in config_data["agent"]:
+                if "openai" not in config_data:
+                    config_data["openai"] = {}
+                # 只有当openai中没有model_name时才迁移，避免覆盖
+                if "model_name" not in config_data["openai"]:
+                    config_data["openai"]["model_name"] = config_data["agent"]["llm_model"]
+                # 移除旧的配置项
+                del config_data["agent"]["llm_model"]
+
             return cls(**config_data)
         except Exception as e:
             raise RuntimeError(f"Failed to load config file: {e}") from e

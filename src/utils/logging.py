@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 import structlog
 from structlog.types import Processor
+import json
 
 
 def setup_logging(
@@ -55,7 +56,9 @@ def setup_logging(
 
     # 根据格式选择渲染器
     if json_format:
-        processors.append(structlog.processors.JSONRenderer())
+        processors.append(structlog.processors.JSONRenderer(
+            serializer=lambda obj, **kwargs: json.dumps(obj, ensure_ascii=False, **kwargs)
+        ))
     else:
         processors.append(structlog.dev.ConsoleRenderer())
 

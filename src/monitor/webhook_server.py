@@ -145,6 +145,31 @@ class GitHubWebhookMonitor(BaseMonitor):
                 logger.error(f"Failed to convert event: {e}", exc_info=True)
                 raise HTTPException(status_code=400, detail="Failed to process event")
 
+            # 事件过滤：只处理需要触发修复的事件
+            if event_type == "pull_request":
+                # 只处理 PR opened 和 synchronize 事件，用于获取PR信息
+                # 其他动作（closed、reopened等）忽略
+                allowed_pr_actions = ["opened", "synchronize"]
+                if event.action not in allowed_pr_actions:
+                    logger.info(f"Ignoring pull_request event: {event_id}, action: {event.action}")
+                    return {"status": "ignored", "reason": f"pull_request action '{event.action}' does not trigger repair"}
+                # PR事件不需要检查conclusion，保留用于获取PR编号和分支信息
+                logger.info(f"Accepted pull_request event: {event_id}, action: {event.action}, pr_number: {event.pr_number}")
+
+            elif event_type == "workflow_run":
+                # workflow_run 事件只处理 failure
+                if event.conclusion != "failure":
+                    logger.info(f"Ignoring workflow_run event: {event_id}, conclusion: {event.conclusion}")
+                    return {"status": "ignored", "reason": f"workflow_run conclusion '{event.conclusion}' is not failure"}
+                logger.info(f"Accepted workflow_run event: {event_id}, conclusion: {event.conclusion}")
+
+            elif event_type == "check_run":
+                # check_run 事件只处理 failure
+                if event.conclusion != "failure":
+                    logger.info(f"Ignoring check_run event: {event_id}, conclusion: {event.conclusion}")
+                    return {"status": "ignored", "reason": f"check_run conclusion '{event.conclusion}' is not failure"}
+                logger.info(f"Accepted check_run event: {event_id}, conclusion: {event.conclusion}")
+
             # 发布事件到总线
             publish_success = await self.publish_event(event)
             if not publish_success:
@@ -224,7 +249,12 @@ class GitHubWebhookMonitor(BaseMonitor):
             check_run = payload.get("check_run", {})
             event.branch = check_run.get("check_suite", {}).get("head_branch", "")
             event.conclusion = check_run.get("conclusion", "")
-            event.logs_url = check_run.get("details_url", "")
+            # 构造job日志的API URL，而不是网页URL
+            job_id = check_run.get("id", "")
+            if job_id and repository:
+                event.logs_url = f"https://api.github.com/repos/{repository}/actions/jobs/{job_id}/logs"
+            else:
+                event.logs_url = check_run.get("details_url", "")
             prs = check_run.get("pull_requests", [])
             if prs:
                 event.pr_number = prs[0].get("number")

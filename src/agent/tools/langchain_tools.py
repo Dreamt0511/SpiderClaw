@@ -1,0 +1,687 @@
+"""LangChain标准工具定义"""
+import os
+import tempfile
+import subprocess
+import re
+from typing import Optional, List, Dict, Any
+from langchain_core.tools import tool
+from git import Repo, GitCommandError
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import urllib3
+import zipfile
+import logging
+
+# 禁用SSL警告
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+logger = logging.getLogger(__name__)
+
+# 全局状态，用于在工具之间共享上下文
+_tool_context: Dict[str, Any] = {}
+
+
+def set_tool_context(context: Dict[str, Any]) -> None:
+    """设置工具上下文，在工具执行前调用"""
+    global _tool_context
+    _tool_context.update(context)
+
+
+def get_tool_context() -> Dict[str, Any]:
+    """获取工具上下文"""
+    return _tool_context
+
+
+@tool
+def read_file(file_path: str) -> str:
+    """
+    读取指定文件的内容。
+
+    只能读取当前工作目录下的文件，不允许访问系统其他目录。
+
+    Args:
+        file_path: 要读取的文件路径（相对于当前仓库根目录）
+
+    Returns:
+        str: 文件内容，如果文件不存在或读取失败返回错误信息
+    """
+    repo_path = _tool_context.get("repo_path", "")
+    if not repo_path:
+        return "Error: 仓库路径未设置，请先克隆仓库"
+
+    # 防止路径穿越
+    full_path = os.path.abspath(os.path.join(repo_path, file_path))
+    if not full_path.startswith(os.path.abspath(repo_path)):
+        return f"Error: 路径 '{file_path}' 超出仓库范围，禁止访问"
+
+    if not os.path.exists(full_path) or not os.path.isfile(full_path):
+        return f"Error: 文件 '{file_path}' 不存在"
+
+    try:
+        with open(full_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except UnicodeDecodeError:
+        try:
+            with open(full_path, 'r', encoding='gbk') as f:
+                return f.read()
+        except Exception as e:
+            return f"Error: 读取文件失败: {str(e)}"
+    except Exception as e:
+        return f"Error: 读取文件失败: {str(e)}"
+
+
+@tool
+def write_file(file_path: str, content: str) -> str:
+    """
+    写入内容到指定文件。
+
+    只能写入当前工作目录下的文件，不允许访问系统其他目录。
+    如果文件已存在会被覆盖。
+
+    Args:
+        file_path: 要写入的文件路径（相对于当前仓库根目录）
+        content: 要写入的文件内容
+
+    Returns:
+        str: 操作结果，成功返回"Success"，失败返回错误信息
+    """
+    repo_path = _tool_context.get("repo_path", "")
+    if not repo_path:
+        return "Error: 仓库路径未设置，请先克隆仓库"
+
+    # 防止路径穿越
+    full_path = os.path.abspath(os.path.join(repo_path, file_path))
+    if not full_path.startswith(os.path.abspath(repo_path)):
+        return f"Error: 路径 '{file_path}' 超出仓库范围，禁止访问"
+
+    # 确保目录存在
+    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+
+    try:
+        with open(full_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return "Success"
+    except Exception as e:
+        return f"Error: 写入文件失败: {str(e)}"
+
+
+@tool
+def search_files(pattern: str, file_type: Optional[str] = None) -> List[str]:
+    """
+    搜索仓库中匹配的文件。
+
+    Args:
+        pattern: 搜索模式，支持glob语法，例如"*.py"、"src/**/*.ts"
+        file_type: 可选，文件类型过滤，例如"py"、"js"
+
+    Returns:
+        List[str]: 匹配的文件路径列表（相对于仓库根目录）
+    """
+    import glob
+
+    repo_path = _tool_context.get("repo_path", "")
+    if not repo_path:
+        return []
+
+    if file_type:
+        pattern = f"**/*.{file_type}"
+
+    search_pattern = os.path.join(repo_path, pattern)
+    matching_files = glob.glob(search_pattern, recursive=True)
+
+    # 转换为相对路径
+    relative_paths = [
+        os.path.relpath(file_path, repo_path)
+        for file_path in matching_files
+        if os.path.isfile(file_path)
+    ]
+
+    return relative_paths
+
+
+@tool
+def search_code(keyword: str, file_type: str = "py") -> List[Dict]:
+    """
+    在代码中搜索关键词。
+
+    Args:
+        keyword: 要搜索的关键词
+        file_type: 文件类型，默认为py
+
+    Returns:
+        List[Dict]: 搜索结果，每个元素包含file_path、line_number、line_content
+    """
+    results = []
+    files = search_files.invoke({"pattern": f"**/*.{file_type}"})
+
+    for file_path in files:
+        try:
+            content = read_file.invoke({"file_path": file_path})
+            if content.startswith("Error:"):
+                continue
+            lines = content.split('\n')
+            for line_num, line in enumerate(lines, 1):
+                if keyword in line:
+                    results.append({
+                        "file_path": file_path,
+                        "line_number": line_num,
+                        "line_content": line.strip()
+                    })
+        except Exception as e:
+            logger.warning(f"搜索文件 {file_path} 失败: {e}")
+            continue
+
+    return results
+
+
+@tool
+def clone_repository(clone_url: str, branch: str = "main") -> str:
+    """
+    克隆Git仓库到临时目录。
+
+    Args:
+        clone_url: 仓库的克隆URL，可以是HTTPS或SSH地址
+        branch: 要克隆的分支名称，默认为main
+
+    Returns:
+        str: 本地仓库路径，如果克隆失败返回错误信息
+    """
+    try:
+        # 创建临时目录
+        temp_dir = tempfile.mkdtemp(prefix="spiderclaw_repo_")
+        logger.info(f"克隆仓库 {clone_url} (分支: {branch}) 到 {temp_dir}")
+
+        repo = Repo.clone_from(
+            clone_url,
+            temp_dir,
+            branch=branch,
+            depth=1  # 浅克隆，加快速度
+        )
+
+        # 保存到上下文
+        _tool_context["repo_path"] = temp_dir
+        _tool_context["repo"] = repo
+
+        return temp_dir
+    except GitCommandError as e:
+        logger.error(f"克隆仓库失败: {e}")
+        return f"Error: 克隆仓库失败: {str(e)}"
+
+
+@tool
+def create_branch(branch_name: str) -> str:
+    """
+    在当前仓库创建并切换到新分支。
+
+    Args:
+        branch_name: 新分支的名称
+
+    Returns:
+        str: 操作结果，成功返回"Success"，失败返回错误信息
+    """
+    repo = _tool_context.get("repo")
+    if not repo:
+        return "Error: 仓库未初始化，请先克隆仓库"
+
+    try:
+        # 检查分支是否已存在
+        if branch_name in [h.name for h in repo.heads]:
+            logger.warning(f"分支 {branch_name} 已存在，直接切换")
+            repo.heads[branch_name].checkout()
+        else:
+            logger.info(f"创建新分支: {branch_name}")
+            new_branch = repo.create_head(branch_name)
+            new_branch.checkout()
+        return "Success"
+    except GitCommandError as e:
+        return f"Error: 创建分支失败: {str(e)}"
+
+
+@tool
+def commit_changes(message: str, author_name: str = "SpiderClaw AutoFix",
+                   author_email: str = "spiderclaw@example.com") -> str:
+    """
+    提交当前仓库的所有变更。
+
+    Args:
+        message: 提交信息
+        author_name: 提交者名称，默认为"SpiderClaw AutoFix"
+        author_email: 提交者邮箱，默认为"spiderclaw@example.com"
+
+    Returns:
+        str: 操作结果，成功返回"Success"，失败返回错误信息
+    """
+    repo = _tool_context.get("repo")
+    if not repo:
+        return "Error: 仓库未初始化，请先克隆仓库"
+
+    try:
+        # 添加所有变更
+        repo.git.add(A=True)
+
+        # 检查是否有变更需要提交
+        if repo.is_dirty(untracked_files=True):
+            logger.info(f"提交变更: {message}")
+            repo.config_writer().set_value("user", "name", author_name).release()
+            repo.config_writer().set_value("user", "email", author_email).release()
+            repo.index.commit(message)
+            return "Success"
+        else:
+            return "Warning: 没有需要提交的变更"
+    except GitCommandError as e:
+        return f"Error: 提交变更失败: {str(e)}"
+
+
+@tool
+def get_diff(base_branch: str = "main") -> str:
+    """
+    获取当前分支与基准分支的diff内容。
+
+    Args:
+        base_branch: 基准分支名称，默认为main
+
+    Returns:
+        str: diff内容，如果获取失败返回错误信息
+    """
+    repo = _tool_context.get("repo")
+    if not repo:
+        return "Error: 仓库未初始化，请先克隆仓库"
+
+    try:
+        # 确保基准分支存在
+        if base_branch not in [h.name for h in repo.heads]:
+            # 如果本地没有基准分支，从远程获取
+            repo.git.fetch("origin", base_branch)
+
+        diff = repo.git.diff(f"{base_branch}...HEAD")
+        return diff
+    except GitCommandError as e:
+        return f"Error: 获取diff失败: {str(e)}"
+
+
+@tool
+def download_ci_logs(logs_url: str) -> str:
+    """
+    下载GitHub Actions CI日志。
+
+    Args:
+        logs_url: CI日志的下载URL，支持以下格式：
+        - https://github.com/{owner}/{repo}/runs/{job_id}... (网页URL)
+        - https://api.github.com/repos/{owner}/{repo}/actions/jobs/{job_id}/logs (API URL)
+        - https://api.github.com/repos/{owner}/{repo}/actions/runs/{run_id}/logs (workflow zip URL)
+
+    Returns:
+        str: 日志内容，如果下载失败返回错误信息
+    """
+    github_token = _tool_context.get("github_token", "")
+
+    try:
+        logger.info(f"下载CI日志: {logs_url}")
+
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("https://", adapter)
+
+        # 配置SSL验证
+        session.verify = os.getenv("SSL_VERIFY", "true").lower() != "false"
+
+        if github_token:
+            session.headers.update({
+                "Authorization": f"token {github_token}",
+                "Accept": "application/vnd.github.v3+json"
+            })
+
+        # 处理不同格式的URL，转换为正确的job日志API URL
+        import re
+
+        # 匹配 GitHub 网页格式：https://github.com/{owner}/{repo}/runs/{job_id}...
+        web_pattern = r'https?://github\.com/([^/]+)/([^/]+)/runs/(\d+)'
+        web_match = re.match(web_pattern, logs_url)
+        if web_match:
+            owner, repo, job_id = web_match.groups()
+            logs_url = f"https://api.github.com/repos/{owner}/{repo}/actions/jobs/{job_id}/logs"
+            logger.info(f"转换为API URL: {logs_url}")
+
+        response = session.get(logs_url, stream=True, timeout=30)
+        response.raise_for_status()
+
+        # 创建临时目录保存日志
+        temp_dir = tempfile.mkdtemp(prefix="spiderclaw_logs_")
+
+        # 如果是zip文件，先解压
+        if "zip" in response.headers.get("content-type", "") or logs_url.endswith(".zip"):
+            zip_path = os.path.join(temp_dir, "logs.zip")
+            with open(zip_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+            # 解压zip文件
+            extract_dir = os.path.join(temp_dir, "extracted")
+            os.makedirs(extract_dir, exist_ok=True)
+            with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                zip_ref.extractall(extract_dir)
+
+            # 合并所有日志文件
+            log_content = []
+            for root, _, files in os.walk(extract_dir):
+                for file in files:
+                    if file.endswith(".txt") or file.endswith(".log"):
+                        file_path = os.path.join(root, file)
+                        try:
+                            with open(file_path, "r", encoding="utf-8") as f:
+                                log_content.append(f"=== {file} ===\n")
+                                log_content.append(f.read())
+                        except UnicodeDecodeError:
+                            try:
+                                with open(file_path, "r", encoding="gbk") as f:
+                                    log_content.append(f"=== {file} ===\n")
+                                    log_content.append(f.read())
+                            except Exception as e:
+                                logger.warning(f"读取日志文件 {file_path} 失败: {e}")
+                                continue
+
+            return "\n".join(log_content)
+        else:
+            # 直接返回文本日志
+            return response.text
+
+    except Exception as e:
+        logger.error(f"下载CI日志失败: {e}")
+        return f"Error: 下载CI日志失败: {str(e)}"
+
+
+@tool
+def parse_python_errors(log_content: str) -> List[Dict]:
+    """
+    解析Python Traceback错误信息。
+
+    Args:
+        log_content: CI日志内容
+
+    Returns:
+        List[Dict]: 错误列表，每个元素包含file_path、line_number、error_type、error_message、traceback等字段
+    """
+    errors = []
+
+    # 预处理：移除每行开头的时间戳前缀（如 2026-04-24T16:24:21.8873818Z ）
+    import re
+    timestamp_pattern = r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s+'
+    original_lines = log_content.split('\n')
+    processed_lines = []
+    for line in original_lines:
+        # 移除时间戳前缀
+        processed_line = re.sub(timestamp_pattern, '', line)
+        processed_lines.append(processed_line)
+    processed_content = '\n'.join(processed_lines)
+
+    # 匹配Traceback块
+    traceback_pattern = re.compile(
+        r'Traceback \(most recent call last\):\n'
+        r'(?:  File "([^"]+)", line (\d+)[^\n]*\n.*?\n)+?'
+        r'([^\n:]+): (.*?)\n',
+        re.DOTALL | re.MULTILINE
+    )
+
+    # 匹配简单错误行，支持多种前缀格式
+    simple_error_pattern = re.compile(
+        r'^(?:E\s+|ERROR:\s+|\[ERROR\]\s+|ERROR\s+\|\s+)?([A-Z][a-zA-Z0-9]*Error):?\s*(.*)$',
+        re.MULTILINE
+    )
+
+    # 匹配pytest失败总结行
+    pytest_failure_pattern = re.compile(
+        r'^FAILED\s+.*?::.*?\s+-\s+([A-Z][a-zA-Z0-9]*Error):?\s*(.*)$',
+        re.MULTILINE
+    )
+
+    # 匹配ERROR: 开头的非标准错误行
+    error_prefix_pattern = re.compile(
+        r'^ERROR:\s*(.*)$',
+        re.MULTILINE
+    )
+
+    # 提取所有Traceback
+    for match in traceback_pattern.finditer(processed_content):
+        full_traceback = match.group(0)
+        error_type = match.group(3)
+        error_message = match.group(4)
+
+        # 提取最准确的错误位置（Traceback的最后一个文件）
+        last_file_match = re.findall(r'File "([^"]+)", line (\d+)', full_traceback)[-1]
+        file_path, line_number = last_file_match[0], int(last_file_match[1])
+
+        errors.append({
+            "type": "traceback",
+            "file_path": file_path,
+            "line_number": line_number,
+            "error_type": error_type,
+            "error_message": error_message,
+            "traceback": full_traceback
+        })
+
+    # 提取简单错误（避免重复）
+    existing_errors = {(e["error_type"], e["error_message"]) for e in errors}
+    for match in simple_error_pattern.finditer(processed_content):
+        error_type = match.group(1)
+        error_message = match.group(2)
+
+        if (error_type, error_message) not in existing_errors:
+            existing_errors.add((error_type, error_message))
+            errors.append({
+                "type": "simple",
+                "file_path": "",
+                "line_number": 0,
+                "error_type": error_type,
+                "error_message": error_message,
+                "traceback": f"{error_type}: {error_message}"
+            })
+
+    # 提取pytest失败总结行
+    for match in pytest_failure_pattern.finditer(processed_content):
+        error_type = match.group(1)
+        error_message = match.group(2)
+
+        if (error_type, error_message) not in existing_errors:
+            existing_errors.add((error_type, error_message))
+            errors.append({
+                "type": "pytest",
+                "file_path": "",
+                "line_number": 0,
+                "error_type": error_type,
+                "error_message": error_message,
+                "traceback": f"{error_type}: {error_message}"
+            })
+
+    # 提取ERROR: 开头的错误行
+    for match in error_prefix_pattern.finditer(processed_content):
+        error_message = match.group(1).strip()
+        error_type = "UnknownError"
+
+        # 尝试从错误信息中提取具体的错误类型
+        import re
+        error_type_match = re.match(r'([A-Z][a-zA-Z0-9]*Error):', error_message)
+        if error_type_match:
+            error_type = error_type_match.group(1)
+            # 移除错误类型前缀
+            error_message = error_message[len(error_type) + 1:].strip()
+
+        if (error_type, error_message) not in existing_errors:
+            existing_errors.add((error_type, error_message))
+            errors.append({
+                "type": "simple",
+                "file_path": "",
+                "line_number": 0,
+                "error_type": error_type,
+                "error_message": error_message,
+                "traceback": f"{error_type}: {error_message}"
+            })
+
+    # 兜底解析：如果没有找到任何错误，扫描包含错误关键词的行
+    if not errors:
+        # 错误关键词
+        error_keywords = ["Error", "ERROR", "FAILED", "Traceback"]
+        added_contexts = set()  # 避免重复添加相同的上下文
+
+        for i, line in enumerate(processed_lines):
+            # 检查是否包含错误关键词
+            if any(keyword in line for keyword in error_keywords):
+                # 获取前后各3行，注意边界
+                start = max(0, i - 3)
+                end = min(len(processed_lines), i + 4)  # +4因为切片是左闭右开
+                context_lines = processed_lines[start:end]
+                context_str = '\n'.join(context_lines)
+
+                # 避免重复添加相同的上下文
+                if context_str not in added_contexts:
+                    added_contexts.add(context_str)
+                    # 提取错误信息（取当前行作为错误信息）
+                    error_message = line.strip()
+                    errors.append({
+                        "type": "unknown",
+                        "file_path": "",
+                        "line_number": 0,
+                        "error_type": "UnknownError",
+                        "error_message": error_message,
+                        "traceback": context_str
+                    })
+
+    return errors
+
+
+@tool
+def run_tests(test_command: str = "pytest") -> str:
+    """
+    在仓库目录下运行测试命令。
+
+    Args:
+        test_command: 测试命令，默认为"pytest"
+
+    Returns:
+        str: 测试输出内容，如果运行失败返回错误信息
+    """
+    repo_path = _tool_context.get("repo_path", "")
+    if not repo_path:
+        return "Error: 仓库路径未设置，请先克隆仓库"
+
+    try:
+        logger.info(f"运行测试命令: {test_command}")
+
+        result = subprocess.run(
+            test_command,
+            shell=True,
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=300  # 5分钟超时
+        )
+
+        output = f"Exit code: {result.returncode}\n\n"
+        if result.stdout:
+            output += f"STDOUT:\n{result.stdout}\n"
+        if result.stderr:
+            output += f"STDERR:\n{result.stderr}\n"
+
+        return output
+    except subprocess.TimeoutExpired:
+        return "Error: 测试运行超时（超过5分钟）"
+    except Exception as e:
+        return f"Error: 运行测试失败: {str(e)}"
+
+
+@tool
+def push_branch(branch_name: str, remote_name: str = "origin") -> str:
+    """
+    推送本地分支到远程仓库。
+
+    Args:
+        branch_name: 要推送的分支名称
+        remote_name: 远程仓库名称，默认为"origin"
+
+    Returns:
+        str: 操作结果，成功返回"Success"，失败返回错误信息
+    """
+    repo_path = _tool_context.get("repo_path", "")
+    if not repo_path:
+        return "Error: 仓库路径未设置，请先克隆仓库"
+
+    try:
+        from git import Repo, GitCommandError
+        repo = Repo(repo_path)
+        logger.info(f"推送分支 {branch_name} 到 {remote_name}")
+        origin = repo.remote(name=remote_name)
+        origin.push(refspec=f"HEAD:refs/heads/{branch_name}", force=True)
+        return "Success"
+    except GitCommandError as e:
+        return f"Error: 推送分支失败: {str(e)}"
+    except Exception as e:
+        return f"Error: 推送分支失败: {str(e)}"
+
+
+@tool
+def create_pull_request(
+    repo_full_name: str,
+    head_branch: str,
+    base_branch: str,
+    title: str,
+    body: str
+) -> str:
+    """
+    在GitHub上创建Pull Request。
+
+    Args:
+        repo_full_name: 仓库全名（owner/repo）
+        head_branch: 源分支名称
+        base_branch: 目标分支名称
+        title: PR标题
+        body: PR描述内容
+
+    Returns:
+        str: 创建成功返回PR URL，失败返回错误信息
+    """
+    github_token = _tool_context.get("github_token", "")
+    if not github_token:
+        return "Error: GitHub Token未设置"
+
+    try:
+        from github import Github, GithubException
+        logger.info(f"创建PR: {repo_full_name} {head_branch} → {base_branch}")
+
+        g = Github(github_token)
+        repo = g.get_repo(repo_full_name)
+
+        pr = repo.create_pull(
+            title=title,
+            body=body,
+            head=head_branch,
+            base=base_branch
+        )
+
+        return pr.html_url
+    except GithubException as e:
+        return f"Error: 创建PR失败: {str(e)}"
+    except Exception as e:
+        return f"Error: 创建PR失败: {str(e)}"
+
+
+# 导出所有工具
+all_tools = [
+    read_file,
+    write_file,
+    search_files,
+    search_code,
+    clone_repository,
+    create_branch,
+    commit_changes,
+    get_diff,
+    download_ci_logs,
+    parse_python_errors,
+    run_tests,
+    push_branch,
+    create_pull_request
+]
