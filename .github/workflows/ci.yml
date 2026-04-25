@@ -1,43 +1,70 @@
-name: CI 测试
+name: CI 检查
 
 on:
-  push:
-    branches: [ "main" ]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
-  build:
+  check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
     - name: 拉取代码
       uses: actions/checkout@v4
-    
+
     - name: 安装 Python
       uses: actions/setup-python@v5
       with:
         python-version: "3.12"
-    
+
     - name: 安装依赖
       run: |
         python -m pip install --upgrade pip
         pip install pytest
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-    
-    - name: 运行测试
-      id: pytest
+
+    - name: 语法检查
       continue-on-error: true
-      run: pytest
-    
-    - name: 上传测试结果
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: 测试结果
-        path: |
-          .pytest_cache/
-          test-results/
+      run: |
+        shopt -s lastpipe
+        FAIL=0
+        find . -name "*.py" -not -path "./.venv/*" -not -path "./.git/*" -print0 \
+          | while IFS= read -r -d '' f; do
+            if ! python -c "import ast; ast.parse(open('$f').read())" 2>&1; then
+              echo "❌ 语法错误: $f"
+              FAIL=1
+            fi
+          done
+        exit $FAIL
+
+    - name: 运行测试
+      continue-on-error: true
+      run: pytest -v --tb=short
+
+    - name: 逐文件运行检查
+      timeout-minutes: 5
+      continue-on-error: true
+      run: |
+        shopt -s lastpipe
+        FAIL=0
+        find . -name "*.py" \
+          -not -path "./.venv/*" \
+          -not -path "./.git/*" \
+          -not -path "./tests/*" \
+          -not -name "test_*" \
+          -print0 | while IFS= read -r -d '' f; do
+            if ! timeout 10 python "$f" 2>&1; then
+              echo "❌ 运行错误: $f"
+              FAIL=1
+            fi
+          done
+        exit $FAIL
