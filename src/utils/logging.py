@@ -1,5 +1,6 @@
 """结构化日志系统"""
 import logging
+import logging.handlers
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +32,14 @@ def setup_logging(
 
     # 配置基础日志
     level = getattr(logging, log_level.upper())
+
+    # 修复Windows控制台编码问题
+    import sys
+    if sys.platform == "win32":
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
     logging.basicConfig(
         level=level,
         format="%(message)s",

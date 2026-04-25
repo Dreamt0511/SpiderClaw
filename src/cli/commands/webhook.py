@@ -94,13 +94,13 @@ def start(
     table.add_row("运行环境", settings.environment)
     console.print(table)
 
-    console.print(f"[green]🚀 启动GitHub Webhook服务，访问 http://{settings.webhook.host}:{settings.webhook.port}/health 检查健康状态[/green]")
-    console.print(f"[blue]📝 Webhook端点地址: http://{settings.webhook.host}:{settings.webhook.port}/webhook/github[/blue]")
+    console.print(f"[green]启动GitHub Webhook服务，访问 http://{settings.webhook.host}:{settings.webhook.port}/health 检查健康状态[/green]")
+    console.print(f"[blue]Webhook端点地址: http://{settings.webhook.host}:{settings.webhook.port}/webhook/github[/blue]")
 
     # 初始化修复编排器
     orchestrator = None
     if settings.agent.enabled:
-        console.print("[green]🤖 自动修复功能已启用[/green]")
+        console.print("[green]自动修复功能已启用[/green]")
         try:
             orchestrator = RepairOrchestrator(
                 github_token=settings.github.token,
@@ -111,7 +111,7 @@ def start(
                 max_change_lines=settings.agent.max_change_lines
             )
         except Exception as e:
-            console.print(f"[yellow]⚠️  初始化修复编排器失败: {e}，自动修复功能已禁用[/yellow]")
+            console.print(f"[yellow]警告: 初始化修复编排器失败: {e}，自动修复功能已禁用[/yellow]")
 
     async def event_consumer():
         """事件消费循环"""

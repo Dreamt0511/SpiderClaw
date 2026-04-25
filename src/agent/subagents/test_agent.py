@@ -6,7 +6,7 @@ from langchain.agents import create_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import ChatOpenAI
 
-from src.agent.prompts.test_agent_prompts import TEST_AGENT_SYSTEM_PROMPT
+from src.agent.prompts.test_agent_prompts import TEST_AGENT_SYSTEM_PROMPT, TEST_AGENT_USER_PROMPT
 from src.agent.tools import all_tools, set_tool_context, run_tests as run_tests_tool
 
 logger = logging.getLogger(__name__)
@@ -44,22 +44,6 @@ class TestAgent:
             temperature=temperature,
             api_key=openai_api_key,
             base_url=openai_base_url
-        )
-
-        # 过滤出测试Agent需要的工具
-        self.tools = [
-            tool for tool in all_tools
-            if tool.name in [
-                "run_tests",
-                "read_file"
-            ]
-        ]
-
-        # 创建Agent（使用最新create_agent参数规范）
-        self.agent = create_agent(
-            model=self.llm,
-            tools=self.tools,
-            system_prompt=TEST_AGENT_SYSTEM_PROMPT
         )
 
     def _parse_failed_tests(self, test_output: str) -> List[str]:
@@ -132,35 +116,23 @@ class TestAgent:
                 }
 
             # 否则调用LLM分析测试结果
-            user_input = f"""
-请验证以下代码修复是否有效：
+            user_input = TEST_AGENT_USER_PROMPT.format(
+                fix_description=fix_description,
+                diff_content=diff_content,
+                test_output=test_output,
+                error_locations=error_locations
+            )
 
-## 修复描述
-{fix_description}
-
-## 代码变更
-```diff
-{diff_content}
-```
-
-## 测试运行结果
-```
-{test_output}
-```
-
-## 原始错误信息
-{error_locations}
-
-请根据以上信息判断修复是否有效，按照要求的JSON格式返回结果。
-"""
-
-            # 运行Agent
-            result = await self.agent.ainvoke({
-                "input": user_input
-            })
+            # 直接调用LLM分析测试结果
+            from langchain_core.messages import SystemMessage, HumanMessage
+            messages = [
+                SystemMessage(content=TEST_AGENT_SYSTEM_PROMPT),
+                HumanMessage(content=user_input)
+            ]
+            result = await self.llm.ainvoke(messages)
 
             # 解析结果
-            response_content = result["messages"][-1].content
+            response_content = result.content
             logger.info(f"测试Agent原始响应: {response_content[:500]}")
 
             # 尝试提取JSON

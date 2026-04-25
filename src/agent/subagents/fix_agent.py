@@ -1,11 +1,12 @@
 """修复Agent实现 - LangChain标准版本"""
+
 from typing import Dict, Any, List
 import logging
 from langchain.agents import create_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import ChatOpenAI
 
-from src.agent.prompts.fix_agent import FIX_AGENT_SYSTEM_PROMPT
+from src.agent.prompts.fix_agent import FIX_AGENT_SYSTEM_PROMPT, FIX_AGENT_USER_PROMPT
 from src.agent.tools.langchain_tools import all_tools, set_tool_context
 
 logger = logging.getLogger(__name__)
@@ -21,7 +22,7 @@ class FixAgent:
         temperature: float = 0.1,
         openai_api_key: str = None,
         openai_base_url: str = "https://api.openai.com/v1",
-        github_token: str = None
+        github_token: str = None,
     ):
         """
         初始化修复Agent
@@ -42,24 +43,18 @@ class FixAgent:
             model=llm_model,
             temperature=temperature,
             api_key=openai_api_key,
-            base_url=openai_base_url
+            base_url=openai_base_url,
         )
 
-        # 过滤出修复Agent需要的工具（限制工具数量，避免盲目调用）
-        # 只保留最必要的工具，禁止搜索类工具，避免盲目读取文件
+        # 过滤出修复Agent需要的工具（只读权限，禁止写入）
+        # search_files仅用于SyntaxError无文件路径时的定位，不会被滥用
         self.tools = [
-            tool for tool in all_tools
-            if tool.name in [
-                "read_file",
-                "write_file"
-            ]
+            tool for tool in all_tools if tool.name in ["read_file", "search_files"]
         ]
 
         # 创建Agent（使用最新create_agent参数规范）
         self.agent = create_agent(
-            model=self.llm,
-            tools=self.tools,
-            system_prompt=FIX_AGENT_SYSTEM_PROMPT
+            model=self.llm, tools=self.tools, system_prompt=FIX_AGENT_SYSTEM_PROMPT
         )
 
     async def generate_fix(
@@ -69,7 +64,8 @@ class FixAgent:
         review_feedback: str = "",
         risk_warnings: List[str] = None,
         test_output: str = "",
-        failed_tests: List[str] = None
+        failed_tests: List[str] = None,
+        retry_count: int = 0,
     ) -> Dict[str, Any]:
         """
         生成修复代码
@@ -81,142 +77,327 @@ class FixAgent:
             risk_warnings: 风险警告列表（重试时提供）
             test_output: 测试输出（重试时提供）
             failed_tests: 失败的测试用例列表（重试时提供）
+            retry_count: 重试次数（默认0，最多重试3次）
 
         Returns:
             Dict: 修复结果，包含fix_description、modified_files、code_changes
         """
         try:
-            logger.info("使用LangChain Agent生成修复代码")
+            logger.info(f"使用LangChain Agent生成修复代码，重试次数: {retry_count}")
 
-            # 预先分析错误类型，过滤不需要修复的场景
-            # 环境/配置/依赖错误，不需要修改代码
-            env_error_patterns = [
-                "Could not open requirements file",
-                "No such file or directory",
-                "ModuleNotFoundError",
-                "ImportError",
-                "pip install",
-                "requirements.txt",
-                "dependency",
-                "version conflict",
-                "permission denied",
-                "Certificate verify failed",
-                "SSL error",
-                "network error",
-                "timeout",
-                "Connection refused"
-            ]
-
-            is_env_error = False
-            error_msg = ""
-            for err in error_locations:
-                error_msg = err.get("error_message", "").lower()
-                error_type = err.get("error_type", "").lower()
-                for pattern in env_error_patterns:
-                    if pattern.lower() in error_msg or pattern.lower() in error_type or pattern.lower() in ci_logs.lower():
-                        is_env_error = True
-                        break
-                if is_env_error:
-                    break
-
-            if is_env_error:
-                logger.info("检测到环境/配置/依赖错误，不需要修改代码")
+            # 重试次数上限检测，避免死循环
+            if retry_count >= 3:
+                logger.error("重试次数达到上限，放弃修复")
                 return {
-                    "fix_description": "检测到环境/配置/依赖错误，需要在CI环境或项目配置中修复，无需修改代码",
+                    "fix_description": "修复失败：重试次数已达3次上限，无法生成有效修复",
                     "modified_files": [],
                     "code_changes": {},
-                    "is_env_error": True  # 标记为环境错误，不需要后续处理
+                    "error": "重试次数达到上限",
                 }
 
+            # 检查是否有语法错误（Orchestrator已经处理了错误分类和文件扫描）
+            is_syntax_error = any(
+                err.get("error_type", "").lower() == "syntaxerror"
+                or "syntaxerror" in err.get("error_message", "").lower()
+                for err in error_locations
+            )
+            # 收集所有有语法错误的文件（去重），不要过滤，让Agent尝试处理所有文件
+            syntax_error_files = []
+            for err in error_locations:
+                if (
+                    err.get("error_type", "").lower() == "syntaxerror"
+                    or "syntaxerror" in err.get("error_message", "").lower()
+                ):
+                    file_path = err.get("file_path")
+                    if file_path and file_path not in syntax_error_files:
+                        syntax_error_files.append(file_path)
+
             # 设置工具上下文
-            set_tool_context({
-                "repo_path": self.repo_path,
-                "github_token": self.github_token
-            })
+            set_tool_context(
+                {"repo_path": self.repo_path, "github_token": self.github_token}
+            )
 
-            # 构建输入
-            prompt_sections = ["""
-请分析以下CI错误信息并生成修复代码：
-
-## 重要提示
-请严格遵循工作流程：
-1. 先分析错误根本原因
-2. 只读取与错误直接相关的文件（每次最多读1-2个）
-3. 生成最小化修复，不要做无关修改
-
-## CI错误日志
-```
-{ci_logs}
-```
-
-## 解析到的错误信息
-{error_locations}
-""".format(ci_logs=ci_logs, error_locations=error_locations)]
-
-            # 添加审查反馈（如果有）
-            if review_feedback:
-                prompt_sections.append(f"""
+            # 构建动态部分
+            review_feedback_section = (
+                f"""
 ## 审查反馈（需要修改）
 {review_feedback}
-""")
+"""
+                if review_feedback
+                else ""
+            )
 
-            # 添加风险警告（如果有）
-            if risk_warnings and len(risk_warnings) > 0:
-                prompt_sections.append("""
+            risk_warnings_section = (
+                f"""
 ## 风险警告（需要修复）
-- {warnings}
-""".format(warnings="\n- ".join(risk_warnings)))
+- {"\n- ".join(risk_warnings)}
+"""
+                if risk_warnings and len(risk_warnings) > 0
+                else ""
+            )
 
-            # 添加测试反馈（如果有）
-            if test_output:
-                prompt_sections.append(f"""
+            test_output_section = (
+                f"""
 ## 测试输出
 ```
 {test_output}
 ```
-""")
+"""
+                if test_output
+                else ""
+            )
 
-            # 添加失败的测试用例（如果有）
-            if failed_tests and len(failed_tests) > 0:
-                prompt_sections.append("""
+            failed_tests_section = (
+                f"""
 ## 失败的测试用例
-- {failed_tests}
-""".format(failed_tests="\n- ".join(failed_tests)))
+- {"\n- ".join(failed_tests)}
+"""
+                if failed_tests and len(failed_tests) > 0
+                else ""
+            )
 
-            # 添加返回格式要求
-            prompt_sections.append("""
-请根据以上信息生成修复方案，严格按照要求的JSON格式返回。
-""")
+            # 使用模板构建用户输入
+            import json
 
-            # 合并所有部分
-            user_input = "\n".join(prompt_sections)
+            error_locations_json = json.dumps(
+                error_locations, ensure_ascii=False, indent=2
+            )
 
-            # 运行Agent
-            result = await self.agent.ainvoke({
-                "input": user_input
-            })
+            # 简化日志输出，避免编码问题
+            logger.info(f"找到错误数量: {len(error_locations)}")
+            logger.info(f"是否有语法错误: {is_syntax_error}")
+            logger.info(f"语法错误文件列表: {syntax_error_files}")
+
+            # 构建目标文件指令（动态部分）
+            force_instruction_content = ""
+            if syntax_error_files:
+                if len(syntax_error_files) == 1:
+                    # 单个文件修复
+                    file_path = syntax_error_files[0]
+                    force_instruction_content = f"""1. **唯一修复目标文件：{file_path}**
+   - 你 **只能** 修复这个文件，绝对不允许修改或返回其他任何文件
+   - 在你的JSON响应中，`modified_files`数组 **必须** 只包含["{file_path}"]
+   - 在你的JSON响应中，`code_changes`对象的key **必须** 是"{file_path}"
+"""
+                else:
+                    # 多个文件修复
+                    files_str = "、".join(syntax_error_files)
+                    files_json = '", "'.join(syntax_error_files)
+                    force_instruction_content = f"""1. **修复目标文件列表：{files_str}**
+   - 你 **只能** 修复列表中的这些文件，绝对不允许修改或返回其他任何文件
+   - 在你的JSON响应中，`modified_files`数组 **必须** 只包含["{files_json}"]
+   - 在你的JSON响应中，`code_changes`对象的key **必须** 是上述列表中的文件路径
+"""
+                logger.info(f"构建目标文件指令: {force_instruction_content[:300]}...")
+            else:
+                force_instruction_content = ""
+                logger.info("没有找到语法错误文件，不添加目标文件指令")
+
+            user_input = FIX_AGENT_USER_PROMPT.format(
+                force_instruction_content=force_instruction_content,
+                ci_logs=ci_logs,
+                error_locations=error_locations_json,
+                repo_path=self.repo_path,
+                review_feedback_section=review_feedback_section,
+                risk_warnings_section=risk_warnings_section,
+                test_output_section=test_output_section,
+                failed_tests_section=failed_tests_section,
+            )
+
+            logger.info(f"用户提示词构建完成，长度: {len(user_input)}")
+            logger.info(f"提示词前500字符: {user_input[:500]}...")
+
+            # 使用Agent调用，支持工具自动调用，最多允许3轮工具调用
+            logger.info("开始调用Agent生成修复...")
+            config = {"recursion_limit": 10}  # 限制最大调用次数，防止无限循环
+            result = await self.agent.ainvoke({"input": user_input}, config=config)
+            logger.info("Agent调用完成")
 
             # 解析结果
             response_content = result["messages"][-1].content
-            logger.info(f"修复Agent原始响应: {response_content[:500]}")
+            logger.info(f"修复Agent原始响应长度: {len(response_content)}")
+            logger.info(f"修复Agent原始响应完整内容: {response_content}")
+
+            # 检查是否有工具调用
+            if "tool_calls" in result["messages"][-1].additional_kwargs:
+                tool_calls = result["messages"][-1].additional_kwargs["tool_calls"]
+                logger.info(f"Agent调用了工具: {tool_calls}")
+                # 这里不需要手动处理工具调用，LangChain的create_agent会自动处理
 
             # 尝试提取JSON
             import json
             import re
 
-            json_match = re.search(r'```json\s*(.*?)\s*```', response_content, re.DOTALL)
+            json_content = ""
+
+            # 首先尝试匹配markdown格式的JSON
+            json_match = re.search(
+                r"```json\s*(.*?)\s*```", response_content, re.DOTALL
+            )
             if json_match:
                 json_content = json_match.group(1)
+                logger.info(f"从markdown中提取JSON: {json_content}")
             else:
-                json_content = response_content.strip()
+                # 尝试直接匹配JSON对象
+                json_match = re.search(r"\{.*\}", response_content, re.DOTALL)
+                if json_match:
+                    json_content = json_match.group(0)
+                    logger.info(f"从响应中直接提取JSON: {json_content}")
+                else:
+                    # 如果没有找到JSON，尝试清理响应内容
+                    # 移除所有非JSON内容，只保留从第一个{到最后一个}的部分
+                    start_idx = response_content.find("{")
+                    end_idx = response_content.rfind("}")
+                    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                        json_content = response_content[start_idx : end_idx + 1]
+                        logger.info(f"清理后提取的JSON: {json_content}")
+                    else:
+                        json_content = response_content.strip()
+                        logger.warning(f"无法提取JSON，响应内容为: {response_content}")
 
-            fix_result = json.loads(json_content)
+            # 尝试解析JSON
+            try:
+                fix_result = json.loads(json_content)
+                logger.info(f"JSON解析成功: {fix_result}")
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON解析失败，内容: {json_content}")
+                raise
 
             # 验证结果格式
             required_fields = ["fix_description", "modified_files", "code_changes"]
             for field in required_fields:
                 if field not in fix_result:
                     raise ValueError(f"修复结果缺少必要字段: {field}")
+
+            # 统一文件路径格式，使用正斜杠
+            def normalize_path(path):
+                return path.replace("\\", "/").lstrip("./")
+
+            # 规范化modified_files中的路径
+            fix_result["modified_files"] = [normalize_path(f) for f in fix_result["modified_files"]]
+
+            # 规范化code_changes中的路径
+            normalized_code_changes = {}
+            for path, content in fix_result["code_changes"].items():
+                normalized_code_changes[normalize_path(path)] = content
+            fix_result["code_changes"] = normalized_code_changes
+
+            # 语法错误强制检查：必须返回非空的code_changes
+            if is_syntax_error:
+                # 检查返回的文件路径是否符合要求
+                expected_files = [
+                    err.get("file_path")
+                    for err in error_locations
+                    if err.get("error_type")
+                    in ["SyntaxError", "IndentationError", "TabError"]
+                    and err.get("file_path")
+                    and err.get("file_path") != "<string>"
+                ]
+                # 清理路径中的./前缀和路径分隔符
+                expected_files = [
+                    f.lstrip("./").replace("\\", "/") for f in expected_files
+                ]
+                expected_files = list(set(expected_files))  # 去重
+
+                if expected_files:
+                    # 检查返回的文件是否在预期列表中
+                    returned_files = [
+                        f.lstrip("./").replace("\\", "/")
+                        for f in fix_result.get("code_changes", {}).keys()
+                    ]
+                    invalid_files = [
+                        f for f in returned_files if f not in expected_files
+                    ]
+
+                    if invalid_files:
+                        logger.error(
+                            f"修复Agent返回了不允许的文件: {invalid_files}，允许修复的文件: {expected_files}"
+                        )
+                        if retry_count < 2:
+                            feedback_msg = f"严重错误：你返回了不在允许列表中的文件路径 {invalid_files}，这是绝对禁止的！\n"
+                            feedback_msg += f"允许修复的文件列表是：{expected_files}\n"
+                            feedback_msg += "请严格遵守指令，只修复列表中的文件，禁止编造任何不存在的文件路径。"
+
+                            return await self.generate_fix(
+                                ci_logs=ci_logs,
+                                error_locations=error_locations,
+                                review_feedback=feedback_msg,
+                                risk_warnings=risk_warnings,
+                                test_output=test_output,
+                                failed_tests=failed_tests,
+                                retry_count=retry_count + 1,
+                            )
+
+                if (
+                    not fix_result.get("code_changes")
+                    or len(fix_result["code_changes"]) == 0
+                ):
+                    # 检查是否已经尝试过所有方法仍然找不到文件
+                    has_unknown_file = any(
+                        err.get("error_type") == "SyntaxError"
+                        and not err.get("file_path")
+                        for err in error_locations
+                    )
+
+                    if has_unknown_file and retry_count >= 1:
+                        # 已经重试一次仍然找不到文件，直接返回失败，避免死循环
+                        logger.error("无法定位语法错误所在文件，放弃修复")
+                        return {
+                            "fix_description": "无法定位语法错误所在的文件，需要人工处理",
+                            "modified_files": [],
+                            "code_changes": {},
+                            "error": "无法定位语法错误文件",
+                        }
+
+                    logger.error("语法错误修复结果为空，重试")
+                    # 构建明确的反馈信息，告诉Agent已经找到的错误位置
+                    error_details = []
+                    for err in error_locations:
+                        if err.get("error_type") == "SyntaxError" and err.get(
+                            "file_path"
+                        ):
+                            error_details.append(
+                                f"文件 {err['file_path']} 第 {err['line_number']} 行存在语法错误：{err['error_message']}"
+                            )
+
+                    feedback_msg = (
+                        "语法错误必须修复，已经为你定位到错误位置：\n"
+                        + "\n".join(error_details)
+                        + "\n"
+                    )
+                    feedback_msg += (
+                        "请直接读取对应的文件，修复语法错误，必须返回完整的修复代码。"
+                    )
+
+                    # 递归重试，最多3次，传递更新后的ci_logs
+                    return await self.generate_fix(
+                        ci_logs=ci_logs,
+                        error_locations=error_locations,
+                        review_feedback=feedback_msg,
+                        risk_warnings=risk_warnings,
+                        test_output=test_output,
+                        failed_tests=failed_tests,
+                        retry_count=retry_count + 1,
+                    )
+                # 验证修复后的代码没有语法错误
+                for file_path, code_content in fix_result["code_changes"].items():
+                    try:
+                        # 尝试解析代码，检查语法错误
+                        import ast
+
+                        ast.parse(code_content)
+                        logger.info(f"文件 {file_path} 语法检查通过")
+                    except SyntaxError as e:
+                        logger.error(f"修复后的代码仍然有语法错误: {e}，重试")
+                        return await self.generate_fix(
+                            ci_logs=ci_logs,
+                            error_locations=error_locations,
+                            review_feedback=f"修复后的代码仍然有语法错误: {str(e)}，请重新修复",
+                            risk_warnings=risk_warnings,
+                            test_output=test_output,
+                            failed_tests=failed_tests,
+                            retry_count=retry_count + 1,
+                        )
 
             logger.info(f"修复生成成功: {fix_result['fix_description']}")
             return fix_result
@@ -227,5 +408,5 @@ class FixAgent:
                 "fix_description": f"生成修复失败: {str(e)}",
                 "modified_files": [],
                 "code_changes": {},
-                "error": str(e)
+                "error": str(e),
             }

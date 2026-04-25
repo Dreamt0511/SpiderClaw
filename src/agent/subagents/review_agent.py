@@ -6,7 +6,7 @@ import re
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_openai import ChatOpenAI
 
-from src.agent.prompts.review_agent_prompts import REVIEW_AGENT_SYSTEM_PROMPT
+from src.agent.prompts.review_agent_prompts import REVIEW_AGENT_SYSTEM_PROMPT, REVIEW_AGENT_USER_PROMPT
 from src.agent.tools import set_tool_context, read_file
 
 logger = logging.getLogger(__name__)
@@ -124,6 +124,7 @@ class ReviewAgent:
         code_changes: Dict[str, str],
         diff_content: str,
         repo_path: str,
+        original_codes: Dict[str, str] = None,
     ) -> Dict[str, Any]:
         """
         审查代码变更
@@ -170,58 +171,52 @@ class ReviewAgent:
                     error_info.append(f"{error['error_type']}: {error['error_message']}")
             error_info_str = "\n".join(error_info) if error_info else "无明确错误位置"
 
-            # 2. 读取每个修改文件的原始内容
-            original_codes = {}
+            # 2. 使用传入的原始代码，避免读取到已修改的文件
+            if original_codes is None:
+                original_codes = {}
+                # 如果没有传入原始代码，再尝试读取（兼容旧调用方式）
+                for file_path in modified_files:
+                    try:
+                        original_content = read_file.invoke({"file_path": file_path})
+                        if not original_content.startswith("Error:"):
+                            original_codes[file_path] = original_content
+                        else:
+                            original_codes[file_path] = f"无法读取原始文件: {original_content}"
+                    except Exception as e:
+                        original_codes[file_path] = f"读取原始文件失败: {str(e)}"
+
+            # 构建代码对比部分
+            code_comparison_sections = []
             for file_path in modified_files:
-                try:
-                    original_content = read_file.invoke({"file_path": file_path})
-                    if not original_content.startswith("Error:"):
-                        original_codes[file_path] = original_content
-                    else:
-                        original_codes[file_path] = f"无法读取原始文件: {original_content}"
-                except Exception as e:
-                    original_codes[file_path] = f"读取原始文件失败: {str(e)}"
+                code_comparison_sections.append(f"\n## 原始代码 - {file_path}")
+                code_comparison_sections.append("```python")
+                code_comparison_sections.append(original_codes.get(file_path, "无原始代码"))
+                code_comparison_sections.append("```")
 
-            # 3. 构建审查prompt
-            prompt_sections = ["## 原始错误", error_info_str]
+                code_comparison_sections.append(f"\n## 修复后代码 - {file_path}")
+                code_comparison_sections.append("```python")
+                code_comparison_sections.append(code_changes.get(file_path, "无修复代码"))
+                code_comparison_sections.append("```")
+            code_comparison_section = "\n".join(code_comparison_sections)
 
-            # 添加原始代码和修复后代码
-            for file_path in modified_files:
-                prompt_sections.append(f"\n## 原始代码 - {file_path}")
-                prompt_sections.append("```python")
-                prompt_sections.append(original_codes.get(file_path, "无原始代码"))
-                prompt_sections.append("```")
-
-                prompt_sections.append(f"\n## 修复后代码 - {file_path}")
-                prompt_sections.append("```python")
-                prompt_sections.append(code_changes.get(file_path, "无修复代码"))
-                prompt_sections.append("```")
-
-            # 添加修复描述和静态检查警告
-            prompt_sections.append(f"\n## 修复描述")
-            prompt_sections.append(fix_description)
-
+            # 构建静态警告部分
             if static_result["risk_warnings"]:
-                prompt_sections.append("\n## 静态检查警告")
-                prompt_sections.append("\n".join(f"- {warning}" for warning in static_result["risk_warnings"]))
-                prompt_sections.append("\n注意：以上警告仅供参考，是否通过审查请根据实际情况判断。")
+                static_warnings_section = f"""
+## 静态检查警告
+{chr(10).join(f"- {warning}" for warning in static_result["risk_warnings"])}
 
-            # 添加审查要求
-            prompt_sections.append("""
-## 重要提示
-原始代码和修复后代码已完整提供在上述内容中，不需要调用任何工具获取额外信息，请直接基于以上提供的所有内容进行审查。
+注意：以上警告仅供参考，是否通过审查请根据实际情况判断。
+"""
+            else:
+                static_warnings_section = ""
 
-## 审查要求
-请判断此修复是否：
-1. 解决了原始错误
-2. 没有引入新问题
-3. 变更范围合理
-
-请按照要求的JSON格式返回审查结果。
-""")
-
-            # 合并所有部分
-            user_input = "\n".join(prompt_sections)
+            # 使用模板构建用户输入
+            user_input = REVIEW_AGENT_USER_PROMPT.format(
+                error_info_str=error_info_str,
+                code_comparison_section=code_comparison_section,
+                fix_description=fix_description,
+                static_warnings_section=static_warnings_section
+            )
 
             # 直接调用LLM，不使用Agent框架，避免工具调用
             messages = [

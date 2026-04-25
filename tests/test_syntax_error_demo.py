@@ -11,7 +11,8 @@ def process_data(data):
             results.append(item * 2)
         else:
             results.append(item)
-    return results
+    # 另一个语法错误：未闭合的括号
+    return results[
 
 if __name__ == "__main__":
     test_data = [5, 12, 8, 15, 3]

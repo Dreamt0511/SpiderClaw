@@ -75,6 +75,7 @@ def read_file(file_path: str) -> str:
 def write_file(file_path: str, content: str) -> str:
     """
     写入内容到指定文件。
+    权限: ORCHESTRATOR_ONLY
 
     只能写入当前工作目录下的文件，不允许访问系统其他目录。
     如果文件已存在会被覆盖。
@@ -428,6 +429,14 @@ def parse_python_errors(log_content: str) -> List[Dict]:
         re.DOTALL | re.MULTILINE
     )
 
+    # 匹配没有Traceback头部的语法错误（如IndentationError、SyntaxError等）
+    syntax_error_pattern = re.compile(
+        r'^File "([^"]+)", line (\d+)[^\n]*\n'
+        r'(?:.*?\n)*?'
+        r'([A-Z][a-zA-Z0-9]*Error): (.*?)$',
+        re.MULTILINE
+    )
+
     # 匹配简单错误行，支持多种前缀格式
     simple_error_pattern = re.compile(
         r'^(?:E\s+|ERROR:\s+|\[ERROR\]\s+|ERROR\s+\|\s+)?([A-Z][a-zA-Z0-9]*Error):?\s*(.*)$',
@@ -456,31 +465,109 @@ def parse_python_errors(log_content: str) -> List[Dict]:
         last_file_match = re.findall(r'File "([^"]+)", line (\d+)', full_traceback)[-1]
         file_path, line_number = last_file_match[0], int(last_file_match[1])
 
-        errors.append({
-            "type": "traceback",
-            "file_path": file_path,
-            "line_number": line_number,
-            "error_type": error_type,
-            "error_message": error_message,
-            "traceback": full_traceback
-        })
+        # 过滤系统路径，只保留用户项目文件
+        is_system_file = (
+            file_path.startswith("/")
+            and not file_path.startswith("/github/workspace/")
+            and not file_path.startswith("./")
+            and not os.path.isabs(file_path) is False
+        ) or "python" in file_path.lower() and "lib" in file_path.lower()
+
+        if not is_system_file:
+            errors.append({
+                "type": "traceback",
+                "file_path": file_path,
+                "line_number": line_number,
+                "error_type": error_type,
+                "error_message": error_message,
+                "traceback": full_traceback
+            })
+
+    # 提取没有Traceback头部的语法错误
+    for match in syntax_error_pattern.finditer(processed_content):
+        full_traceback = match.group(0)
+        file_path = match.group(1)
+        line_number = int(match.group(2))
+        error_type = match.group(3)
+        error_message = match.group(4)
+
+        # 避免重复添加
+        error_key = (file_path, line_number, error_type, error_message)
+        existing_keys = {(e["file_path"], e["line_number"], e["error_type"], e["error_message"]) for e in errors}
+        if error_key not in existing_keys:
+            # 过滤系统路径，只保留用户项目文件
+            is_system_file = (
+                file_path.startswith("/")
+                and not file_path.startswith("/github/workspace/")
+                and not file_path.startswith("./")
+                and not os.path.isabs(file_path) is False
+            ) or "python" in file_path.lower() and "lib" in file_path.lower()
+
+            if not is_system_file:
+                errors.append({
+                    "type": "syntax_error",
+                    "file_path": file_path,
+                    "line_number": line_number,
+                    "error_type": error_type,
+                    "error_message": error_message,
+                    "traceback": full_traceback
+                })
 
     # 提取简单错误（避免重复）
     existing_errors = {(e["error_type"], e["error_message"]) for e in errors}
     for match in simple_error_pattern.finditer(processed_content):
         error_type = match.group(1)
         error_message = match.group(2)
+        file_path = ""
+        line_number = 0
+
+        # 专门处理语法错误（SyntaxError、IndentationError、TabError等）：尝试从上下文中提取文件路径
+        if error_type in ["SyntaxError", "IndentationError", "TabError"]:
+            # 获取当前匹配行的位置
+            match_pos = processed_content.find(match.group(0))
+            if match_pos != -1:
+                # 向前查找1000个字符，寻找文件路径模式
+                context_start = max(0, match_pos - 1000)
+                context = processed_content[context_start:match_pos]
+                # 匹配 File "xxx.py", line xx 模式
+                file_match = re.search(r'File "([^"]+\.py)", line (\d+)', context)
+                if file_match and file_match.group(1) != "<string>":
+                    file_path = file_match.group(1)
+                    line_number = int(file_match.group(2))
+                # 匹配CI日志中的语法错误标记行：❌ 语法错误: xxx.py
+                else:
+                    ci_syntax_match = re.search(r'语法错误:\s*([a-zA-Z0-9_\-/\\.]+\.py)', context)
+                    if ci_syntax_match:
+                        file_path = ci_syntax_match.group(1)
+                        # 尝试从错误信息中提取行号
+                        line_match = re.search(r'line (\d+)', match.group(0))
+                        if line_match:
+                            line_number = int(line_match.group(1))
+                # 匹配直接的文件名行，如 "File "/path/to/file.py""
+                if not file_path:
+                    simple_file_match = re.search(r'^.*?([a-zA-Z0-9_\-/\\]+\.py)', context, re.MULTILINE)
+                    if simple_file_match:
+                        file_path = simple_file_match.group(1)
 
         if (error_type, error_message) not in existing_errors:
             existing_errors.add((error_type, error_message))
-            errors.append({
-                "type": "simple",
-                "file_path": "",
-                "line_number": 0,
-                "error_type": error_type,
-                "error_message": error_message,
-                "traceback": f"{error_type}: {error_message}"
-            })
+            # 过滤系统路径，只保留用户项目文件
+            is_system_file = (
+                file_path.startswith("/")
+                and not file_path.startswith("/github/workspace/")
+                and not file_path.startswith("./")
+                and not os.path.isabs(file_path) is False
+            ) or "python" in file_path.lower() and "lib" in file_path.lower()
+
+            if not is_system_file:
+                errors.append({
+                    "type": "simple",
+                    "file_path": file_path,
+                    "line_number": line_number,
+                    "error_type": error_type,
+                    "error_message": error_message,
+                    "traceback": f"{error_type}: {error_message}"
+                })
 
     # 提取pytest失败总结行
     for match in pytest_failure_pattern.finditer(processed_content):
@@ -598,6 +685,7 @@ def run_tests(test_command: str = "pytest") -> str:
 def push_branch(branch_name: str, remote_name: str = "origin") -> str:
     """
     推送本地分支到远程仓库。
+    权限: ORCHESTRATOR_ONLY
 
     Args:
         branch_name: 要推送的分支名称
@@ -633,6 +721,7 @@ def create_pull_request(
 ) -> str:
     """
     在GitHub上创建Pull Request。
+    权限: ORCHESTRATOR_ONLY
 
     Args:
         repo_full_name: 仓库全名（owner/repo）

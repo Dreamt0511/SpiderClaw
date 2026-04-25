@@ -164,9 +164,10 @@ class RepairOrchestrator:
                 "github_token": self.github_token
             })
 
-            # 1. 下载CI日志
-            ci_logs = ""
-            if event.logs_url:
+            # 1. 获取CI日志：如果状态中已经有了就直接使用（本地测试场景），否则下载
+            ci_logs = state.get("ci_logs", "")
+            if not ci_logs and event.logs_url:
+                # 没有提供CI日志，需要从URL下载
                 logs_result = download_ci_logs.invoke({"logs_url": event.logs_url})
                 if not logs_result.startswith("Error:"):
                     ci_logs = logs_result
@@ -180,8 +181,18 @@ class RepairOrchestrator:
 
             logger.info(f"解析到Python错误数量: {len(error_locations)}")
             if len(error_locations) > 0:
+                import re
+                # 过滤ANSI颜色代码和特殊字符
+                ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[.*?[a-zA-Z])')
                 for i, err in enumerate(error_locations):
-                    logger.info(f"  错误{i+1}: {err.get('file_path', 'unknown')}:{err.get('line_number', 0)} {err.get('error_type', 'UnknownError')}: {err.get('error_message', '')[:100]}")
+                    file_path = err.get('file_path', 'unknown')
+                    line_number = err.get('line_number', 0)
+                    error_type = err.get('error_type', 'UnknownError')
+                    error_msg = err.get('error_message', '')[:100]
+                    # 清理特殊字符
+                    error_msg = ansi_escape.sub('', error_msg)
+                    error_msg = error_msg.encode('gbk', errors='ignore').decode('gbk')
+                    logger.info(f"  错误{i+1}: {file_path}:{line_number} {error_type}: {error_msg}")
 
             if not error_locations:
                 logger.warning("日志中未解析到任何Python错误，无需修复")
@@ -194,7 +205,7 @@ class RepairOrchestrator:
                     "error_message": "日志中未检测到Python错误，无需修复"
                 }
 
-            # 3. 克隆仓库
+            # 3. 克隆仓库（必须在任何需要访问仓库文件的操作之前执行）
             repo_path = ""
             if event.clone_url and event.branch:
                 clone_result = clone_repository.invoke({
@@ -233,6 +244,177 @@ class RepairOrchestrator:
                     "success": False,
                     "error_message": "仓库克隆失败，路径为空"
                 }
+
+            # 设置工具上下文的仓库路径，供后续工具使用
+            set_tool_context({
+                "github_token": self.github_token,
+                "repo_path": repo_path
+            })
+
+            # 过滤掉不存在的文件路径的错误（只保留实际存在的文件）
+            valid_error_locations = []
+            for err in error_locations:
+                file_path = err.get("file_path", "")
+                if not file_path or file_path == "<string>":
+                    continue
+
+                # 清理路径中的相对路径符号和多余的分隔符
+                cleaned_file_path = file_path.lstrip("./\\").replace("\\", "/")
+
+                # 检查文件是否存在于克隆的仓库中
+                full_file_path = os.path.abspath(os.path.join(repo_path, cleaned_file_path))
+                repo_path_abs = os.path.abspath(repo_path)
+
+                # 确保文件在仓库目录内，并且确实存在
+                if (full_file_path.startswith(repo_path_abs) and
+                    os.path.exists(full_file_path) and
+                    os.path.isfile(full_file_path)):
+                    valid_error_locations.append(err)
+                    # 更新错误中的文件路径为相对路径（统一格式）
+                    relative_path = os.path.relpath(full_file_path, repo_path_abs).replace("\\", "/")
+                    err["file_path"] = relative_path
+                else:
+                    logger.info(f"  过滤不存在的文件错误: {file_path} -> 清理后: {cleaned_file_path} -> 完整路径: {full_file_path}")
+
+            error_locations = valid_error_locations
+            logger.info(f"过滤后有效Python错误数量: {len(error_locations)}")
+            for i, err in enumerate(error_locations):
+                logger.info(f"  有效错误{i+1}: {err.get('file_path', 'unknown')}:{err.get('line_number', 0)} {err.get('error_type', 'UnknownError')}: {err.get('error_message', '')[:100]}")
+
+            if not error_locations:
+                logger.warning("过滤后没有有效错误，无需修复")
+                # 没有有效错误，直接结束流程
+                async with self.lock:
+                    if event_key in self.processed_events:
+                        self.processed_events.remove(event_key)
+                return {
+                    "success": False,
+                    "error_message": "过滤后没有检测到需要修复的有效Python错误"
+                }
+
+            # 错误分类前置处理
+            is_syntax_error = False
+            missing_file_path = None
+            is_dependency_error = False
+            syntax_error_files = []  # 所有语法错误文件列表
+
+            for err in error_locations:
+                error_type = err.get("error_type", "").lower()
+                error_msg = err.get("error_message", "")
+                file_path = err.get("file_path")
+
+                # B类错误：语法/逻辑错误（最高优先级，不允许跳过）
+                if error_type == "syntaxerror" or "syntaxerror" in error_msg.lower():
+                    is_syntax_error = True
+                    if file_path and file_path not in syntax_error_files:
+                        syntax_error_files.append(file_path)
+
+            if syntax_error_files:
+                logger.info(f"检测到语法错误，涉及文件: {syntax_error_files}")
+
+                # A类错误：文件缺失
+                if "no such file or directory" in error_msg.lower() or "could not open" in error_msg.lower():
+                    # 提取缺失的文件路径
+                    import re
+                    file_match = re.search(r"No such file or directory: '([^']+)'", error_msg)
+                    if not file_match:
+                        file_match = re.search(r"Could not open '([^']+)'", error_msg)
+                    if file_match:
+                        missing_file_path = file_match.group(1)
+                        # 特殊处理：缺失requirements.txt属于A类
+                        if "requirements.txt" in missing_file_path.lower():
+                            logger.info(f"检测到缺失文件: {missing_file_path}")
+
+                # C类错误：依赖问题
+                if error_type == "modulenotfounderror" or "modulenotfounderror" in error_msg.lower():
+                    # 排除缺失requirements.txt的情况
+                    if "requirements.txt" not in error_msg.lower():
+                        is_dependency_error = True
+                        logger.info("检测到依赖缺失错误")
+
+            # 处理A类错误：缺失文件
+            if missing_file_path:
+                logger.info(f"创建缺失文件: {missing_file_path}")
+                from src.agent.tools.langchain_tools import write_file
+                # 写入空文件
+                write_result = write_file.invoke({
+                    "file_path": f"{repo_path}/{missing_file_path}",
+                    "content": ""
+                })
+                if write_result == "Success":
+                    logger.info(f"成功创建缺失文件: {missing_file_path}")
+                    return {
+                        "success": True,
+                        "fix_description": f"创建缺失文件: {missing_file_path}",
+                        "modified_files": [missing_file_path],
+                        "code_changes": {
+                            missing_file_path: ""
+                        }
+                    }
+                else:
+                    logger.error(f"创建缺失文件失败: {write_result}")
+                    return {
+                        "success": False,
+                        "error_message": f"创建缺失文件失败: {write_result}"
+                    }
+
+            # 处理C类错误：依赖问题
+            elif is_dependency_error:
+                logger.info("检测到依赖/配置错误，不需要修改代码")
+                return {
+                    "success": True,
+                    "error_message": "检测到依赖/环境错误，需要安装对应的依赖包，无需修改代码",
+                    "is_env_error": True
+                }
+
+            # 处理语法错误无文件路径的情况，主动扫描仓库中的Python文件
+            elif is_syntax_error and not syntax_error_files:
+                logger.info("语法错误未关联到具体文件，开始扫描仓库中的Python文件")
+                from src.agent.tools.langchain_tools import search_files, read_file
+                # 搜索所有Python文件
+                py_files = search_files.invoke({"pattern": "**/*.py"})
+                # 对每个文件进行语法检查
+                import ast
+                for file_path in py_files:
+                    try:
+                        # 读取文件内容
+                        full_file_path = f"{repo_path}/{file_path}"
+                        content = read_file.invoke({"file_path": full_file_path})
+                        if not content.startswith("Error:"):
+                            # 尝试解析语法
+                            ast.parse(content)
+                    except SyntaxError as e:
+                        # 找到有语法错误的文件
+                        if file_path not in syntax_error_files:
+                            syntax_error_files.append(file_path)
+                        logger.info(f"找到语法错误文件: {file_path}:{e.lineno}")
+                        # 更新错误信息
+                        for err in error_locations:
+                            # 只要错误信息中包含SyntaxError，就更新文件路径
+                            if (err.get("error_type") == "SyntaxError" or
+                                "syntaxerror" in err.get("error_message", "").lower()):
+                                err["file_path"] = file_path
+                                err["line_number"] = e.lineno
+                                err["error_message"] = str(e)
+                                # 确保错误类型正确
+                                err["error_type"] = "SyntaxError"
+                        # 更新CI日志，添加详细的错误位置信息
+                        syntax_error_details = f"""
+File "{file_path}", line {e.lineno}
+{e.text}
+{' ' * (e.offset - 1)}^
+SyntaxError: {e.msg}
+"""
+                        ci_logs = ci_logs + "\n\n" + "="*50 + "\n"
+                        ci_logs += "自动扫描找到的语法错误详情：\n"
+                        ci_logs += syntax_error_details
+                        ci_logs += "\n" + "="*50 + "\n"
+                if not syntax_error_files:
+                    logger.error("无法定位到用户代码中的语法错误文件，可能错误发生在系统库中")
+                    return {
+                        "success": False,
+                        "error_message": "语法错误发生在Python系统库中，无法自动修复"
+                    }
 
             return {
                 "ci_logs": ci_logs,
@@ -284,6 +466,13 @@ class RepairOrchestrator:
             )
 
         try:
+            # 重试时回滚所有变更，避免旧修复叠加
+            if state.get("retry_count", 0) > 0:
+                logger.info(f"检测到第 {state['retry_count']} 次重试，回滚所有本地变更")
+                from git import Repo
+                repo = Repo(state["repo_path"])
+                repo.git.checkout("--", ".")
+
             # 创建修复Agent
             fix_agent = FixAgent(
                 repo_path=state["repo_path"],
@@ -341,8 +530,18 @@ class RepairOrchestrator:
                     goto="handle_failure"
                 )
 
+            # 先读取所有需要修改文件的原始内容
+            from src.agent.tools.langchain_tools import read_file, write_file, get_diff
+            original_codes = {}
+            for file_path in fix_result["code_changes"].keys():
+                try:
+                    original_content = read_file.invoke({"file_path": file_path})
+                    if not original_content.startswith("Error:"):
+                        original_codes[file_path] = original_content
+                except Exception as e:
+                    logger.warning(f"读取原始文件 {file_path} 失败: {str(e)}")
+
             # 应用修复到本地仓库
-            from src.agent.tools.langchain_tools import write_file
             for file_path, content in fix_result["code_changes"].items():
                 write_result = write_file.invoke({
                     "file_path": file_path,
@@ -360,11 +559,13 @@ class RepairOrchestrator:
                 "modified_files": fix_result["modified_files"],
                 "code_changes": fix_result["code_changes"],
                 "diff_content": diff_content,
+                "original_codes": original_codes,
                 "retry_count": state["retry_count"] + 1
             }
 
-            # 首次修复时重置反馈字段，重试时保留上一次的反馈用于调试
-            if state["retry_count"] == 0:
+            # 只有在首次修复且没有任何反馈时才重置反馈字段
+            # 重试时保留所有反馈信息，用于指导下一次修复
+            if state["retry_count"] == 0 and not state.get("review_comments") and not state.get("test_output"):
                 update_state.update({
                     "review_comments": "",
                     "test_output": "",
@@ -412,7 +613,8 @@ class RepairOrchestrator:
                 modified_files=state["modified_files"],
                 code_changes=state["code_changes"],
                 diff_content=state["diff_content"],
-                repo_path=state["repo_path"]
+                repo_path=state["repo_path"],
+                original_codes=state.get("original_codes")
             )
 
             return review_result
@@ -645,6 +847,61 @@ class RepairOrchestrator:
             initial_state: RepairState = {
                 "event": event,
                 "ci_logs": "",
+                "repo_path": "",
+                "error_locations": [],
+                "fix_description": "",
+                "modified_files": [],
+                "code_changes": {},
+                "diff_content": "",
+                "review_passed": False,
+                "review_comments": "",
+                "change_lines": 0,
+                "risk_warnings": [],
+                "test_passed": False,
+                "test_output": "",
+                "failed_tests": [],
+                "pr_url": None,
+                "pr_number": None,
+                "success": False,
+                "error_message": "",
+                "retry_count": 0,
+                "max_retries": self.max_retries
+            }
+
+            # 运行图
+            final_state = await self.graph.ainvoke(initial_state)
+
+            logger.info(f"修复流程完成: 成功={final_state['success']}")
+            if final_state.get("pr_url"):
+                logger.info(f"PR地址: {final_state['pr_url']}")
+
+            return final_state
+
+        except Exception as e:
+            logger.error(f"修复流程异常: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error_message": f"修复流程异常: {str(e)}"
+            }
+
+    async def run_repair(self, event: GitHubEvent, ci_logs: str = "") -> Dict[str, Any]:
+        """
+        运行修复流程，支持直接传入CI日志（用于本地测试）
+
+        Args:
+            event: GitHub事件对象
+            ci_logs: 可选的CI日志内容，如果提供则不下载日志
+
+        Returns:
+            Dict: 最终修复结果
+        """
+        logger.info(f"启动本地修复流程: {event.event_id}")
+
+        try:
+            # 初始化状态
+            initial_state: RepairState = {
+                "event": event,
+                "ci_logs": ci_logs,
                 "repo_path": "",
                 "error_locations": [],
                 "fix_description": "",
