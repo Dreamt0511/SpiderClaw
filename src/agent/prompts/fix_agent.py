@@ -46,8 +46,8 @@ FIX_AGENT_SYSTEM_PROMPT = """
     "code_changes": {
         "文件路径1": "修复后的完整文件内容",
         "文件路径2": "修复后的完整文件内容"
-    }
-}
+    }}
+}}
 ```
 """
 
@@ -75,13 +75,13 @@ FIX_AGENT_USER_PROMPT = """
 ## 输出要求
 返回严格的JSON格式，包含所有修复的文件：
 ```json
-{
+{{
     "fix_description": "简要描述修复内容",
     "modified_files": ["文件路径1"],
-    "code_changes": {
+    "code_changes": {{
         "文件路径1": "修复后的完整文件内容"
-    }
-}
+    }}
+}}
 ```
 
 {review_feedback_section}
