@@ -122,9 +122,6 @@ def main(
         CONFIG_PATH = Path(config)
 
     if ctx.invoked_subcommand is None:
-        console.print(f"[bold #4488ff]启动 SpiderClaw 总监控服务[/bold #4488ff]")
-        console.print(f"监听地址: {host}:{port}")
-
         from src.monitor.webhook_server import run_webhook_server
         run_webhook_server(host=host, port=port, reload=reload)
 

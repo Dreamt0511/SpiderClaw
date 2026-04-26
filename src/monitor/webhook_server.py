@@ -8,9 +8,14 @@ from typing import Optional, Callable, Awaitable
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+from rich.console import Console
+from rich.panel import Panel
+from rich.logging import RichHandler
 from .base import BaseMonitor
 from src.bus import GitHubEvent, EventBus
 
+# 强制启用颜色输出，即使输出到非终端
+console = Console(force_terminal=True, color_system="auto")
 logger = logging.getLogger(__name__)
 
 # 支持的GitHub事件类型
@@ -317,12 +322,28 @@ def run_webhook_server(
 
     log = get_logger(__name__)
 
+    # 配置基础日志
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+
+    handler = RichHandler(
+        show_time=True,
+        show_level=True,
+        show_path=False,
+        markup=True
+    )
+    logging.basicConfig(
+        level="INFO",
+        format="%(message)s",
+        datefmt="[%X]",
+        handlers=[handler]
+    )
+
     settings = get_settings()
 
     webhook_secret = secret or settings.webhook.secret
     if not webhook_secret:
-        log.error("Webhook secret not configured")
-        print("[red]错误：Webhook secret 未配置，请通过 --secret 参数或配置文件设置[/red]")
+        console.print("[bold #ff4444]错误：Webhook secret 未配置，请通过 --secret 参数或配置文件设置[/bold #ff4444]")
         return
 
     event_bus = get_event_bus(
@@ -338,6 +359,20 @@ def run_webhook_server(
         reload=reload,
         allowed_events=set(settings.webhook.allowed_events),
     )
+
+    # 显示启动面板
+    console.print(Panel(
+        f"[bold #ffffff]SpiderClaw 总监控服务已启动[/bold #ffffff]\n\n"
+        f"监听地址: [bold #4488ff]http://{host}:{port}[/bold #4488ff]\n"
+        f"Webhook端点: [bold #4488ff]/webhook/github[/bold #4488ff]\n"
+        f"健康检查: [bold #4488ff]/health[/bold #4488ff]\n"
+        f"允许事件: [bold #4488ff]{', '.join(settings.webhook.allowed_events)}[/bold #4488ff]\n\n"
+        f"[dim]按 Ctrl+C 停止服务[/dim]",
+        title="[bold #4488ff]SpiderClaw 运行中[/bold #4488ff]",
+        border_style="#2453fc",
+        padding=(1, 2)
+    ))
+    console.print()
 
     async def _run():
         await monitor.start()
