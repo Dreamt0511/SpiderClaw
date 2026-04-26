@@ -45,11 +45,71 @@ class ReviewAgent:
         )
         self.system_prompt = REVIEW_AGENT_SYSTEM_PROMPT
 
+    # 严重风险模式（必须拦截，触发后强制重试）
+    _CRITICAL_PATTERNS = [
+        r"rm\s+-rf",                         # 递归删除
+        r"shutil\.rmtree",                    # 删除目录树
+        r"os\.remove",                        # 删除文件
+        r"os\.unlink",                        # 删除链接
+        r"os\.rmdir",                         # 删除目录
+        r"os\.system",                        # 执行系统命令
+        r"exec\(",                            # 执行任意代码
+        r"DROP\s+TABLE",                      # 删除数据库表
+        r"DELETE\s+FROM.*WHERE\s+1=1",        # 危险SQL删除
+    ]
+
+    # 低风险模式（仅警告，不阻止流程）
+    _WARNING_PATTERNS = [
+        r"eval\(",                            # eval动态执行
+        r"subprocess\.run",                   # 运行子进程
+        r"subprocess\.call",                  # 调用子进程
+        r"subprocess\.Popen",                 # 启动子进程
+        r"api_key\s*=",                       # API密钥硬编码
+        r"secret\s*=",                        # 机密信息
+        r"token\s*=",                         # Token硬编码
+        r"password\s*=",                      # 密码硬编码
+    ]
+
+    def _strip_line_comment(self, line: str) -> str:
+        """去除单行中的 Python 注释部分（保留行内 # 前的代码）"""
+        in_string = False
+        string_char = None
+        for i, c in enumerate(line):
+            if c in ('"', "'") and (i == 0 or line[i-1] != '\\'):
+                in_string = not in_string
+                string_char = c
+            elif c == '#' and not in_string:
+                return line[:i]
+        return line
+
+    def _line_has_pattern(self, line: str, pattern: str) -> bool:
+        """检查一行中是否包含特定模式（排除注释后的代码部分）"""
+        code_part = self._strip_line_comment(line)
+        return bool(re.search(pattern, code_part))
+
+    def _scan_patterns_in_content(
+        self, file_path: str, content: str, patterns: list, label: str
+    ) -> list:
+        """在文件内容中扫描模式，返回匹配结果列表"""
+        results = []
+        for line_num, line in enumerate(content.split('\n'), 1):
+            for pattern in patterns:
+                if self._line_has_pattern(line, pattern):
+                    results.append(
+                        f"[{label}] 文件 {file_path}:{line_num} "
+                        f"包含敏感操作: {pattern}"
+                    )
+        return results
+
     def _static_security_check(
         self, code_changes: Dict[str, str], diff_content: str
     ) -> Dict[str, Any]:
         """
         静态安全检查（先于LLM审查执行）
+
+        分级处理:
+        - 严重风险 (critical) → 直接拦截，触发重试
+        - 低风险 (warning)  → 仅记录警告，不阻止流程
 
         Args:
             code_changes: 代码变更字典
@@ -59,7 +119,7 @@ class ReviewAgent:
             Dict: 检查结果
         """
         risk_warnings = []
-        dangerous_operations = []
+        critical_risks = []
 
         # 1. 检查变更行数（仅作为警告，不拦截）
         add_count = 0
@@ -73,48 +133,36 @@ class ReviewAgent:
 
         if change_lines > self.max_change_lines:
             risk_warnings.append(
-                f"变更行数超过建议值: {change_lines} 行，建议不超过 {self.max_change_lines} 行"
+                f"[警告] 变更行数超过建议值: {change_lines} 行，"
+                f"建议不超过 {self.max_change_lines} 行"
             )
 
-        # 2. 扫描危险模式（必须拦截）
-        dangerous_patterns = [
-            r"rm\s+-rf",
-            r"shutil\.rmtree",
-            r"os\.remove",
-            r"os\.unlink",
-            r"os\.rmdir",
-            r"subprocess\.run",
-            r"subprocess\.call",
-            r"subprocess\.Popen",
-            r"os\.system",
-            r"eval\(",
-            r"exec\(",
-            r"DROP\s+TABLE",
-            r"DELETE\s+FROM.*WHERE\s+1=1",
-            r"api_key\s*=",
-            r"token\s*=",
-            r"password\s*=",
-            r"secret\s*=",
-        ]
-
+        # 2. 扫描严重风险模式（排除注释后匹配）
         for file_path, content in code_changes.items():
-            for pattern in dangerous_patterns:
-                if re.search(pattern, content, re.IGNORECASE):
-                    dangerous_operations.append(f"文件 {file_path} 中包含危险操作: {pattern}")
+            critical_risks.extend(
+                self._scan_patterns_in_content(
+                    file_path, content, self._CRITICAL_PATTERNS, "严重"
+                )
+            )
 
-        # 3. 检查是否修改了非Python文件（仅作为警告）
+        # 3. 扫描低风险模式（排除注释后匹配）
+        for file_path, content in code_changes.items():
+            risk_warnings.extend(
+                self._scan_patterns_in_content(
+                    file_path, content, self._WARNING_PATTERNS, "警告"
+                )
+            )
+
+        # 4. 检查是否修改了非Python文件（仅作为警告）
         for file_path in code_changes.keys():
             if not file_path.endswith(".py"):
-                risk_warnings.append(f"修改了非Python文件: {file_path}")
-
-        # 合并警告和危险操作
-        all_warnings = dangerous_operations + risk_warnings
+                risk_warnings.append(f"[警告] 修改了非Python文件: {file_path}")
 
         return {
             "change_lines": change_lines,
-            "risk_warnings": all_warnings,
-            "has_dangerous_operations": len(dangerous_operations) > 0,
-            "dangerous_operations": dangerous_operations,
+            "risk_warnings": risk_warnings,
+            "critical_risks": critical_risks,
+            "has_critical_risks": len(critical_risks) > 0,
         }
 
     def _auto_compare_codes(
@@ -195,16 +243,23 @@ class ReviewAgent:
             # 先执行静态检查
             static_result = self._static_security_check(code_changes, diff_content)
 
-            # 只有危险操作才直接拦截
-            if static_result["has_dangerous_operations"]:
-                logger.warning(f"发现危险操作: {static_result['dangerous_operations']}")
+            # 严重风险 → 直接拦截，不提交LLM审查
+            if static_result["has_critical_risks"]:
+                logger.warning(f"发现严重风险: {static_result['critical_risks']}")
                 return {
                     "review_passed": False,
-                    "review_comments": "发现危险操作，审查未通过: "
-                    + "; ".join(static_result["dangerous_operations"]),
+                    "review_comments": "发现严重风险，审查未通过: "
+                    + "; ".join(static_result["critical_risks"]),
                     "change_lines": static_result["change_lines"],
                     "risk_warnings": static_result["risk_warnings"],
+                    "has_critical_risks": True,
                 }
+
+            # 低风险（警告）→ 记录但继续LLM审查
+            if static_result["risk_warnings"]:
+                logger.info(
+                    f"发现低风险警告（不阻止流程）: {static_result['risk_warnings']}"
+                )
 
             # 设置工具上下文
             set_tool_context({"repo_path": repo_path})

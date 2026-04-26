@@ -34,9 +34,14 @@ class RepairState(TypedDict):
     risk_warnings: Annotated[List[str], operator.add]  # 风险警告列表，支持追加
 
     # 测试阶段
-    test_passed: bool  # 测试是否通过
+    test_passed: bool  # 测试是否通过（向后兼容）
     test_output: str  # 测试输出内容
     failed_tests: Annotated[List[str], operator.add]  # 失败的测试用例列表，支持追加
+
+    # 动态验证字段（v2 核心改进）
+    validation_status: str  # "success" | "failure" | "uncertain" | ""
+    validation_method: str  # "command" | "ast" | "fallback_test" | "none" | ""
+    validation_command: str  # 实际执行的验证命令
 
     # 最终结果
     pr_url: Optional[str]  # 生成的PR链接

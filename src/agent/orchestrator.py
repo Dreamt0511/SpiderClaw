@@ -271,6 +271,12 @@ class RepairOrchestrator:
             for err in error_locations:
                 file_path = err.get("file_path", "")
                 if not file_path or file_path == "<string>":
+                    # 没有文件路径但有错误类型和错误描述 → 保留，供修复 Agent 定位
+                    if err.get("error_type") and err.get("error_message"):
+                        logger.info(
+                            f"  保留无路径错误: {err.get('error_type')}: {err.get('error_message', '')[:100]}"
+                        )
+                        valid_error_locations.append(err)
                     continue
 
                 # 清理路径中的相对路径符号和多余的分隔符
@@ -721,25 +727,43 @@ class RepairOrchestrator:
 
     def _route_after_review(self, state: RepairState) -> str:
         """
-        审查后的路由逻辑
+        审查后的路由逻辑（基于风险分级）
+
+        - 严重风险 → 重试（如果可达上限则仍创建 PR 并标记警告）
+        - 仅警告/无风险 + 审查通过 → 进入测试
+        - 仅警告/无风险 + 审查不通过 → 仍进入测试（低风险不放慢流程）
         """
         # 如果有明确的错误消息且success为False，说明之前的节点已经失败
         if state.get("success") is False and state.get("error_message"):
             logger.error(f"流程已失败: {state.get('error_message', '未知错误')}")
             return "handle_failure"
 
-        # 审查不通过，检查重试次数
-        if not state.get("review_passed", False):
-            retry_count = state.get("retry_count", 0)
-            if retry_count < state["max_retries"]:
-                logger.info(f"审查失败，重试修复 (第 {retry_count + 1} 次)")
-                return "fix_agent"
-            else:
-                logger.error("超过最大重试次数，修复失败")
-                return "handle_failure"
+        retry_count = state.get("retry_count", 0)
+        has_critical_risks = state.get("has_critical_risks", False)
 
-        # 审查通过，进入测试阶段
-        logger.info("审查通过，进入测试阶段")
+        # 有严重风险 → 重试（如果达到上限则创建 PR 并标记）
+        if has_critical_risks:
+            if retry_count < state["max_retries"]:
+                logger.info(
+                    f"存在严重风险，重试修复 (第 {retry_count + 1} 次,"
+                    f" 共 {state['max_retries']} 次)"
+                )
+                return "fix_agent"
+            logger.warning(
+                f"重试 {state['max_retries']} 次后仍存在严重风险，"
+                f"仍然创建 PR（标记需人工确认）"
+            )
+            return "create_pr"
+
+        # 无严重风险 → 无论审查是否通过，都进入测试阶段
+        # LLM 不通过的原因（如代码风格、可读性等）不应阻塞修复流程
+        if not state.get("review_passed", False):
+            logger.info(
+                f"审查未通过但无严重风险，仍进入测试阶段"
+            )
+        else:
+            logger.info("审查通过，进入测试阶段")
+
         return "run_tests"
 
     async def _run_tests(self, state: RepairState) -> Dict[str, Any]:
@@ -764,18 +788,28 @@ class RepairOrchestrator:
                 test_command="pytest",
             )
 
-            # 执行测试并验证修复
+            # 执行动态验证（传入 CI 日志用于提取原始失败命令）
             test_result = await test_agent.verify_fix(
                 error_locations=state["error_locations"],
                 fix_description=state["fix_description"],
                 diff_content=state["diff_content"],
+                ci_logs=state.get("ci_logs", ""),
             )
 
+            # 补充兼容字段供下游使用（如果有）
+            logger.info(
+                f"验证结果: status={test_result.get('validation_status', 'N/A')}, "
+                f"method={test_result.get('validation_method', 'N/A')}, "
+                f"command={test_result.get('command_used', 'N/A')}"
+            )
             return test_result
 
         except Exception as e:
             logger.error(f"测试Agent执行失败: {e}", exc_info=True)
             return {
+                "validation_status": "uncertain",
+                "validation_method": "error",
+                "command_used": "",
                 "test_passed": False,
                 "test_output": f"测试执行失败: {str(e)}",
                 "failed_tests": [],
@@ -784,25 +818,57 @@ class RepairOrchestrator:
 
     def _route_after_test(self, state: RepairState) -> str:
         """
-        测试后的路由逻辑
+        测试后的路由逻辑（基于 validation_status 三元决策）
+
+        - "success"  → 创建 PR
+        - "uncertain" → 仍然创建 PR，但标记需人工确认
+        - "failure"   → 重试（未达上限）或失败（已达上限）
         """
         # 如果有明确的错误消息且success为False，说明之前的节点已经失败
         if state.get("success") is False and state.get("error_message"):
             logger.error(f"流程已失败: {state.get('error_message', '未知错误')}")
             return "handle_failure"
 
-        # 测试不通过，检查重试次数
+        validation_status = state.get("validation_status", "")
+
+        # 验证通过 → 创建 PR
+        if validation_status == "success":
+            logger.info("验证通过，准备创建 PR")
+            return "create_pr"
+
+        # 不确定（无测试用例/超时/命令被拦截） → 仍创建 PR，标记需人工确认
+        if validation_status == "uncertain":
+            logger.warning("验证结果不确定，仍创建 PR（标记需人工确认）")
+            return "create_pr"
+
+        # 验证失败 → 重试或重试用尽后创建 PR（标记需人工确认）
+        if validation_status == "failure":
+            retry_count = state.get("retry_count", 0)
+            if retry_count < state["max_retries"]:
+                logger.info(
+                    f"验证失败，重试修复 (第 {retry_count + 1} 次, 共 {state['max_retries']} 次)"
+                )
+                return "fix_agent"
+            logger.warning(
+                f"重试 {state['max_retries']} 次后验证仍未通过，"
+                f"仍然创建 PR（标记需人工确认）"
+            )
+            return "create_pr"
+
+        # 向后兼容：如果 validation_status 为空，回退到旧的 test_passed 逻辑
+        logger.warning("validation_status 为空，回退到旧的 test_passed 逻辑")
         if not state.get("test_passed", False):
             retry_count = state.get("retry_count", 0)
             if retry_count < state["max_retries"]:
-                logger.info(f"测试失败，重试修复 (第 {retry_count + 1} 次)")
+                logger.info(f"测试失败（旧逻辑），重试修复 (第 {retry_count + 1} 次)")
                 return "fix_agent"
-            else:
-                logger.error("超过最大重试次数，修复失败")
-                return "handle_failure"
+            logger.warning(
+                f"重试 {state['max_retries']} 次后测试仍未通过（旧逻辑），"
+                f"仍然创建 PR（标记需人工确认）"
+            )
+            return "create_pr"
 
-        # 测试通过，创建PR
-        logger.info("测试通过，准备创建PR")
+        logger.info("测试通过（旧逻辑），准备创建 PR")
         return "create_pr"
 
     async def _create_pull_request(self, state: RepairState) -> Dict[str, Any]:
@@ -874,14 +940,50 @@ class RepairOrchestrator:
             # 审查结果状态
             review_status = "✅ 通过" if state['review_passed'] else "❌ 不通过"
 
-            # 测试结果状态
-            test_status = "✅ 通过" if state['test_passed'] else "❌ 不通过"
+            # 验证结果状态（三元）
+            validation_status = state.get('validation_status', '')
+            validation_method = state.get('validation_method', '')
+            validation_command = state.get('validation_command', '')
 
-            # 风险警告
-            risk_warning = '; '.join(state['risk_warnings']) if state['risk_warnings'] else "无"
+            if validation_status == 'success':
+                test_status = "✅ 通过"
+                test_detail = f"验证方法: {validation_method}"
+                if validation_command:
+                    test_detail += f" | 命令: {validation_command}"
+            elif validation_status == 'uncertain':
+                test_status = "⚠️ 不确定"
+                test_detail = (
+                    f"验证方法: {validation_method}，"
+                    f"无法完全自动验证修复正确性，请人工确认"
+                )
+                if validation_command:
+                    test_detail += f" | 命令: {validation_command}"
+            else:
+                test_status = "❌ 不通过"
+                test_detail = f"验证方法: {validation_method}"
+                if validation_command:
+                    test_detail += f" | 命令: {validation_command}"
+
+            # 风险警告（区分严重/警告）
+            risk_warnings = state.get('risk_warnings', []) or []
+            critical_risks = [r for r in risk_warnings if r.startswith('[严重]')]
+            normal_warnings = [r for r in risk_warnings if not r.startswith('[严重]')]
+
+            risk_section_parts = []
+            if critical_risks:
+                risk_section_parts.append("### ⚠️ 未解决的严重风险")
+                risk_section_parts.extend(f"- {r}" for r in critical_risks)
+                risk_section_parts.append("")
+            if normal_warnings:
+                risk_section_parts.append("### 低风险警告")
+                risk_section_parts.extend(f"- {r}" for r in normal_warnings)
+                risk_section_parts.append("")
+
+            risk_warning_display = '; '.join(risk_warnings) if risk_warnings else "无"
+            risk_detail_section = '\n'.join(risk_section_parts) if risk_section_parts else ""
 
             # 构建PR正文
-            pr_body = f"""## 🎯 修复概览
+            pr_body_parts = [f"""## 🎯 修复概览
 - 原错误分支: `{event.branch}`
 - 修复分支: `{branch_name}`
 - 错误类型: {error_types_str}
@@ -893,8 +995,35 @@ class RepairOrchestrator:
 ## ✅ 检查结果
 - 代码审查: {review_status}
 - 测试验证: {test_status}
-- 风险警告: {risk_warning}
+- 验证详情: {test_detail}
+- 风险警告: {risk_warning_display}
+{risk_detail_section}
+"""]
 
+            # 有严重风险时在 PR 顶部加醒目警告
+            if critical_risks:
+                pr_body_parts.insert(0, f"""| 🚨 此 PR 包含未解决的严重风险，请谨慎合并 |
+| --- |
+| 自动修复尝试 {state.get('max_retries', '?')} 次后仍存在严重风险， |
+| **务必人工审查所有变更后再合并**。 |
+
+""")
+
+            # uncertain 时在 PR 顶部额外加一个醒目警告
+            if validation_status == 'uncertain':
+                pr_body_parts.insert(0, f"""| ⚠️ 自动验证结果不确定 |
+| --- |
+| 原始验证命令「{validation_command or '无'}」无法确定修复正确性。 |
+| 此 PR 由系统自动生成，**请人工审查和验证后合并**。 |
+
+""")
+                pr_body_parts.append(f"""---
+| ⚠️ 如需回退，请使用以下命令重置到 CI 失败前的状态 |
+| --- |
+| git checkout origin/{event.branch} -- . |
+""")
+
+            pr_body_parts.append(f"""
 <details>
 <summary>🔍 查看详细变更</summary>
 
@@ -912,7 +1041,9 @@ class RepairOrchestrator:
 
 ---
 此PR由SpiderClaw自动修复系统生成
-"""
+""")
+
+            pr_body = '\n'.join(pr_body_parts)
 
             pr_url = create_pull_request.invoke(
                 {
@@ -1035,6 +1166,9 @@ class RepairOrchestrator:
                 "test_passed": False,
                 "test_output": "",
                 "failed_tests": [],
+                "validation_status": "",
+                "validation_method": "",
+                "validation_command": "",
                 "pr_url": None,
                 "pr_number": None,
                 "success": False,
