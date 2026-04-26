@@ -118,43 +118,18 @@ class FixAgent:
             )
 
             # 构建动态部分
-            review_feedback_section = (
-                f"""
-## 审查反馈（需要修改）
-{review_feedback}
-"""
-                if review_feedback
-                else ""
-            )
 
-            risk_warnings_section = (
-                f"""
-## 风险警告（需要修复）
-- {"\n- ".join(risk_warnings)}
-"""
-                if risk_warnings and len(risk_warnings) > 0
-                else ""
-            )
+            #审查反馈（需要修改）
+            review_feedback_section = (f"""{review_feedback}""" if review_feedback else "")
+            
+            # 风险警告（需要修复）
+            risk_warnings_section = (f"""{"\n- ".join(risk_warnings)}""" if risk_warnings and len(risk_warnings) > 0 else "")
 
-            test_output_section = (
-                f"""
-## 测试输出
-```
-{test_output}
-```
-"""
-                if test_output
-                else ""
-            )
+            # 测试输出
+            test_output_section = (f"""```{test_output}```""" if test_output else "")
 
-            failed_tests_section = (
-                f"""
-## 失败的测试用例
-- {"\n- ".join(failed_tests)}
-"""
-                if failed_tests and len(failed_tests) > 0
-                else ""
-            )
+            # 失败的测试用例
+            failed_tests_section = (f"""- {"\n- ".join(failed_tests)}""" if failed_tests and len(failed_tests) > 0 else "")
 
             # 使用模板构建用户输入
             import json
@@ -274,7 +249,9 @@ class FixAgent:
                 return path.replace("\\", "/").lstrip("./")
 
             # 规范化modified_files中的路径
-            fix_result["modified_files"] = [normalize_path(f) for f in fix_result["modified_files"]]
+            fix_result["modified_files"] = [
+                normalize_path(f) for f in fix_result["modified_files"]
+            ]
 
             # 规范化code_changes中的路径
             normalized_code_changes = {}

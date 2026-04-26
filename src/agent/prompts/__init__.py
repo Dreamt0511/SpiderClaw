@@ -11,3 +11,5 @@ __all__ = [
     "TEST_AGENT_SYSTEM_PROMPT",
     "TEST_AGENT_USER_PROMPT"
 ]
+
+#__all__ 不是约定俗成的名字，而是 Python 语法的强制要求，只有这个名字才能触发导入控制机制。
