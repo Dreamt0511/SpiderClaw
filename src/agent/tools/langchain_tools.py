@@ -18,19 +18,21 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logger = logging.getLogger(__name__)
 
-# 全局状态，用于在工具之间共享上下文
-_tool_context: Dict[str, Any] = {}
+# 上下文变量，用于在工具之间异步安全地共享上下文
+import contextvars
+_tool_context_var: contextvars.ContextVar = contextvars.ContextVar("tool_context", default={})
 
 
 def set_tool_context(context: Dict[str, Any]) -> None:
     """设置工具上下文，在工具执行前调用"""
-    global _tool_context
-    _tool_context.update(context)
+    current = _tool_context_var.get()
+    current.update(context)
+    _tool_context_var.set(current)
 
 
 def get_tool_context() -> Dict[str, Any]:
     """获取工具上下文"""
-    return _tool_context
+    return _tool_context_var.get()
 
 
 @tool
@@ -46,7 +48,7 @@ def read_file(file_path: str) -> str:
     Returns:
         str: 文件内容，如果文件不存在或读取失败返回错误信息
     """
-    repo_path = _tool_context.get("repo_path", "")
+    repo_path = get_tool_context().get("repo_path", "")
     if not repo_path:
         return "Error: 仓库路径未设置，请先克隆仓库"
 
@@ -87,7 +89,7 @@ def write_file(file_path: str, content: str) -> str:
     Returns:
         str: 操作结果，成功返回"Success"，失败返回错误信息
     """
-    repo_path = _tool_context.get("repo_path", "")
+    repo_path = get_tool_context().get("repo_path", "")
     if not repo_path:
         return "Error: 仓库路径未设置，请先克隆仓库"
 
@@ -121,7 +123,7 @@ def search_files(pattern: str, file_type: Optional[str] = None) -> List[str]:
     """
     import glob
 
-    repo_path = _tool_context.get("repo_path", "")
+    repo_path = get_tool_context().get("repo_path", "")
     if not repo_path:
         return []
 
@@ -201,8 +203,10 @@ def clone_repository(clone_url: str, branch: str = "main") -> str:
         )
 
         # 保存到上下文
-        _tool_context["repo_path"] = temp_dir
-        _tool_context["repo"] = repo
+        ctx = get_tool_context()
+        ctx["repo_path"] = temp_dir
+        ctx["repo"] = repo
+        _tool_context_var.set(ctx)
 
         return temp_dir
     except GitCommandError as e:
@@ -221,7 +225,7 @@ def create_branch(branch_name: str) -> str:
     Returns:
         str: 操作结果，成功返回"Success"，失败返回错误信息
     """
-    repo = _tool_context.get("repo")
+    repo = get_tool_context().get("repo")
     if not repo:
         return "Error: 仓库未初始化，请先克隆仓库"
 
@@ -240,26 +244,32 @@ def create_branch(branch_name: str) -> str:
 
 
 @tool
-def commit_changes(message: str, author_name: str = "SpiderClaw AutoFix",
+def commit_changes(message: str, files: Optional[List[str]] = None,
+                   author_name: str = "SpiderClaw AutoFix",
                    author_email: str = "spiderclaw@example.com") -> str:
     """
-    提交当前仓库的所有变更。
+    提交仓库变更（仅暂存指定的文件）。
 
     Args:
         message: 提交信息
+        files: 要提交的文件列表（相对于仓库根目录）。如为None则提交所有变更。
         author_name: 提交者名称，默认为"SpiderClaw AutoFix"
         author_email: 提交者邮箱，默认为"spiderclaw@example.com"
 
     Returns:
         str: 操作结果，成功返回"Success"，失败返回错误信息
     """
-    repo = _tool_context.get("repo")
+    repo = get_tool_context().get("repo")
     if not repo:
         return "Error: 仓库未初始化，请先克隆仓库"
 
     try:
-        # 添加所有变更
-        repo.git.add(A=True)
+        # 添加需要提交的文件（如未指定则添加所有）
+        if files:
+            for file_path in files:
+                repo.git.add(file_path)
+        else:
+            repo.git.add(A=True)
 
         # 检查是否有变更需要提交
         if repo.is_dirty(untracked_files=True):
@@ -285,7 +295,7 @@ def get_diff(base_branch: str = "main") -> str:
     Returns:
         str: diff内容，如果获取失败返回错误信息
     """
-    repo = _tool_context.get("repo")
+    repo = get_tool_context().get("repo")
     if not repo:
         return "Error: 仓库未初始化，请先克隆仓库"
 
@@ -315,7 +325,7 @@ def download_ci_logs(logs_url: str) -> str:
     Returns:
         str: 日志内容，如果下载失败返回错误信息
     """
-    github_token = _tool_context.get("github_token", "")
+    github_token = get_tool_context().get("github_token", "")
 
     try:
         logger.info(f"下载CI日志: {logs_url}")
@@ -652,7 +662,7 @@ def run_tests(test_command: str = "pytest") -> str:
     Returns:
         str: 测试输出内容，如果运行失败返回错误信息
     """
-    repo_path = _tool_context.get("repo_path", "")
+    repo_path = get_tool_context().get("repo_path", "")
     if not repo_path:
         return "Error: 仓库路径未设置，请先克隆仓库"
 
@@ -694,7 +704,7 @@ def push_branch(branch_name: str, remote_name: str = "origin") -> str:
     Returns:
         str: 操作结果，成功返回"Success"，失败返回错误信息
     """
-    repo_path = _tool_context.get("repo_path", "")
+    repo_path = get_tool_context().get("repo_path", "")
     if not repo_path:
         return "Error: 仓库路径未设置，请先克隆仓库"
 
@@ -703,7 +713,7 @@ def push_branch(branch_name: str, remote_name: str = "origin") -> str:
         repo = Repo(repo_path)
         logger.info(f"推送分支 {branch_name} 到 {remote_name}")
         origin = repo.remote(name=remote_name)
-        origin.push(refspec=f"HEAD:refs/heads/{branch_name}", force=True)
+        origin.push(refspec=f"HEAD:refs/heads/{branch_name}")
         return "Success"
     except GitCommandError as e:
         return f"Error: 推送分支失败: {str(e)}"
@@ -733,7 +743,7 @@ def create_pull_request(
     Returns:
         str: 创建成功返回PR URL，失败返回错误信息
     """
-    github_token = _tool_context.get("github_token", "")
+    github_token = get_tool_context().get("github_token", "")
     if not github_token:
         return "Error: GitHub Token未设置"
 

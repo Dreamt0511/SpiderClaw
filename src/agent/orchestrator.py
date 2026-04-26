@@ -5,7 +5,7 @@ import asyncio
 import datetime
 import logging
 import re
-from typing import Dict, Any
+from typing import Dict, Any, List
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Command
 
@@ -86,7 +86,9 @@ class RepairOrchestrator:
         # 定义边
         workflow.add_edge(START, "collect_context")
         workflow.add_edge("collect_context", "fix_agent")
-        workflow.add_edge("fix_agent", "review_changes")
+        # 注意：fix_agent → review_changes 的边不在此定义
+        # _run_fix_agent 通过 Command(goto="review_changes") 显式路由
+        # 因为 Command(goto) 与固定边共存时固定边优先级更高
 
         # 审查后的条件路由
         workflow.add_conditional_edges(
@@ -190,8 +192,6 @@ class RepairOrchestrator:
 
             logger.info(f"解析到Python错误数量: {len(error_locations)}")
             if len(error_locations) > 0:
-                import re
-
                 # 过滤ANSI颜色代码和特殊字符
                 ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[.*?[a-zA-Z])")
                 for i, err in enumerate(error_locations):
@@ -334,8 +334,6 @@ class RepairOrchestrator:
                     or "could not open" in error_msg.lower()
                 ):
                     # 提取缺失的文件路径
-                    import re
-
                     file_match = re.search(
                         r"No such file or directory: '([^']+)'", error_msg
                     )
@@ -393,57 +391,12 @@ class RepairOrchestrator:
             # 处理语法错误无文件路径的情况，主动扫描仓库中的Python文件
             elif is_syntax_error and not syntax_error_files:
                 logger.info("语法错误未关联到具体文件，开始扫描仓库中的Python文件")
-                from src.agent.tools.langchain_tools import search_files, read_file
-
-                # 搜索所有Python文件
-                py_files = search_files.invoke({"pattern": "**/*.py"})
-                # 对每个文件进行语法检查
-                import ast
-
-                for file_path in py_files:
-                    try:
-                        # 读取文件内容
-                        full_file_path = f"{repo_path}/{file_path}"
-                        content = read_file.invoke({"file_path": full_file_path})
-                        if not content.startswith("Error:"):
-                            # 尝试解析语法
-                            ast.parse(content)
-                    except SyntaxError as e:
-                        # 找到有语法错误的文件
-                        if file_path not in syntax_error_files:
-                            syntax_error_files.append(file_path)
-                        logger.info(f"找到语法错误文件: {file_path}:{e.lineno}")
-                        # 更新错误信息
-                        for err in error_locations:
-                            # 只要错误信息中包含SyntaxError，就更新文件路径
-                            if (
-                                err.get("error_type") == "SyntaxError"
-                                or "syntaxerror" in err.get("error_message", "").lower()
-                            ):
-                                err["file_path"] = file_path
-                                err["line_number"] = e.lineno
-                                err["error_message"] = str(e)
-                                # 确保错误类型正确
-                                err["error_type"] = "SyntaxError"
-                        # 更新CI日志，添加详细的错误位置信息
-                        syntax_error_details = f"""
-File "{file_path}", line {e.lineno}
-{e.text}
-{' ' * (e.offset - 1)}^
-SyntaxError: {e.msg}
-"""
-                        ci_logs = ci_logs + "\n\n" + "=" * 50 + "\n"
-                        ci_logs += "自动扫描找到的语法错误详情：\n"
-                        ci_logs += syntax_error_details
-                        ci_logs += "\n" + "=" * 50 + "\n"
-                if not syntax_error_files:
-                    logger.error(
-                        "无法定位到用户代码中的语法错误文件，可能错误发生在系统库中"
-                    )
-                    return {
-                        "success": False,
-                        "error_message": "语法错误发生在Python系统库中，无法自动修复",
-                    }
+                scan_result = self._scan_syntax_files(repo_path, error_locations, ci_logs)
+                if "error" in scan_result:
+                    return {"success": False, "error_message": scan_result["error"]}
+                syntax_error_files = scan_result.get("syntax_error_files", [])
+                ci_logs = scan_result["ci_logs"]
+                error_locations = scan_result["error_locations"]
 
             return {
                 "ci_logs": ci_logs,
@@ -460,6 +413,53 @@ SyntaxError: {e.msg}
         except Exception as e:
             logger.error(f"收集上下文失败: {e}", exc_info=True)
             return {"success": False, "error_message": f"收集上下文失败: {str(e)}"}
+
+    def _scan_syntax_files(
+        self, repo_path: str, error_locations: List[Dict], ci_logs: str
+    ) -> Dict[str, Any]:
+        """当语法错误未关联到具体文件时，扫描仓库中的Python文件定位语法错误"""
+        import ast
+        from src.agent.tools.langchain_tools import search_files, read_file
+
+        syntax_error_files = []
+        py_files = search_files.invoke({"pattern": "**/*.py"})
+
+        for file_path in py_files:
+            try:
+                full_file_path = f"{repo_path}/{file_path}"
+                content = read_file.invoke({"file_path": full_file_path})
+                if not content.startswith("Error:"):
+                    ast.parse(content)
+            except SyntaxError as e:
+                if file_path not in syntax_error_files:
+                    syntax_error_files.append(file_path)
+                logger.info(f"找到语法错误文件: {file_path}:{e.lineno}")
+                for err in error_locations:
+                    if (
+                        err.get("error_type") == "SyntaxError"
+                        or "syntaxerror" in err.get("error_message", "").lower()
+                    ):
+                        err["file_path"] = file_path
+                        err["line_number"] = e.lineno
+                        err["error_message"] = str(e)
+                        err["error_type"] = "SyntaxError"
+                syntax_error_details = (
+                    f'\nFile "{file_path}", line {e.lineno}\n'
+                    f"{e.text}\n{' ' * (e.offset - 1)}^\n"
+                    f"SyntaxError: {e.msg}\n"
+                )
+                ci_logs = ci_logs + "\n" + "=" * 50 + "\n"
+                ci_logs += "自动扫描找到的语法错误详情：\n"
+                ci_logs += syntax_error_details
+                ci_logs += "=" * 50 + "\n"
+
+        if not syntax_error_files:
+            return {"error": "语法错误发生在Python系统库中，无法自动修复"}
+        return {
+            "syntax_error_files": syntax_error_files,
+            "ci_logs": ci_logs,
+            "error_locations": error_locations,
+        }
 
     async def _run_fix_agent(self, state: RepairState) -> Command:
         """
@@ -629,7 +629,7 @@ SyntaxError: {e.msg}
             # 获取diff
             diff_content = get_diff.invoke({"base_branch": state["event"].branch})
 
-            # 只返回状态更新，由固定边跳转到review_changes
+            # 正常路径：返回状态更新并路由到 review_changes
             update_state = {
                 "fix_description": fix_result["fix_description"],
                 "modified_files": fix_result["modified_files"],
@@ -655,7 +655,7 @@ SyntaxError: {e.msg}
                     }
                 )
 
-            return Command(update=update_state)
+            return Command(update=update_state, goto="review_changes")
 
         except Exception as e:
             logger.error(f"修复Agent执行失败: {e}", exc_info=True)
@@ -827,7 +827,9 @@ SyntaxError: {e.msg}
 
             # 提交变更
             commit_message = f"Auto-fix: {state['fix_description']}\n\nGenerated by SpiderClaw AutoFix Agent."
-            commit_result = commit_changes.invoke({"message": commit_message})
+            commit_result = commit_changes.invoke(
+                {"message": commit_message, "files": state["modified_files"]}
+            )
             if commit_result.startswith("Error:"):
                 return {
                     "success": False,
@@ -905,70 +907,18 @@ SyntaxError: {e.msg}
         # 临时目录会在工具上下文被覆盖时自动清理
         return {"success": False, "error_message": error_msg}
 
-    async def run(self, event: GitHubEvent) -> Dict[str, Any]:
+    async def run(self, event: GitHubEvent, ci_logs: str = "") -> Dict[str, Any]:
         """
         运行修复流程
 
         Args:
             event: GitHub事件对象
+            ci_logs: 可选的CI日志内容，如果提供则不下载日志（用于本地测试）
 
         Returns:
             Dict: 最终修复结果
         """
         logger.info(f"启动修复流程: {event.event_id}")
-
-        try:
-            # 初始化状态
-            initial_state: RepairState = {
-                "event": event,
-                "ci_logs": "",
-                "repo_path": "",
-                "error_locations": [],
-                "fix_description": "",
-                "modified_files": [],
-                "code_changes": {},
-                "original_codes": {},
-                "diff_content": "",
-                "review_passed": False,
-                "review_comments": "",
-                "change_lines": 0,
-                "risk_warnings": [],
-                "test_passed": False,
-                "test_output": "",
-                "failed_tests": [],
-                "pr_url": None,
-                "pr_number": None,
-                "success": False,
-                "error_message": "",
-                "retry_count": 0,
-                "max_retries": self.max_retries,
-            }
-
-            # 运行图
-            final_state = await self.graph.ainvoke(initial_state)
-
-            logger.info(f"修复流程完成: 成功={final_state['success']}")
-            if final_state.get("pr_url"):
-                logger.info(f"PR地址: {final_state['pr_url']}")
-
-            return final_state
-
-        except Exception as e:
-            logger.error(f"修复流程异常: {e}", exc_info=True)
-            return {"success": False, "error_message": f"修复流程异常: {str(e)}"}
-
-    async def run_repair(self, event: GitHubEvent, ci_logs: str = "") -> Dict[str, Any]:
-        """
-        运行修复流程，支持直接传入CI日志（用于本地测试）
-
-        Args:
-            event: GitHub事件对象
-            ci_logs: 可选的CI日志内容，如果提供则不下载日志
-
-        Returns:
-            Dict: 最终修复结果
-        """
-        logger.info(f"启动本地修复流程: {event.event_id}")
 
         try:
             # 初始化状态
@@ -1009,3 +959,7 @@ SyntaxError: {e.msg}
         except Exception as e:
             logger.error(f"修复流程异常: {e}", exc_info=True)
             return {"success": False, "error_message": f"修复流程异常: {str(e)}"}
+
+    async def run_repair(self, event: GitHubEvent, ci_logs: str = "") -> Dict[str, Any]:
+        """向后兼容别名，与run()功能相同。"""
+        return await self.run(event, ci_logs=ci_logs)

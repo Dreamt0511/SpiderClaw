@@ -125,6 +125,7 @@ async def test_event_bus_drain():
     async def consumer():
         while bus.qsize() > 0:
             await bus.subscribe()
+            bus.mark_done()
             await asyncio.sleep(0.01)
 
     consumer_task = asyncio.create_task(consumer())

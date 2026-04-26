@@ -68,14 +68,21 @@ class EventBus:
 
     async def subscribe(self) -> BaseEvent:
         """
-        订阅事件（阻塞）
+        订阅事件（阻塞）。消费者处理完事件后应调用 mark_done()。
 
         Returns:
             BaseEvent: 从队列中获取的事件
         """
         event = await self.queue.get()
-        self.queue.task_done()
         return event
+
+    def mark_done(self) -> None:
+        """标记当前事件已处理完成，配合 subscribe() 使用。"""
+        self.queue.task_done()
+
+    async def task_done(self) -> None:
+        """标记当前事件已处理完成（别名，兼容旧调用）。"""
+        self.queue.task_done()
 
     async def is_duplicate(self, event_id: str) -> bool:
         """

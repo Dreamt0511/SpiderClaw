@@ -95,22 +95,13 @@ class FixAgent:
                     "error": "重试次数达到上限",
                 }
 
-            # 检查是否有语法错误（Orchestrator已经处理了错误分类和文件扫描）
-            is_syntax_error = any(
-                err.get("error_type", "").lower() == "syntaxerror"
-                or "syntaxerror" in err.get("error_message", "").lower()
-                for err in error_locations
-            )
-            # 收集所有有语法错误的文件（去重），不要过滤，让Agent尝试处理所有文件
-            syntax_error_files = []
+            # 收集所有有明确文件路径的错误文件（去重），不限于语法错误
+            target_files = []
             for err in error_locations:
-                if (
-                    err.get("error_type", "").lower() == "syntaxerror"
-                    or "syntaxerror" in err.get("error_message", "").lower()
-                ):
-                    file_path = err.get("file_path")
-                    if file_path and file_path not in syntax_error_files:
-                        syntax_error_files.append(file_path)
+                file_path = err.get("file_path")
+                error_type = err.get("error_type", "")
+                if file_path and file_path != "<string>" and file_path not in target_files:
+                    target_files.append(file_path)
 
             # 设置工具上下文
             set_tool_context(
@@ -121,7 +112,7 @@ class FixAgent:
 
             #审查反馈（需要修改）
             review_feedback_section = (f"""{review_feedback}""" if review_feedback else "")
-            
+
             # 风险警告（需要修复）
             risk_warnings_section = (f"""{"\n- ".join(risk_warnings)}""" if risk_warnings and len(risk_warnings) > 0 else "")
 
@@ -140,24 +131,21 @@ class FixAgent:
 
             # 简化日志输出，避免编码问题
             logger.info(f"找到错误数量: {len(error_locations)}")
-            logger.info(f"是否有语法错误: {is_syntax_error}")
-            logger.info(f"语法错误文件列表: {syntax_error_files}")
+            logger.info(f"目标修复文件列表: {target_files}")
 
-            # 构建目标文件指令（动态部分）
+            # 构建目标文件指令（动态部分）—— 对所有有文件路径的错误类型生效
             force_instruction_content = ""
-            if syntax_error_files:
-                if len(syntax_error_files) == 1:
-                    # 单个文件修复
-                    file_path = syntax_error_files[0]
+            if target_files:
+                if len(target_files) == 1:
+                    file_path = target_files[0]
                     force_instruction_content = f"""1. **唯一修复目标文件：{file_path}**
    - 你 **只能** 修复这个文件，绝对不允许修改或返回其他任何文件
    - 在你的JSON响应中，`modified_files`数组 **必须** 只包含["{file_path}"]
    - 在你的JSON响应中，`code_changes`对象的key **必须** 是"{file_path}"
 """
                 else:
-                    # 多个文件修复
-                    files_str = "、".join(syntax_error_files)
-                    files_json = '", "'.join(syntax_error_files)
+                    files_str = "、".join(target_files)
+                    files_json = '", "'.join(target_files)
                     force_instruction_content = f"""1. **修复目标文件列表：{files_str}**
    - 你 **只能** 修复列表中的这些文件，绝对不允许修改或返回其他任何文件
    - 在你的JSON响应中，`modified_files`数组 **必须** 只包含["{files_json}"]
@@ -166,7 +154,7 @@ class FixAgent:
                 logger.info(f"构建目标文件指令: {force_instruction_content[:300]}...")
             else:
                 force_instruction_content = ""
-                logger.info("没有找到语法错误文件，不添加目标文件指令")
+                logger.info("没有找到带文件路径的错误，不添加目标文件指令")
 
             user_input = FIX_AGENT_USER_PROMPT.format(
                 force_instruction_content=force_instruction_content,
@@ -259,122 +247,61 @@ class FixAgent:
                 normalized_code_changes[normalize_path(path)] = content
             fix_result["code_changes"] = normalized_code_changes
 
-            # 语法错误强制检查：必须返回非空的code_changes
-            if is_syntax_error:
+            # 修复结果验证（适用于所有错误类型）
+            if target_files:
                 # 检查返回的文件路径是否符合要求
-                expected_files = [
-                    err.get("file_path")
-                    for err in error_locations
-                    if err.get("error_type")
-                    in ["SyntaxError", "IndentationError", "TabError"]
-                    and err.get("file_path")
-                    and err.get("file_path") != "<string>"
+                expected_files = [f.lstrip("./").replace("\\", "/") for f in target_files]
+                expected_files = list(set(expected_files))
+
+                # 检查返回的文件是否在预期列表中
+                returned_files = [
+                    f.lstrip("./").replace("\\", "/")
+                    for f in fix_result.get("code_changes", {}).keys()
                 ]
-                # 清理路径中的./前缀和路径分隔符
-                expected_files = [
-                    f.lstrip("./").replace("\\", "/") for f in expected_files
+                invalid_files = [
+                    f for f in returned_files if f not in expected_files
                 ]
-                expected_files = list(set(expected_files))  # 去重
 
-                if expected_files:
-                    # 检查返回的文件是否在预期列表中
-                    returned_files = [
-                        f.lstrip("./").replace("\\", "/")
-                        for f in fix_result.get("code_changes", {}).keys()
-                    ]
-                    invalid_files = [
-                        f for f in returned_files if f not in expected_files
-                    ]
-
-                    if invalid_files:
-                        logger.error(
-                            f"修复Agent返回了不允许的文件: {invalid_files}，允许修复的文件: {expected_files}"
-                        )
-                        if retry_count < 2:
-                            feedback_msg = f"严重错误：你返回了不在允许列表中的文件路径 {invalid_files}，这是绝对禁止的！\n"
-                            feedback_msg += f"允许修复的文件列表是：{expected_files}\n"
-                            feedback_msg += "请严格遵守指令，只修复列表中的文件，禁止编造任何不存在的文件路径。"
-
-                            return await self.generate_fix(
-                                ci_logs=ci_logs,
-                                error_locations=error_locations,
-                                review_feedback=feedback_msg,
-                                risk_warnings=risk_warnings,
-                                test_output=test_output,
-                                failed_tests=failed_tests,
-                                retry_count=retry_count + 1,
-                            )
-
-                if (
-                    not fix_result.get("code_changes")
-                    or len(fix_result["code_changes"]) == 0
-                ):
-                    # 检查是否已经尝试过所有方法仍然找不到文件
-                    has_unknown_file = any(
-                        err.get("error_type") == "SyntaxError"
-                        and not err.get("file_path")
-                        for err in error_locations
+                if invalid_files:
+                    logger.error(
+                        f"修复Agent返回了不允许的文件: {invalid_files}，允许修复的文件: {expected_files}"
                     )
+                    # 不在此处重试，由Orchestrator的review→retry循环处理
+                    return {
+                        "fix_description": f"修复Agent返回了不允许的文件: {invalid_files}",
+                        "modified_files": fix_result.get("modified_files", []),
+                        "code_changes": fix_result.get("code_changes", {}),
+                        "error": f"返回了不在允许列表中的文件: {invalid_files}",
+                    }
 
-                    if has_unknown_file and retry_count >= 1:
-                        # 已经重试一次仍然找不到文件，直接返回失败，避免死循环
-                        logger.error("无法定位语法错误所在文件，放弃修复")
-                        return {
-                            "fix_description": "无法定位语法错误所在的文件，需要人工处理",
-                            "modified_files": [],
-                            "code_changes": {},
-                            "error": "无法定位语法错误文件",
-                        }
+            if (
+                not fix_result.get("code_changes")
+                or len(fix_result["code_changes"]) == 0
+            ):
+                logger.error("修复Agent返回了空的code_changes")
+                # 不在此处重试，由Orchestrator的review→retry循环处理
+                return {
+                    "fix_description": "修复Agent未能生成有效的代码变更",
+                    "modified_files": fix_result.get("modified_files", []),
+                    "code_changes": fix_result.get("code_changes", {}),
+                    "error": "code_changes为空",
+                }
 
-                    logger.error("语法错误修复结果为空，重试")
-                    # 构建明确的反馈信息，告诉Agent已经找到的错误位置
-                    error_details = []
-                    for err in error_locations:
-                        if err.get("error_type") == "SyntaxError" and err.get(
-                            "file_path"
-                        ):
-                            error_details.append(
-                                f"文件 {err['file_path']} 第 {err['line_number']} 行存在语法错误：{err['error_message']}"
-                            )
-
-                    feedback_msg = (
-                        "语法错误必须修复，已经为你定位到错误位置：\n"
-                        + "\n".join(error_details)
-                        + "\n"
-                    )
-                    feedback_msg += (
-                        "请直接读取对应的文件，修复语法错误，必须返回完整的修复代码。"
-                    )
-
-                    # 递归重试，最多3次，传递更新后的ci_logs
-                    return await self.generate_fix(
-                        ci_logs=ci_logs,
-                        error_locations=error_locations,
-                        review_feedback=feedback_msg,
-                        risk_warnings=risk_warnings,
-                        test_output=test_output,
-                        failed_tests=failed_tests,
-                        retry_count=retry_count + 1,
-                    )
-                # 验证修复后的代码没有语法错误
-                for file_path, code_content in fix_result["code_changes"].items():
-                    try:
-                        # 尝试解析代码，检查语法错误
-                        import ast
-
-                        ast.parse(code_content)
-                        logger.info(f"文件 {file_path} 语法检查通过")
-                    except SyntaxError as e:
-                        logger.error(f"修复后的代码仍然有语法错误: {e}，重试")
-                        return await self.generate_fix(
-                            ci_logs=ci_logs,
-                            error_locations=error_locations,
-                            review_feedback=f"修复后的代码仍然有语法错误: {str(e)}，请重新修复",
-                            risk_warnings=risk_warnings,
-                            test_output=test_output,
-                            failed_tests=failed_tests,
-                            retry_count=retry_count + 1,
-                        )
+            # 验证修复后的代码没有语法错误
+            for file_path, code_content in fix_result["code_changes"].items():
+                try:
+                    import ast
+                    ast.parse(code_content)
+                    logger.info(f"文件 {file_path} 语法检查通过")
+                except SyntaxError as e:
+                    logger.error(f"修复后的代码仍然有语法错误: {e}")
+                    # 不在此处重试，由Orchestrator的review→retry循环处理
+                    return {
+                        "fix_description": f"修复后的代码仍有语法错误: {str(e)}",
+                        "modified_files": fix_result.get("modified_files", []),
+                        "code_changes": fix_result.get("code_changes", {}),
+                        "error": f"生成的代码有语法错误: {str(e)}",
+                    }
 
             logger.info(f"修复生成成功: {fix_result['fix_description']}")
             return fix_result

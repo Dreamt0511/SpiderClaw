@@ -127,12 +127,22 @@ def start(
                 if isinstance(event, GitHubEvent) and event.conclusion == "failure":
                     logger.info(f"收到CI失败事件: {event.event_id}, 仓库: {event.repository}, 分支: {event.branch}")
 
-                    # 异步执行修复流程，不阻塞消费
+                    async def process_and_mark_done():
+                        try:
+                            await orchestrator.run(event)
+                        finally:
+                            event_bus.mark_done()
+
                     asyncio.create_task(
-                        orchestrator.run(event),
+                        process_and_mark_done(),
                         name=f"repair_{event.event_id}"
                     )
+                else:
+                    event_bus.mark_done()
 
+            except asyncio.CancelledError:
+                logger.info("事件消费循环被取消")
+                break
             except Exception as e:
                 logger.error(f"事件消费出错: {e}", exc_info=True)
                 await asyncio.sleep(1)
