@@ -933,6 +933,9 @@ class RepairOrchestrator:
                     # 提取错误类型
                     error_types = list({err.get('error_type', 'Unknown') for err in state['error_locations']})
                     error_type_str = ', '.join(error_types)
+                    # 获取PR提交者昵称和bug数量
+                    pr_author = event.payload.get('sender', {}).get('login', '未知用户')
+                    bug_count = len(state['error_locations'])
 
                     # 给每个配置的用户发送通知
                     for user_id in self.lark_notify_users:
@@ -944,7 +947,9 @@ class RepairOrchestrator:
                                 pr_url=pr_url,
                                 fix_description=state['fix_description'],
                                 receive_id=user_id,
-                                receive_id_type="open_id"
+                                receive_id_type="open_id",
+                                pr_author=pr_author,
+                                bug_count=bug_count
                             )
                         )
 
@@ -973,6 +978,10 @@ class RepairOrchestrator:
             # 提取错误类型
             error_types = list({err.get('error_type', 'Unknown') for err in state['error_locations']})
             error_type_str = ', '.join(error_types) if error_types else 'Unknown'
+            # 获取PR提交者昵称和bug数量
+            event = state['event']
+            pr_author = event.payload.get('sender', {}).get('login', '未知用户')
+            bug_count = len(state['error_locations'])
 
             # 给每个配置的用户发送通知
             for user_id in self.lark_notify_users:
@@ -980,12 +989,14 @@ class RepairOrchestrator:
                     send_repair_notification(
                         repair_success=False,
                         error_type=error_type_str,
-                        source_branch=state['event'].branch,
+                        source_branch=event.branch,
                         pr_url="",
                         fix_description=state.get('fix_description', '修复失败'),
                         receive_id=user_id,
                         receive_id_type="open_id",
-                        error_message=error_msg
+                        error_message=error_msg,
+                        pr_author=pr_author,
+                        bug_count=bug_count
                     )
                 )
 

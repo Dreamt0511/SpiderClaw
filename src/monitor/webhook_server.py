@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import hmac
 import logging
+import os
 from datetime import datetime
 from typing import Optional, Callable, Awaitable
 from fastapi import FastAPI, Request, HTTPException, Response
@@ -318,7 +319,8 @@ def run_webhook_server(
     """同步方式启动Webhook服务（用于CLI直接调用）"""
     from src.config.settings import get_settings
     from src.utils.logging import get_logger
-    from src.bus import get_event_bus
+    from src.bus import get_event_bus, GitHubEvent
+    from src.agent.orchestrator import RepairOrchestrator
 
     log = get_logger(__name__)
 
@@ -341,6 +343,9 @@ def run_webhook_server(
 
     settings = get_settings()
 
+    # 设置SSL验证环境变量（CI日志下载等HTTP客户端会读取）
+    os.environ["SSL_VERIFY"] = str(settings.webhook.ssl_verify).lower()
+
     webhook_secret = secret or settings.webhook.secret
     if not webhook_secret:
         console.print("[bold #ff4444]错误：Webhook secret 未配置，请通过 --secret 参数或配置文件设置[/bold #ff4444]")
@@ -360,13 +365,33 @@ def run_webhook_server(
         allowed_events=set(settings.webhook.allowed_events),
     )
 
+    # 初始化修复编排器
+    orchestrator = None
+    if settings.agent.enabled:
+        log.info("自动修复功能已启用")
+        try:
+            orchestrator = RepairOrchestrator(
+                github_token=settings.github.token,
+                openai_api_key=settings.openai.api_key,
+                openai_base_url=settings.openai.base_url,
+                llm_model=settings.openai.model_name,
+                max_retries=settings.agent.max_retries,
+                max_change_lines=settings.agent.max_change_lines,
+                lark_notify_enabled=settings.lark.enabled,
+                lark_notify_users=settings.lark.notify_users,
+            )
+        except Exception as e:
+            log.warning(f"初始化修复编排器失败: {e}，自动修复功能已禁用")
+
     # 显示启动面板
+    repair_status = "[green]已启用[/green]" if orchestrator else "[dim]未启用[/dim]"
     console.print(Panel(
         f"[bold #ffffff]SpiderClaw 总监控服务已启动[/bold #ffffff]\n\n"
         f"监听地址: [bold #4488ff]http://{host}:{port}[/bold #4488ff]\n"
         f"Webhook端点: [bold #4488ff]/webhook/github[/bold #4488ff]\n"
         f"健康检查: [bold #4488ff]/health[/bold #4488ff]\n"
-        f"允许事件: [bold #4488ff]{', '.join(settings.webhook.allowed_events)}[/bold #4488ff]\n\n"
+        f"允许事件: [bold #4488ff]{', '.join(settings.webhook.allowed_events)}[/bold #4488ff]\n"
+        f"自动修复: {repair_status}\n\n"
         f"[dim]按 Ctrl+C 停止服务[/dim]",
         title="[bold #4488ff]SpiderClaw 运行中[/bold #4488ff]",
         border_style="#2453fc",
@@ -374,8 +399,43 @@ def run_webhook_server(
     ))
     console.print()
 
+    async def event_consumer():
+        """事件消费循环"""
+        if not orchestrator:
+            return
+
+        log.info("事件消费循环已启动，等待CI失败事件...")
+        while True:
+            try:
+                event = await event_bus.subscribe()
+
+                if isinstance(event, GitHubEvent) and event.conclusion == "failure":
+                    log.info(f"收到CI失败事件: {event.event_id}, 仓库: {event.repository}, 分支: {event.branch}")
+
+                    async def process_and_mark_done():
+                        try:
+                            await orchestrator.run(event)
+                        finally:
+                            event_bus.mark_done()
+
+                    asyncio.create_task(
+                        process_and_mark_done(),
+                        name=f"repair_{event.event_id}"
+                    )
+                else:
+                    event_bus.mark_done()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.error(f"事件消费出错: {e}", exc_info=True)
+                await asyncio.sleep(1)
+
     async def _run():
-        await monitor.start()
+        tasks = [asyncio.create_task(monitor.start())]
+        if orchestrator:
+            tasks.append(asyncio.create_task(event_consumer()))
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     try:
         asyncio.run(_run())

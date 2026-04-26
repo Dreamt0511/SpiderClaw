@@ -13,7 +13,7 @@ class WebhookConfig(BaseModel):
     port: int = Field(default=8000, description="监听端口")
     reload: bool = Field(default=False, description="是否启用热重载")
     allowed_events: list[str] = Field(
-        default_factory=lambda: ["workflow_run", "pull_request", "check_run"],
+        default_factory=lambda: ["workflow_run", "pull_request"],
         description="允许的事件类型"
     )
     max_payload_size: str = Field(default="10MB", description="最大请求体大小")
