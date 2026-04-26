@@ -423,6 +423,9 @@ class RepairOrchestrator:
                 "test_output": "",  # 初始化测试反馈字段
                 "risk_warnings": [],  # 初始化风险警告字段
                 "failed_tests": [],  # 初始化失败测试字段
+                "has_critical_risks": False,  # 初始化致命风险标记
+                "has_high_risks": False,  # 初始化高危风险标记
+                "risk_level": "NONE",  # 初始化风险等级
             }
 
         except Exception as e:
@@ -727,39 +730,46 @@ class RepairOrchestrator:
 
     def _route_after_review(self, state: RepairState) -> str:
         """
-        审查后的路由逻辑（基于风险分级）
+        审查后的路由逻辑（基于四级风险分级）
 
-        - 严重风险 → 重试（如果可达上限则仍创建 PR 并标记警告）
-        - 仅警告/无风险 + 审查通过 → 进入测试
-        - 仅警告/无风险 + 审查不通过 → 仍进入测试（低风险不放慢流程）
+        - CRITICAL → 立即终止修复流程，绝不创建PR
+        - HIGH → 强制重试修复，重试用尽后创建带"禁止合并"标签的PR
+        - MEDIUM/LOW/NONE → 无论审查是否通过，进入测试阶段
         """
         # 如果有明确的错误消息且success为False，说明之前的节点已经失败
         if state.get("success") is False and state.get("error_message"):
             logger.error(f"流程已失败: {state.get('error_message', '未知错误')}")
             return "handle_failure"
 
+        risk_level = state.get("risk_level", "NONE")
         retry_count = state.get("retry_count", 0)
-        has_critical_risks = state.get("has_critical_risks", False)
 
-        # 有严重风险 → 重试（如果达到上限则创建 PR 并标记）
-        if has_critical_risks:
+        # CRITICAL → 立即终止，绝不创建PR
+        if risk_level == "CRITICAL":
+            logger.error(
+                f"致命安全风险，终止修复流程: {state.get('risk_warnings', [])}"
+            )
+            return "handle_failure"
+
+        # HIGH → 强制重试，重试用尽后创建带"禁止合并"标签的PR
+        if risk_level == "HIGH" or state.get("has_high_risks", False):
             if retry_count < state["max_retries"]:
                 logger.info(
-                    f"存在严重风险，重试修复 (第 {retry_count + 1} 次,"
+                    f"存在高危风险，重试修复 (第 {retry_count + 1} 次,"
                     f" 共 {state['max_retries']} 次)"
                 )
                 return "fix_agent"
             logger.warning(
-                f"重试 {state['max_retries']} 次后仍存在严重风险，"
-                f"仍然创建 PR（标记需人工确认）"
+                f"重试 {state['max_retries']} 次后仍存在高危风险，"
+                f"创建带'禁止合并'标签的PR，转人工处理"
             )
+            # 标记为高危PR，create_pr节点会检查此标记
             return "create_pr"
 
-        # 无严重风险 → 无论审查是否通过，都进入测试阶段
-        # LLM 不通过的原因（如代码风格、可读性等）不应阻塞修复流程
+        # MEDIUM/LOW/NONE → 无论审查是否通过，进入测试阶段
         if not state.get("review_passed", False):
             logger.info(
-                f"审查未通过但无严重风险，仍进入测试阶段"
+                f"审查未通过但风险等级为{risk_level}，仍进入测试阶段"
             )
         else:
             logger.info("审查通过，进入测试阶段")
@@ -1009,6 +1019,16 @@ class RepairOrchestrator:
 
 """)
 
+            # HIGH风险重试用尽后创建的PR：加"禁止合并"醒目标签
+            if state.get("has_high_risks", False) or state.get("risk_level") == "HIGH":
+                pr_body_parts.insert(0, f"""| 🚨 禁止合并 🚨 |
+| --- |
+| 此PR包含高危风险（如不安全的子进程调用、硬编码密钥、函数契约破坏等）， |
+| 重试 {state.get('max_retries', '?')} 次后仍未能消除。 |
+| **强烈建议人工审查所有变更，确认安全后再决定是否合并**。 |
+
+""")
+
             # uncertain 时在 PR 顶部额外加一个醒目警告
             if validation_status == 'uncertain':
                 pr_body_parts.insert(0, f"""| ⚠️ 自动验证结果不确定 |
@@ -1163,6 +1183,9 @@ class RepairOrchestrator:
                 "review_comments": "",
                 "change_lines": 0,
                 "risk_warnings": [],
+                "has_critical_risks": False,
+                "has_high_risks": False,
+                "risk_level": "NONE",
                 "test_passed": False,
                 "test_output": "",
                 "failed_tests": [],

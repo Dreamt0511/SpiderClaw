@@ -459,9 +459,33 @@ def parse_python_errors(log_content: str) -> List[Dict]:
         re.MULTILINE
     )
 
+    # 匹配pytest失败详情格式（短测试摘要之后的详细traceback段）
+    pytest_detail_pattern = re.compile(
+        r'_{10,}\s+FAILED.*?_{10,}\n.*?([A-Z][a-zA-Z0-9]*Error): (.*?)\n',
+        re.DOTALL
+    )
+
+    # 匹配Flask错误页面片段（如 ValueError: ... / werkzeug.exceptions...）
+    flask_error_pattern = re.compile(
+        r'(?:werkzeug\.|flask\.).*?([A-Z][a-zA-Z0-9]*(?:Error|Exception)): (.*?)$',
+        re.MULTILINE
+    )
+
+    # 匹配Django错误页面片段
+    django_error_pattern = re.compile(
+        r'(?:django\.core\.|django\.db\.).*?([A-Z][a-zA-Z0-9]*(?:Error|Exception)): (.*?)$',
+        re.MULTILINE
+    )
+
     # 匹配ERROR: 开头的非标准错误行
     error_prefix_pattern = re.compile(
         r'^ERROR:\s*(.*)$',
+        re.MULTILINE
+    )
+
+    # 匹配裸 Error: 后跟描述的格式（非标准但常见）
+    bare_error_pattern = re.compile(
+        r'^Error:\s*(.*?)$',
         re.MULTILINE
     )
 
@@ -616,6 +640,97 @@ def parse_python_errors(log_content: str) -> List[Dict]:
                 "line_number": 0,
                 "error_type": error_type,
                 "error_message": error_message,
+                "traceback": f"{error_type}: {error_message}"
+            })
+
+    # 提取pytest失败详情（短测试摘要后的详细traceback段）
+    for match in pytest_detail_pattern.finditer(processed_content):
+        error_type = match.group(1)
+        error_message = match.group(2).strip()
+
+        # 从匹配上下文中提取文件路径
+        context_start = max(0, match.start() - 500)
+        context = processed_content[context_start:match.start()]
+        file_path = ""
+        line_number = 0
+        file_match = re.search(r'File "([^"]+\.py)", line (\d+)', context)
+        if file_match and file_match.group(1) != "<string>":
+            file_path = file_match.group(1)
+            line_number = int(file_match.group(2))
+
+        if (error_type, error_message) not in existing_errors:
+            existing_errors.add((error_type, error_message))
+            errors.append({
+                "type": "pytest_detail",
+                "file_path": file_path,
+                "line_number": line_number,
+                "error_type": error_type,
+                "error_message": error_message,
+                "traceback": f"{error_type}: {error_message}"
+            })
+
+    # 提取Flask框架错误
+    for match in flask_error_pattern.finditer(processed_content):
+        error_type = match.group(1)
+        error_message = match.group(2).strip()
+        if (error_type, error_message) not in existing_errors:
+            existing_errors.add((error_type, error_message))
+            errors.append({
+                "type": "framework",
+                "file_path": "",
+                "line_number": 0,
+                "error_type": error_type,
+                "error_message": error_message,
+                "traceback": f"{error_type}: {error_message}"
+            })
+
+    # 提取Django框架错误
+    for match in django_error_pattern.finditer(processed_content):
+        error_type = match.group(1)
+        error_message = match.group(2).strip()
+        if (error_type, error_message) not in existing_errors:
+            existing_errors.add((error_type, error_message))
+            errors.append({
+                "type": "framework",
+                "file_path": "",
+                "line_number": 0,
+                "error_type": error_type,
+                "error_message": error_message,
+                "traceback": f"{error_type}: {error_message}"
+            })
+
+    # 提取裸 Error: 后跟描述的格式
+    for match in bare_error_pattern.finditer(processed_content):
+        error_message = match.group(1).strip()
+        if not error_message:
+            continue
+
+        error_type = "UnknownError"
+        # 尝试提取具体的错误类型
+        error_type_match = re.match(r'([A-Z][a-zA-Z0-9]*(?:Error|Exception|Warning)):?\s*', error_message)
+        if error_type_match:
+            error_type = error_type_match.group(1)
+            error_message = error_message[error_type_match.end():].strip()
+
+        # 提取变量名或缺失模块名等关键线索
+        key_clue = ""
+        # NameError线索: name 'xxx' is not defined
+        name_match = re.search(r"name '(\w+)'", error_message)
+        if name_match:
+            key_clue = f" (变量: {name_match.group(1)})"
+        # ImportError线索: No module named 'xxx'
+        module_match = re.search(r"No module named '?(\w+)'?", error_message)
+        if module_match:
+            key_clue = f" (缺失模块: {module_match.group(1)})"
+
+        if (error_type, error_message) not in existing_errors:
+            existing_errors.add((error_type, error_message))
+            errors.append({
+                "type": "bare_error",
+                "file_path": "",
+                "line_number": 0,
+                "error_type": error_type,
+                "error_message": error_message + key_clue,
                 "traceback": f"{error_type}: {error_message}"
             })
 

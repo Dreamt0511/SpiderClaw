@@ -1,6 +1,7 @@
 """审查Agent实现 - LangChain标准版本"""
 
 from typing import Dict, Any, List
+import ast
 import logging
 import difflib
 import re
@@ -45,29 +46,53 @@ class ReviewAgent:
         )
         self.system_prompt = REVIEW_AGENT_SYSTEM_PROMPT
 
-    # 严重风险模式（必须拦截，触发后强制重试）
+    # ===== 风险分级模式库 =====
+    # CRITICAL：立即终止修复流程，绝不创建PR
     _CRITICAL_PATTERNS = [
-        r"rm\s+-rf",                         # 递归删除
-        r"shutil\.rmtree",                    # 删除目录树
-        r"os\.remove",                        # 删除文件
-        r"os\.unlink",                        # 删除链接
-        r"os\.rmdir",                         # 删除目录
-        r"os\.system",                        # 执行系统命令
-        r"exec\(",                            # 执行任意代码
+        r"\beval\s*\(",                       # 任意代码执行
+        r"\bexec\s*\(",                       # 任意代码执行
+        r"\bos\.system\s*\(",                 # 执行系统命令
+        r"\bos\.popen\s*\(",                  # 执行系统命令
+        r"rm\s+-rf\s+/",                      # 递归删除根目录
+        r"shutil\.rmtree\s*\(",               # 删除目录树
+        r"\b__import__\s*\(",                 # 动态导入
+        r"\bcompile\s*\(.*\)\s*;\s*(?:exec|eval)", # 动态编译+执行
+    ]
+
+    # HIGH：强制重试，重试用尽后创建带"禁止合并"标签的PR
+    _HIGH_PATTERNS = [
+        r"\bsubprocess\.run\s*\([^)]*shell\s*=\s*True", # shell=True的子进程
+        r"\bsubprocess\.call\s*\([^)]*shell\s*=\s*True", # shell=True的子进程
+        r"\bsubprocess\.Popen\s*\([^)]*shell\s*=\s*True", # shell=True的子进程
+        r"\bos\.remove\s*\(",                 # 删除文件
+        r"\bos\.unlink\s*\(",                 # 删除链接
+        r"\bos\.rmdir\s*\(",                  # 删除目录
+        r"\bpickle\.loads\s*\(",              # 不安全反序列化
+        r"\byaml\.load\s*\(",                 # 不安全YAML解析（应用safe_load）
+        r"api_key\s*=\s*['\"]",               # 硬编码API密钥
+        r"secret\s*=\s*['\"]",                # 硬编码机密
+        r"token\s*=\s*['\"]",                 # 硬编码Token
+        r"password\s*=\s*['\"]",              # 硬编码密码
         r"DROP\s+TABLE",                      # 删除数据库表
         r"DELETE\s+FROM.*WHERE\s+1=1",        # 危险SQL删除
     ]
 
-    # 低风险模式（仅警告，不阻止流程）
-    _WARNING_PATTERNS = [
-        r"eval\(",                            # eval动态执行
-        r"subprocess\.run",                   # 运行子进程
-        r"subprocess\.call",                  # 调用子进程
-        r"subprocess\.Popen",                 # 启动子进程
-        r"api_key\s*=",                       # API密钥硬编码
-        r"secret\s*=",                        # 机密信息
-        r"token\s*=",                         # Token硬编码
-        r"password\s*=",                      # 密码硬编码
+    # MEDIUM：作为警告附在PR中，不阻止合并
+    _MEDIUM_PATTERNS = [
+        r"\bsubprocess\.run\s*\(",            # 子进程调用（未用shell=True）
+        r"\bsubprocess\.call\s*\(",           # 子进程调用
+        r"\bsubprocess\.Popen\s*\(",          # 子进程调用
+        r"\bpdb\.set_trace\s*\(",             # 调试断点
+        r"\bprint\s*\(",                      # 调试输出（生产代码中）
+        r"import\s+pdb",                      # 导入调试器
+        r"\bassert\s+",                       # 断言（可能被优化掉）
+    ]
+
+    # LOW：仅记录日志，不影响流程
+    _LOW_PATTERNS = [
+        r"#\s*TODO",                          # TODO注释
+        r"#\s*FIXME",                         # FIXME注释
+        r"#\s*HACK",                          # HACK注释
     ]
 
     def _strip_line_comment(self, line: str) -> str:
@@ -102,26 +127,31 @@ class ReviewAgent:
         return results
 
     def _static_security_check(
-        self, code_changes: Dict[str, str], diff_content: str
+        self, code_changes: Dict[str, str], diff_content: str,
+        original_codes: Dict[str, str] = None,
     ) -> Dict[str, Any]:
         """
-        静态安全检查（先于LLM审查执行）
+        静态安全检查（先于LLM审查执行），四级风险分类
 
-        分级处理:
-        - 严重风险 (critical) → 直接拦截，触发重试
-        - 低风险 (warning)  → 仅记录警告，不阻止流程
+        - CRITICAL：立即终止修复流程，绝不创建PR
+        - HIGH：强制重试，重试用尽后创建带"禁止合并"标签的PR
+        - MEDIUM：作为警告附在PR中，不阻止合并
+        - LOW：仅记录日志
 
         Args:
             code_changes: 代码变更字典
             diff_content: diff内容
+            original_codes: 原始代码字典，用于契约变更检测
 
         Returns:
-            Dict: 检查结果
+            Dict: 检查结果，包含 risk_level 字段
         """
-        risk_warnings = []
         critical_risks = []
+        high_risks = []
+        medium_risks = []
+        low_risks = []
 
-        # 1. 检查变更行数（仅作为警告，不拦截）
+        # 1. 检查变更行数
         add_count = 0
         remove_count = 0
         for line in diff_content.split("\n"):
@@ -132,38 +162,129 @@ class ReviewAgent:
         change_lines = add_count + remove_count
 
         if change_lines > self.max_change_lines:
-            risk_warnings.append(
-                f"[警告] 变更行数超过建议值: {change_lines} 行，"
+            low_risks.append(
+                f"[LOW] 变更行数超过建议值: {change_lines} 行，"
                 f"建议不超过 {self.max_change_lines} 行"
             )
 
-        # 2. 扫描严重风险模式（排除注释后匹配）
+        # 2. 按四级模式扫描（排除注释后匹配）
         for file_path, content in code_changes.items():
             critical_risks.extend(
                 self._scan_patterns_in_content(
-                    file_path, content, self._CRITICAL_PATTERNS, "严重"
+                    file_path, content, self._CRITICAL_PATTERNS, "CRITICAL"
                 )
             )
-
-        # 3. 扫描低风险模式（排除注释后匹配）
-        for file_path, content in code_changes.items():
-            risk_warnings.extend(
+            high_risks.extend(
                 self._scan_patterns_in_content(
-                    file_path, content, self._WARNING_PATTERNS, "警告"
+                    file_path, content, self._HIGH_PATTERNS, "HIGH"
+                )
+            )
+            medium_risks.extend(
+                self._scan_patterns_in_content(
+                    file_path, content, self._MEDIUM_PATTERNS, "MEDIUM"
+                )
+            )
+            low_risks.extend(
+                self._scan_patterns_in_content(
+                    file_path, content, self._LOW_PATTERNS, "LOW"
                 )
             )
 
-        # 4. 检查是否修改了非Python文件（仅作为警告）
+        # 3. 检查是否修改了非Python文件
         for file_path in code_changes.keys():
             if not file_path.endswith(".py"):
-                risk_warnings.append(f"[警告] 修改了非Python文件: {file_path}")
+                medium_risks.append(f"[MEDIUM] 修改了非Python文件: {file_path}")
+
+        # 4. 契约变更检测：检查修复是否改变了原函数的签名或行为
+        contract_warnings = self._detect_contract_changes(code_changes, original_codes)
+        high_risks.extend(contract_warnings)
+
+        # 确定最高风险等级
+        if critical_risks:
+            risk_level = "CRITICAL"
+        elif high_risks:
+            risk_level = "HIGH"
+        elif medium_risks:
+            risk_level = "MEDIUM"
+        elif low_risks:
+            risk_level = "LOW"
+        else:
+            risk_level = "NONE"
+
+        # 合并所有风险为 risk_warnings（保持向下兼容）
+        risk_warnings = low_risks + medium_risks + high_risks + critical_risks
 
         return {
             "change_lines": change_lines,
             "risk_warnings": risk_warnings,
             "critical_risks": critical_risks,
+            "high_risks": high_risks,
+            "medium_risks": medium_risks,
+            "low_risks": low_risks,
             "has_critical_risks": len(critical_risks) > 0,
+            "has_high_risks": len(high_risks) > 0,
+            "risk_level": risk_level,
         }
+
+    def _detect_contract_changes(
+        self, code_changes: Dict[str, str], original_codes: Dict[str, str]
+    ) -> list:
+        """检测修复是否改变了原函数的契约（签名、返回类型、副作用）"""
+        warnings = []
+        if not original_codes:
+            return warnings
+
+        for file_path, fixed_code in code_changes.items():
+            original = original_codes.get(file_path, "")
+            if not original:
+                continue
+
+            try:
+                orig_tree = ast.parse(original)
+                fixed_tree = ast.parse(fixed_code)
+            except SyntaxError:
+                continue
+
+            # 提取函数定义：名称 + 参数列表
+            def _extract_func_signatures(tree):
+                sigs = {}
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        arg_names = [a.arg for a in node.args.args]
+                        defaults_count = len(node.args.defaults)
+                        sigs[node.name] = {
+                            "args": arg_names,
+                            "defaults_count": defaults_count,
+                            "lineno": node.lineno,
+                        }
+                return sigs
+
+            orig_sigs = _extract_func_signatures(orig_tree)
+            fixed_sigs = _extract_func_signatures(fixed_tree)
+
+            # 检查共享函数的签名是否被修改
+            for func_name in orig_sigs:
+                if func_name not in fixed_sigs:
+                    continue
+                orig_sig = orig_sigs[func_name]
+                fixed_sig = fixed_sigs[func_name]
+
+                # 参数列表改变 → 契约破坏
+                if orig_sig["args"] != fixed_sig["args"]:
+                    warnings.append(
+                        f"[HIGH] 函数契约变更: {file_path}:{orig_sig['lineno']} "
+                        f"函数 `{func_name}` 参数列表被修改 "
+                        f"(原始: {orig_sig['args']}, 修复后: {fixed_sig['args']})"
+                    )
+                # 默认参数数量改变 → 契约破坏
+                elif orig_sig["defaults_count"] != fixed_sig["defaults_count"]:
+                    warnings.append(
+                        f"[HIGH] 函数契约变更: {file_path}:{orig_sig['lineno']} "
+                        f"函数 `{func_name}` 默认参数数量被修改 "
+                        f"(原始: {orig_sig['defaults_count']}, "
+                        f"修复后: {fixed_sig['defaults_count']})"
+                    )
+        return warnings
 
     def _auto_compare_codes(
         self, original_codes: Dict[str, str], code_changes: Dict[str, str], modified_files: List[str]
@@ -240,25 +361,43 @@ class ReviewAgent:
         try:
             logger.info("运行审查Agent")
 
-            # 先执行静态检查
-            static_result = self._static_security_check(code_changes, diff_content)
+            # 先执行静态检查（传入原始代码用于契约变更检测）
+            static_result = self._static_security_check(
+                code_changes, diff_content, original_codes=original_codes
+            )
 
-            # 严重风险 → 直接拦截，不提交LLM审查
-            if static_result["has_critical_risks"]:
-                logger.warning(f"发现严重风险: {static_result['critical_risks']}")
+            # CRITICAL → 立即终止，绝不创建PR
+            if static_result["risk_level"] == "CRITICAL":
+                logger.error(f"发现致命安全风险，终止流程: {static_result['critical_risks']}")
                 return {
                     "review_passed": False,
-                    "review_comments": "发现严重风险，审查未通过: "
+                    "review_comments": "发现致命安全风险，修复流程终止: "
                     + "; ".join(static_result["critical_risks"]),
                     "change_lines": static_result["change_lines"],
                     "risk_warnings": static_result["risk_warnings"],
                     "has_critical_risks": True,
+                    "has_high_risks": False,
+                    "risk_level": "CRITICAL",
                 }
 
-            # 低风险（警告）→ 记录但继续LLM审查
+            # HIGH → 拦截但不终止，触发重试
+            if static_result["has_high_risks"]:
+                logger.warning(f"发现高危风险: {static_result['high_risks']}")
+                return {
+                    "review_passed": False,
+                    "review_comments": "发现高危风险: "
+                    + "; ".join(static_result["high_risks"]),
+                    "change_lines": static_result["change_lines"],
+                    "risk_warnings": static_result["risk_warnings"],
+                    "has_critical_risks": False,
+                    "has_high_risks": True,
+                    "risk_level": "HIGH",
+                }
+
+            # MEDIUM/LOW → 记录但继续LLM审查
             if static_result["risk_warnings"]:
                 logger.info(
-                    f"发现低风险警告（不阻止流程）: {static_result['risk_warnings']}"
+                    f"发现中低风险警告（不阻止流程）: {static_result['risk_warnings']}"
                 )
 
             # 设置工具上下文
@@ -397,7 +536,11 @@ class ReviewAgent:
                 )
 
             review_result["review_passed"] = llm_passed
-            logger.info(f"审查完成. 通过: {review_result['review_passed']}")
+            # 保留静态检查确定的风险等级
+            review_result["risk_level"] = static_result["risk_level"]
+            review_result["has_critical_risks"] = static_result["has_critical_risks"]
+            review_result["has_high_risks"] = static_result["has_high_risks"]
+            logger.info(f"审查完成. 通过: {review_result['review_passed']}, 风险等级: {static_result['risk_level']}")
             return review_result
 
         except Exception as e:

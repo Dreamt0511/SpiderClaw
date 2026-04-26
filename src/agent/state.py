@@ -32,6 +32,9 @@ class RepairState(TypedDict):
     review_comments: str  # 审查意见
     change_lines: int  # 变更总行数（新增+删除）
     risk_warnings: Annotated[List[str], operator.add]  # 风险警告列表，支持追加
+    has_critical_risks: bool  # 是否存在致命风险（CRITICAL级）
+    has_high_risks: bool  # 是否存在高危风险（HIGH级）
+    risk_level: str  # 最高风险等级: CRITICAL / HIGH / MEDIUM / LOW / NONE
 
     # 测试阶段
     test_passed: bool  # 测试是否通过（向后兼容）
