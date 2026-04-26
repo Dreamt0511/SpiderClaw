@@ -360,6 +360,45 @@ def download_ci_logs(logs_url: str) -> str:
             logger.info(f"转换为API URL: {logs_url}")
 
         response = session.get(logs_url, stream=True, timeout=30)
+
+        # 处理404：run-level日志URL可能返回404，需回退到job-level
+        if response.status_code == 404:
+            # 尝试从URL中提取run_id，获取jobs列表后按job下载
+            run_match = re.search(
+                r'/repos/([^/]+)/([^/]+)/actions/runs/(\d+)/logs', logs_url
+            )
+            if run_match and github_token:
+                owner, repo_name, run_id = run_match.groups()
+                jobs_url = (
+                    f"https://api.github.com/repos/{owner}/{repo_name}/actions/runs/{run_id}/jobs"
+                )
+                logger.info(f"run-level日志404，尝试获取jobs列表: {jobs_url}")
+                jobs_resp = session.get(jobs_url, timeout=15)
+                jobs_resp.raise_for_status()
+                jobs_data = jobs_resp.json()
+                job_logs = []
+
+                for job in jobs_data.get("jobs", []):
+                    job_id = job.get("id")
+                    if not job_id:
+                        continue
+                    job_log_url = (
+                        f"https://api.github.com/repos/{owner}/{repo_name}/actions/jobs/{job_id}/logs"
+                    )
+                    logger.info(f"下载job {job_id} ({job.get('name', '')})日志: {job_log_url}")
+                    job_resp = session.get(job_log_url, stream=True, timeout=30)
+                    job_resp.raise_for_status()
+                    job_logs.append(f"=== Job: {job.get('name', job_id)} ===\n")
+                    for chunk in job_resp.iter_content(chunk_size=None):
+                        if chunk:
+                            job_logs.append(chunk.decode("utf-8", errors="replace"))
+
+                if job_logs:
+                    return "\n".join(job_logs)
+
+            # 实在获取不到，返回原始错误
+            response.raise_for_status()
+
         response.raise_for_status()
 
         # 创建临时目录保存日志
