@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
-"""项目入口脚本"""
-# 提前配置日志和编码
-from src.utils.logging import setup_logging
-setup_logging()
+"""SpiderClaw - 入口文件"""
+import sys
+import os
 
-from src.cli.app import app
+ENTRY_DIR = os.path.dirname(os.path.abspath(__file__))
+os.chdir(ENTRY_DIR)
+if ENTRY_DIR not in sys.path:
+    sys.path.insert(0, ENTRY_DIR)
+
+
+def main():
+    from src.cli.app import app
+    app()
+
 
 if __name__ == "__main__":
-    app()
+    main()

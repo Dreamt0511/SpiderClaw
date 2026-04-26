@@ -1,19 +1,9 @@
 """Webhook服务相关命令"""
-import asyncio
-import os
 import typer
 from rich.console import Console
-from rich.table import Table
-
-from src.config.settings import get_settings
-from src.utils.logging import setup_logging, get_logger
-from src.bus import get_event_bus, GitHubEvent
-from src.monitor import GitHubWebhookMonitor
-from src.agent.orchestrator import RepairOrchestrator
 
 webhook_app = typer.Typer(help="GitHub Webhook服务管理")
 console = Console()
-logger = get_logger(__name__)
 
 
 @webhook_app.command("start")
@@ -26,7 +16,16 @@ def start(
     config: str = typer.Option(None, "--config", "-c", help="配置文件路径"),
 ):
     """启动GitHub Webhook服务"""
-    # 构建覆盖配置
+    import asyncio
+    import os
+
+    from src.config.settings import get_settings
+    from src.utils.logging import setup_logging, get_logger
+    from src.bus import get_event_bus, GitHubEvent
+    from src.monitor import GitHubWebhookMonitor
+    from src.agent.orchestrator import RepairOrchestrator
+
+    logger = get_logger(__name__)
     overrides = {}
 
     # Webhook配置覆盖
@@ -84,6 +83,7 @@ def start(
     )
 
     # 打印启动信息
+    from rich.table import Table
     table = Table(title="GitHub Webhook服务配置")
     table.add_column("配置项", style="cyan")
     table.add_column("值", style="green")
@@ -179,6 +179,9 @@ def show_config(
     log_level: str = typer.Option(None, "--log-level", help="日志级别"),
 ):
     """显示当前配置（用于调试）"""
+    from src.config.settings import get_settings
+    from rich.table import Table
+
     overrides = {}
 
     # Webhook配置覆盖

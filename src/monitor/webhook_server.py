@@ -302,3 +302,47 @@ class GitHubWebhookMonitor(BaseMonitor):
         # 等待事件队列排空
         await self.event_bus.drain()
         logger.info("GitHub Webhook server stopped gracefully")
+
+
+def run_webhook_server(
+    host: str = "0.0.0.0",
+    port: int = 8000,
+    reload: bool = False,
+    secret: Optional[str] = None,
+) -> None:
+    """同步方式启动Webhook服务（用于CLI直接调用）"""
+    from src.config.settings import get_settings
+    from src.utils.logging import get_logger
+    from src.bus import get_event_bus
+
+    log = get_logger(__name__)
+
+    settings = get_settings()
+
+    webhook_secret = secret or settings.webhook.secret
+    if not webhook_secret:
+        log.error("Webhook secret not configured")
+        print("[red]错误：Webhook secret 未配置，请通过 --secret 参数或配置文件设置[/red]")
+        return
+
+    event_bus = get_event_bus(
+        maxsize=settings.webhook.event_queue_maxsize,
+        max_processed_ids=settings.webhook.max_processed_ids,
+    )
+
+    monitor = GitHubWebhookMonitor(
+        event_bus=event_bus,
+        secret=webhook_secret,
+        host=host,
+        port=port,
+        reload=reload,
+        allowed_events=set(settings.webhook.allowed_events),
+    )
+
+    async def _run():
+        await monitor.start()
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        log.info("Webhook server stopped by user")

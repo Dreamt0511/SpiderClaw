@@ -55,6 +55,15 @@ class OpenAIConfig(BaseModel):
     timeout: int = Field(default=60, description="API请求超时时间（秒）")
 
 
+class LarkConfig(BaseModel):
+    """飞书通知配置"""
+    enabled: bool = Field(default=False, description="是否启用飞书通知")
+    app_id: str = Field(default="", description="飞书应用ID")
+    app_secret: str = Field(default="", description="飞书应用密钥")
+    notify_users: list[str] = Field(default_factory=list, description="需要通知的用户open_id列表")
+    notify_groups: list[str] = Field(default_factory=list, description="需要通知的群组chat_id列表")
+
+
 class Settings(BaseSettings):
     """全局配置"""
     model_config = SettingsConfigDict(
@@ -77,6 +86,9 @@ class Settings(BaseSettings):
 
     # OpenAI配置
     openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
+
+    # 飞书配置
+    lark: LarkConfig = Field(default_factory=LarkConfig)
 
     # 环境
     environment: str = Field(default="development", description="运行环境")

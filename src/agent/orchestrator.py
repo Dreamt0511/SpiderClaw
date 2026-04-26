@@ -25,6 +25,7 @@ from src.agent.tools import (
     create_pull_request,
 )
 from src.bus.schemas import GitHubEvent
+from src.notify.lark_notify import send_repair_notification
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,8 @@ class RepairOrchestrator:
         llm_model: str = "gpt-4o",
         max_retries: int = 3,
         max_change_lines: int = 20,
+        lark_notify_enabled: bool = False,
+        lark_notify_users: list[str] = None,
     ):
         """
         初始化编排器
@@ -51,6 +54,8 @@ class RepairOrchestrator:
             llm_model: LLM模型名称
             max_retries: 最大修复重试次数
             max_change_lines: 最大允许变更行数
+            lark_notify_enabled: 是否启用飞书通知
+            lark_notify_users: 需要通知的飞书用户open_id列表
         """
         self.github_token = github_token
         self.openai_api_key = openai_api_key
@@ -58,6 +63,10 @@ class RepairOrchestrator:
         self.llm_model = llm_model
         self.max_retries = max_retries
         self.max_change_lines = max_change_lines
+
+        # 飞书通知配置
+        self.lark_notify_enabled = lark_notify_enabled
+        self.lark_notify_users = lark_notify_users or []
 
         # 事件去重：已处理的PR或提交SHA
         self.processed_events = set()
@@ -850,22 +859,56 @@ class RepairOrchestrator:
                 }
 
             # 创建PR
-            pr_title = f"[AutoFix] {state['fix_description']}"
-            pr_body = f"""## 修复说明
+            pr_title = f"[SpiderClaw-自动修复]: {state['fix_description']}"
+
+            # 错误类型去重
+            error_types = list({err.get('error_type', 'Unknown') for err in state['error_locations']})
+            error_types_str = ', '.join(error_types)
+
+            # 相关PR链接
+            pr_link = f"#{event.pr_number}" if event.pr_number else "无"
+
+            # 原始CI日志链接
+            ci_logs_link = f"[链接]({event.logs_url})" if event.logs_url else "无"
+
+            # 审查结果状态
+            review_status = "✅ 通过" if state['review_passed'] else "❌ 不通过"
+
+            # 测试结果状态
+            test_status = "✅ 通过" if state['test_passed'] else "❌ 不通过"
+
+            # 风险警告
+            risk_warning = '; '.join(state['risk_warnings']) if state['risk_warnings'] else "无"
+
+            # 构建PR正文
+            pr_body = f"""## 🎯 修复概览
+- 原错误分支: `{event.branch}`
+- 修复分支: `{branch_name}`
+- 错误类型: {error_types_str}
+- 修改文件: {len(state['modified_files'])} 个
+- 变更行数: {state['change_lines']} 行
+- 相关PR: {pr_link}
+- 原始CI日志: {ci_logs_link}
+
+## ✅ 检查结果
+- 代码审查: {review_status}
+- 测试验证: {test_status}
+- 风险警告: {risk_warning}
+
+<details>
+<summary>🔍 查看详细变更</summary>
+
+## 修复说明
 {state['fix_description']}
 
 ## 变更详情
-- 修复的错误类型: {', '.join(err.get('error_type', 'Unknown') for err in state['error_locations'])}
 - 修改文件: {', '.join(state['modified_files'])}
-- 变更行数: {state['change_lines']} 行
 
-## 审查结果
-✅ 审查通过
-{'风险警告: ' + '; '.join(state['risk_warnings']) if state['risk_warnings'] else '无风险警告'}
-
-## 测试结果
-✅ 测试通过
-{len(state['failed_tests'])} 个测试失败
+## 代码Diff
+```diff
+{state['diff_content']}
+```
+</details>
 
 ---
 此PR由SpiderClaw自动修复系统生成
@@ -884,6 +927,27 @@ class RepairOrchestrator:
             if not pr_url.startswith("Error:"):
                 # 从URL中提取PR编号
                 pr_number = int(pr_url.split("/")[-1]) if pr_url else None
+
+                # 发送飞书成功通知
+                if self.lark_notify_enabled and self.lark_notify_users:
+                    # 提取错误类型
+                    error_types = list({err.get('error_type', 'Unknown') for err in state['error_locations']})
+                    error_type_str = ', '.join(error_types)
+
+                    # 给每个配置的用户发送通知
+                    for user_id in self.lark_notify_users:
+                        asyncio.create_task(
+                            send_repair_notification(
+                                repair_success=True,
+                                error_type=error_type_str,
+                                source_branch=event.branch,
+                                pr_url=pr_url,
+                                fix_description=state['fix_description'],
+                                receive_id=user_id,
+                                receive_id_type="open_id"
+                            )
+                        )
+
                 return {
                     "pr_url": pr_url,
                     "pr_number": pr_number,
@@ -903,6 +967,27 @@ class RepairOrchestrator:
         """
         error_msg = state.get("error_message", "未知错误")
         logger.error(f"修复流程失败: {error_msg}")
+
+        # 发送飞书失败通知
+        if self.lark_notify_enabled and self.lark_notify_users:
+            # 提取错误类型
+            error_types = list({err.get('error_type', 'Unknown') for err in state['error_locations']})
+            error_type_str = ', '.join(error_types) if error_types else 'Unknown'
+
+            # 给每个配置的用户发送通知
+            for user_id in self.lark_notify_users:
+                asyncio.create_task(
+                    send_repair_notification(
+                        repair_success=False,
+                        error_type=error_type_str,
+                        source_branch=state['event'].branch,
+                        pr_url="",
+                        fix_description=state.get('fix_description', '修复失败'),
+                        receive_id=user_id,
+                        receive_id_type="open_id",
+                        error_message=error_msg
+                    )
+                )
 
         # 临时目录会在工具上下文被覆盖时自动清理
         return {"success": False, "error_message": error_msg}
