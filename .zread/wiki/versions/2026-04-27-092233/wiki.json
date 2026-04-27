@@ -1,0 +1,194 @@
+{
+  "id": "2026-04-27-092233",
+  "generated_at": "2026-04-27T01:22:33.0255668Z",
+  "language": "en",
+  "pages": [
+    {
+      "slug": "1-overview",
+      "title": "Overview",
+      "file": "1-overview.md",
+      "section": "Get Started",
+      "level": "Beginner"
+    },
+    {
+      "slug": "2-quick-start",
+      "title": "Quick Start",
+      "file": "2-quick-start.md",
+      "section": "Get Started",
+      "level": "Beginner"
+    },
+    {
+      "slug": "3-installation-guide",
+      "title": "Installation Guide",
+      "file": "3-installation-guide.md",
+      "section": "Get Started",
+      "level": "Beginner"
+    },
+    {
+      "slug": "4-basic-configuration",
+      "title": "Basic Configuration",
+      "file": "4-basic-configuration.md",
+      "section": "Get Started",
+      "level": "Beginner"
+    },
+    {
+      "slug": "5-supported-error-types-reference",
+      "title": "Supported Error Types Reference",
+      "file": "5-supported-error-types-reference.md",
+      "section": "Get Started",
+      "level": "Beginner"
+    },
+    {
+      "slug": "6-github-webhook-configuration",
+      "title": "GitHub Webhook Configuration",
+      "file": "6-github-webhook-configuration.md",
+      "section": "Get Started",
+      "group": "Integration Setup",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "7-feishu-lark-notification-setup",
+      "title": "Feishu/Lark Notification Setup",
+      "file": "7-feishu-lark-notification-setup.md",
+      "section": "Get Started",
+      "group": "Integration Setup",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "8-system-architecture-overview",
+      "title": "System Architecture Overview",
+      "file": "8-system-architecture-overview.md",
+      "section": "Deep Dive",
+      "group": "Core Architecture",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "9-event-bus-design-and-implementation",
+      "title": "Event Bus Design \u0026 Implementation",
+      "file": "9-event-bus-design-and-implementation.md",
+      "section": "Deep Dive",
+      "group": "Core Architecture",
+      "level": "Advanced"
+    },
+    {
+      "slug": "10-agent-orchestration-workflow",
+      "title": "Agent Orchestration Workflow",
+      "file": "10-agent-orchestration-workflow.md",
+      "section": "Deep Dive",
+      "group": "Core Architecture",
+      "level": "Advanced"
+    },
+    {
+      "slug": "11-agent-subsystem-deep-dive",
+      "title": "Agent Subsystem Deep Dive",
+      "file": "11-agent-subsystem-deep-dive.md",
+      "section": "Deep Dive",
+      "group": "Core Modules",
+      "level": "Advanced"
+    },
+    {
+      "slug": "12-monitor-subsystem-deep-dive",
+      "title": "Monitor Subsystem Deep Dive",
+      "file": "12-monitor-subsystem-deep-dive.md",
+      "section": "Deep Dive",
+      "group": "Core Modules",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "13-notification-subsystem-deep-dive",
+      "title": "Notification Subsystem Deep Dive",
+      "file": "13-notification-subsystem-deep-dive.md",
+      "section": "Deep Dive",
+      "group": "Core Modules",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "14-safety-guardrail-mechanism",
+      "title": "Safety Guardrail Mechanism",
+      "file": "14-safety-guardrail-mechanism.md",
+      "section": "Deep Dive",
+      "group": "Core Modules",
+      "level": "Advanced"
+    },
+    {
+      "slug": "15-configuration-system-design",
+      "title": "Configuration System Design",
+      "file": "15-configuration-system-design.md",
+      "section": "Deep Dive",
+      "group": "Core Modules",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "16-cli-command-reference",
+      "title": "CLI Command Reference",
+      "file": "16-cli-command-reference.md",
+      "section": "Deep Dive",
+      "group": "Developer Guide",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "17-rest-api-reference",
+      "title": "REST API Reference",
+      "file": "17-rest-api-reference.md",
+      "section": "Deep Dive",
+      "group": "Developer Guide",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "18-custom-tool-development",
+      "title": "Custom Tool Development",
+      "file": "18-custom-tool-development.md",
+      "section": "Deep Dive",
+      "group": "Developer Guide",
+      "level": "Advanced"
+    },
+    {
+      "slug": "19-custom-subagent-development",
+      "title": "Custom Subagent Development",
+      "file": "19-custom-subagent-development.md",
+      "section": "Deep Dive",
+      "group": "Developer Guide",
+      "level": "Advanced"
+    },
+    {
+      "slug": "20-prompt-customization-guide",
+      "title": "Prompt Customization Guide",
+      "file": "20-prompt-customization-guide.md",
+      "section": "Deep Dive",
+      "group": "Developer Guide",
+      "level": "Advanced"
+    },
+    {
+      "slug": "21-local-testing-guide",
+      "title": "Local Testing Guide",
+      "file": "21-local-testing-guide.md",
+      "section": "Deep Dive",
+      "group": "Testing \u0026 Operations",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "22-unit-testing-best-practices",
+      "title": "Unit Testing Best Practices",
+      "file": "22-unit-testing-best-practices.md",
+      "section": "Deep Dive",
+      "group": "Testing \u0026 Operations",
+      "level": "Intermediate"
+    },
+    {
+      "slug": "23-production-deployment-guide",
+      "title": "Production Deployment Guide",
+      "file": "23-production-deployment-guide.md",
+      "section": "Deep Dive",
+      "group": "Testing \u0026 Operations",
+      "level": "Advanced"
+    },
+    {
+      "slug": "24-common-troubleshooting",
+      "title": "Common Troubleshooting",
+      "file": "24-common-troubleshooting.md",
+      "section": "Deep Dive",
+      "group": "Testing \u0026 Operations",
+      "level": "Intermediate"
+    }
+  ]
+}
