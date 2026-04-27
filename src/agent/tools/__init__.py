@@ -14,7 +14,8 @@ from .langchain_tools import (
     parse_python_errors,
     run_tests,
     push_branch,
-    create_pull_request
+    create_pull_request,
+    execute_python_code,
 )
 
 __all__ = [
@@ -32,5 +33,6 @@ __all__ = [
     "parse_python_errors",
     "run_tests",
     "push_branch",
-    "create_pull_request"
+    "create_pull_request",
+    "execute_python_code",
 ]

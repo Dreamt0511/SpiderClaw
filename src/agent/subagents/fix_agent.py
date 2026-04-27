@@ -1,6 +1,7 @@
 """修复Agent实现 - LangChain标准版本"""
 
 from typing import Dict, Any, List
+import json
 import logging
 from langchain.agents import create_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -56,6 +57,82 @@ class FixAgent:
         self.agent = create_agent(
             model=self.llm, tools=self.tools, system_prompt=FIX_AGENT_SYSTEM_PROMPT
         )
+
+    @staticmethod
+    def _parse_json_safely(json_str: str) -> Dict[str, Any] | None:
+        """健壮的JSON解析，尝试多种策略处理LLM常见的JSON格式问题"""
+        import re as _re
+
+        # 清理：移除BOM、空字符
+        json_str = json_str.strip().lstrip("﻿")
+
+        # 策略1: 标准解析
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            pass
+
+        # 策略2: 宽松模式（允许字符串中的未转义控制字符）
+        try:
+            return json.loads(json_str, strict=False)
+        except json.JSONDecodeError:
+            pass
+
+        # 策略3: 移除尾随逗号后重试
+        try:
+            cleaned = _re.sub(r",\s*([}\]])", r"\1", json_str)
+            return json.loads(cleaned, strict=False)
+        except json.JSONDecodeError:
+            pass
+
+        # 策略4: 处理 code_changes 值中可能的未转义双引号
+        # 在 code_changes 的字符串值中，找到并转义未转义的 " 字符
+        try:
+            # 查找 code_changes 对象中所有字符串值
+            def _escape_code_content(m):
+                prefix = m.group(1)  # "filename.py": "
+                content = m.group(2)  # the raw content
+                # 转义内容中的未转义双引号（但不转义已转义的 \"）
+                escaped = content.replace('\\"', "\x00")  # 暂存已转义的
+                escaped = escaped.replace('"', '\\"')  # 转义所有
+                escaped = escaped.replace("\x00", '\\"')  # 恢复原来的
+                return prefix + escaped + '"'
+
+            # 匹配 "key": "value" 模式，其中 value 跨越多行
+            pattern = _re.compile(
+                r'("(?:code_changes|fix_description)"\s*:\s*")(.*?)(?<!\\")"(?=\s*[,}\]])',
+                _re.DOTALL,
+            )
+            # 这只修复简单的 case，复杂 case 需要递归
+            repaired = json_str
+            for _ in range(3):  # 多次迭代处理嵌套
+                new_repaired = pattern.sub(_escape_code_content, repaired)
+                if new_repaired == repaired:
+                    break
+                repaired = new_repaired
+            return json.loads(repaired, strict=False)
+        except (json.JSONDecodeError, Exception):
+            pass
+
+        # 策略5: 手动提取必需字段（最后手段）
+        try:
+            result = {"fix_description": "", "modified_files": [], "code_changes": {}}
+            fd_match = _re.search(r'"fix_description"\s*:\s*"((?:[^"\\]|\\.)*)"', json_str)
+            if fd_match:
+                result["fix_description"] = fd_match.group(1)
+            mf_match = _re.search(r'"modified_files"\s*:\s*\[(.*?)\]', json_str)
+            if mf_match:
+                result["modified_files"] = _re.findall(r'"([^"]+)"', mf_match.group(1))
+            cc_match = _re.search(r'"code_changes"\s*:\s*{(.+)}', json_str, _re.DOTALL)
+            if cc_match:
+                files = _re.findall(r'"([^"]+\.py)"\s*:', cc_match.group(1))
+                result["code_changes"] = {f: "" for f in files}
+            if result["code_changes"]:
+                return result
+        except Exception:
+            pass
+
+        return None
 
     async def generate_fix(
         self,
@@ -218,13 +295,12 @@ class FixAgent:
                         json_content = response_content.strip()
                         logger.warning(f"无法提取JSON，响应内容为: {response_content}")
 
-            # 尝试解析JSON
-            try:
-                fix_result = json.loads(json_content)
-                logger.info(f"JSON解析成功: {fix_result}")
-            except json.JSONDecodeError as e:
+            # 尝试解析JSON（带自动修复）
+            fix_result = self._parse_json_safely(json_content)
+            if fix_result is None:
                 logger.error(f"JSON解析失败，内容: {json_content}")
-                raise
+                raise json.JSONDecodeError("所有修复策略均失败", json_content, 0)
+            logger.info(f"JSON解析成功: {fix_result}")
 
             # 验证结果格式
             required_fields = ["fix_description", "modified_files", "code_changes"]

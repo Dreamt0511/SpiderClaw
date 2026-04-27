@@ -489,6 +489,24 @@ def parse_python_errors(log_content: str) -> List[Dict]:
         re.MULTILINE
     )
 
+    # 匹配 "ERROR: ..." 格式（CI 常见）
+    error_generic = re.compile(
+        r'^ERROR:\s*(.*?)(?:\s*$)',
+        re.MULTILINE
+    )
+
+    # 匹配 pytest 失败详情
+    pytest_detail = re.compile(
+        r'E\s+([A-Z][a-zA-Z0-9]*Error):\s*(.*?)$',
+        re.MULTILINE
+    )
+
+    # 匹配 traceback 的简写形式
+    traceback_short = re.compile(
+        r'([A-Z][a-zA-Z0-9]*Error):\s*(.*?)\n\s*at\s+(\S+)',
+        re.MULTILINE
+    )
+
     # 提取所有Traceback
     for match in traceback_pattern.finditer(processed_content):
         full_traceback = match.group(0)
@@ -885,6 +903,96 @@ def create_pull_request(
         return f"Error: 创建PR失败: {str(e)}"
 
 
+@tool
+def execute_python_code(file_path: str, timeout: int = 10) -> str:
+    """
+    在隔离子进程中执行指定的 Python 文件，捕获异常并返回结果。
+    用于验证修复后的代码是否能正常运行。
+
+    Args:
+        file_path: 要执行的 Python 文件路径（相对于仓库根目录）
+        timeout: 执行超时时间（秒），默认 10 秒
+
+    Returns:
+        str: JSON格式的执行结果 {success, exit_code, stdout, stderr, error_type, error_message, error_line}
+    """
+    import json
+
+    repo_path = get_tool_context().get("repo_path", "")
+    if not repo_path:
+        return json.dumps({"success": False, "error_message": "仓库路径未设置"}, ensure_ascii=False)
+
+    full_path = os.path.abspath(os.path.join(repo_path, file_path))
+    if not full_path.startswith(os.path.abspath(repo_path)):
+        return json.dumps({"success": False, "error_message": f"路径超出仓库范围: {file_path}"}, ensure_ascii=False)
+
+    if not os.path.exists(full_path):
+        return json.dumps({"success": False, "error_message": f"文件不存在: {file_path}"}, ensure_ascii=False)
+
+    try:
+        result = subprocess.run(
+            ["python", full_path],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=repo_path,
+            encoding='utf-8',
+            errors='replace',
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        )
+
+        error_type = ""
+        error_message = ""
+        error_line = 0
+
+        stderr = result.stderr
+        if result.returncode != 0 and stderr:
+            # 匹配 Traceback 中的异常信息（全文搜索）
+            tb_match = re.search(
+                r"(\w+Error):\s*(.+)",
+                stderr,
+            )
+            if tb_match:
+                error_type = tb_match.group(1)
+                error_message = tb_match.group(2).strip()
+
+            # 匹配失败行的行号
+            line_match = re.search(r"line (\d+)", stderr)
+            if line_match:
+                error_line = int(line_match.group(1))
+
+        return json.dumps({
+            "success": result.returncode == 0,
+            "exit_code": result.returncode,
+            "stdout": result.stdout[:5000] if result.stdout else "",
+            "stderr": stderr[:5000] if stderr else "",
+            "error_type": error_type,
+            "error_message": error_message,
+            "error_line": error_line,
+        }, ensure_ascii=False)
+
+    except subprocess.TimeoutExpired:
+        return json.dumps({
+            "success": False,
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": f"执行超时（{timeout}秒）",
+            "error_type": "TimeoutError",
+            "error_message": f"代码执行超过 {timeout} 秒",
+            "error_line": 0,
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": str(e),
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "error_line": 0,
+        }, ensure_ascii=False)
+
+
 # 导出所有工具
 all_tools = [
     read_file,
@@ -899,5 +1007,6 @@ all_tools = [
     parse_python_errors,
     run_tests,
     push_branch,
-    create_pull_request
+    create_pull_request,
+    execute_python_code,
 ]

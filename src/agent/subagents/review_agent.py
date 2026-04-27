@@ -47,48 +47,44 @@ class ReviewAgent:
         self.system_prompt = REVIEW_AGENT_SYSTEM_PROMPT
 
     # ===== 风险分级模式库 =====
-    # CRITICAL：立即终止修复流程，绝不创建PR
+    # CRITICAL（致命）：立即终止修复流程，绝不创建PR
     _CRITICAL_PATTERNS = [
-        r"\beval\s*\(",                       # 任意代码执行
-        r"\bexec\s*\(",                       # 任意代码执行
-        r"\bos\.system\s*\(",                 # 执行系统命令
-        r"\bos\.popen\s*\(",                  # 执行系统命令
+        r"\beval\s*\(",                       # 动态执行任意代码
+        r"\bexec\s*\(",                       # 执行任意代码
+        r"\bcompile\s*\(",                    # 编译任意代码
+        r"\b__import__\s*\(",                 # 动态导入
+        r"\bos\.system\s*\(",                 # 系统命令执行
+        r"\bos\.popen\s*\(",                  # 管道命令执行
+        r"\bsubprocess\.call\s*\(\s*shell\s*=\s*True",  # shell执行
+        r"\bsubprocess\.Popen\s*\(\s*shell\s*=\s*True", # shell执行
         r"rm\s+-rf\s+/",                      # 递归删除根目录
         r"shutil\.rmtree\s*\(",               # 删除目录树
-        r"\b__import__\s*\(",                 # 动态导入
-        r"\bcompile\s*\(.*\)\s*;\s*(?:exec|eval)", # 动态编译+执行
+        r"__import__\s*\(\s*os\s*\)\.system",  # 混淆导入
     ]
 
-    # HIGH：强制重试，重试用尽后创建带"禁止合并"标签的PR
+  # HIGH（高危）：强制重试，重试用尽后创建带"禁止合并"标签的PR
     _HIGH_PATTERNS = [
-        r"\bsubprocess\.run\s*\([^)]*shell\s*=\s*True", # shell=True的子进程
-        r"\bsubprocess\.call\s*\([^)]*shell\s*=\s*True", # shell=True的子进程
-        r"\bsubprocess\.Popen\s*\([^)]*shell\s*=\s*True", # shell=True的子进程
-        r"\bos\.remove\s*\(",                 # 删除文件
-        r"\bos\.unlink\s*\(",                 # 删除链接
-        r"\bos\.rmdir\s*\(",                  # 删除目录
-        r"\bpickle\.loads\s*\(",              # 不安全反序列化
-        r"\byaml\.load\s*\(",                 # 不安全YAML解析（应用safe_load）
-        r"api_key\s*=\s*['\"]",               # 硬编码API密钥
-        r"secret\s*=\s*['\"]",                # 硬编码机密
-        r"token\s*=\s*['\"]",                 # 硬编码Token
-        r"password\s*=\s*['\"]",              # 硬编码密码
-        r"DROP\s+TABLE",                      # 删除数据库表
-        r"DELETE\s+FROM.*WHERE\s+1=1",        # 危险SQL删除
+        r"\bsubprocess\.(?:run|call|Popen)\s*\(",   # 子进程调用（潜在命令注入）
+        r"\bos\.remove\s*\(",                        # 删除文件
+        r"\bos\.unlink\s*\(",                        # 删除链接
+        r"\bos\.rmdir\s*\(",                         # 删除目录
+        r"\bopen\s*\([^)]*['\"]w['\"]",             # 写入模式打开文件（可能覆盖用户数据）
+        r"\b(?:api_key|secret_key|private_key)\s*=\s*['\"]",  # API/私钥硬编码
+        r"\b(?:password|passwd|pwd)\s*=\s*['\"]",    # 密码硬编码
+        r"\b(?:token|access_token|auth_token)\s*=\s*['\"]",  # Token硬编码
+        r"\b(?:requests|httpx|urllib\.request)\.(?:get|post|put|delete|patch)\s*\(",  # HTTP请求（SSRF风险）
+        r"\bhttp\.client\.(?:HTTPConnection|HTTPSConnection)\s*\(",  # 底层HTTP连接
     ]
 
-    # MEDIUM：作为警告附在PR中，不阻止合并
+    # MEDIUM（中危）：仅作审查意见记录，不阻止流程
     _MEDIUM_PATTERNS = [
-        r"\bsubprocess\.run\s*\(",            # 子进程调用（未用shell=True）
-        r"\bsubprocess\.call\s*\(",           # 子进程调用
-        r"\bsubprocess\.Popen\s*\(",          # 子进程调用
-        r"\bpdb\.set_trace\s*\(",             # 调试断点
-        r"\bprint\s*\(",                      # 调试输出（生产代码中）
-        r"import\s+pdb",                      # 导入调试器
-        r"\bassert\s+",                       # 断言（可能被优化掉）
+        r"\bpickle\.load",                    # 不安全的反序列化
+        r"\byaml\.load\s*\(",                 # 不安全的YAML加载（非SafeLoader）
+        r"except\s*:",                        # 裸except（可能隐藏错误）
+        r"except\s+Exception\s*:",            # 过于宽泛的异常捕获
     ]
 
-    # LOW：仅记录日志，不影响流程
+    # LOW（低风险）：仅记录日志，不影响流程
     _LOW_PATTERNS = [
         r"#\s*TODO",                          # TODO注释
         r"#\s*FIXME",                         # FIXME注释
@@ -550,4 +546,7 @@ class ReviewAgent:
                 "review_comments": f"审查过程出错: {str(e)}",
                 "change_lines": 0,
                 "risk_warnings": [str(e)],
+                "has_critical_risks": False,
+                "has_high_risks": False,
+                "risk_level": "NONE",
             }

@@ -31,6 +31,26 @@ FIX_AGENT_SYSTEM_PROMPT = """
 - 如果原始代码使用了上述危险函数，修复时必须替换为安全替代方案
 - 如果无法安全替换，在 fix_description 中明确标注风险
 
+## 函数契约保护原则（新增）
+修复函数时，必须严格遵守以下规则：
+
+1. **对称类型守卫**：检查所有操作数的类型。例如：
+   - 对 `a * b`：检查 a 和 b 所有可能的类型组合
+   - 对 `a + b`：检查 a 和 b 所有可能的类型组合
+   - 对 `a[b]`：检查 b 是否是 a 的有效索引/键
+
+2. **契约兼容性**：不改变函数的返回类型语义。
+   - 如果函数原本返回非空值，修复后不应新增返回 None 的路径
+   - 如果注释注明"调用方保证 xxx"，则不应添加对 xxx 的检查
+   - 用 assert 或 raise 代替 return None 来表明前置条件不满足
+
+3. **通用安全替代**：
+   - eval() → ast.literal_eval()
+   - pickle.load() → pickle.load() + 限制类型
+   - yaml.load() → yaml.safe_load()
+   - os.system() → subprocess.run(shell=False)
+   - open() 无上下文 → with open()
+
 ## 最小修改与契约保护
 修复时必须遵守函数契约（签名、输入/输出类型、副作用），避免过度修复：
 

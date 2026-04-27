@@ -452,15 +452,30 @@ class RepairOrchestrator:
                 if file_path not in syntax_error_files:
                     syntax_error_files.append(file_path)
                 logger.info(f"找到语法错误文件: {file_path}:{e.lineno}")
+                # 每个文件只更新一个 error_locations 条目，避免全部覆盖
+                updated = False
                 for err in error_locations:
                     if (
-                        err.get("error_type") == "SyntaxError"
-                        or "syntaxerror" in err.get("error_message", "").lower()
+                        (err.get("error_type") == "SyntaxError"
+                         or "syntaxerror" in err.get("error_message", "").lower())
+                        and not err.get("file_path")
                     ):
                         err["file_path"] = file_path
                         err["line_number"] = e.lineno
                         err["error_message"] = str(e)
                         err["error_type"] = "SyntaxError"
+                        updated = True
+                        break
+
+                # 无对应条目时新增一个
+                if not updated:
+                    error_locations.append({
+                        "file_path": file_path,
+                        "line_number": e.lineno,
+                        "error_type": "SyntaxError",
+                        "error_message": str(e),
+                    })
+
                 syntax_error_details = (
                     f'\nFile "{file_path}", line {e.lineno}\n'
                     f"{e.text}\n{' ' * (e.offset - 1)}^\n"
@@ -744,23 +759,24 @@ class RepairOrchestrator:
         risk_level = state.get("risk_level", "NONE")
         retry_count = state.get("retry_count", 0)
 
-        # CRITICAL → 立即终止，绝不创建PR
-        if risk_level == "CRITICAL":
+        # CRITICAL → 立即终止，绝不创建PR（优先检查标记，更可靠）
+        if state.get("has_critical_risks", False) or risk_level == "CRITICAL":
             logger.error(
                 f"致命安全风险，终止修复流程: {state.get('risk_warnings', [])}"
             )
             return "handle_failure"
 
         # HIGH → 强制重试，重试用尽后创建带"禁止合并"标签的PR
-        if risk_level == "HIGH" or state.get("has_high_risks", False):
-            if retry_count < state["max_retries"]:
+        if state.get("has_high_risks", False) or risk_level == "HIGH":
+            max_retries = state.get("max_retries", 3)
+            if retry_count < max_retries:
                 logger.info(
                     f"存在高危风险，重试修复 (第 {retry_count + 1} 次,"
-                    f" 共 {state['max_retries']} 次)"
+                    f" 共 {max_retries} 次)"
                 )
                 return "fix_agent"
             logger.warning(
-                f"重试 {state['max_retries']} 次后仍存在高危风险，"
+                f"重试 {max_retries} 次后仍存在高危风险，"
                 f"创建带'禁止合并'标签的PR，转人工处理"
             )
             # 标记为高危PR，create_pr节点会检查此标记
@@ -955,6 +971,15 @@ class RepairOrchestrator:
             validation_method = state.get('validation_method', '')
             validation_command = state.get('validation_command', '')
 
+            # 确保 change_lines 正确（从 diff 内容计算作为回退）
+            change_lines = state.get("change_lines", 0)
+            if change_lines == 0 and state.get("diff_content"):
+                # 从 diff 内容计算实际变更行数
+                diff = state["diff_content"]
+                adds = len([l for l in diff.split('\n') if l.startswith('+') and not l.startswith('+++')])
+                deletes = len([l for l in diff.split('\n') if l.startswith('-') and not l.startswith('---')])
+                change_lines = adds + deletes
+
             if validation_status == 'success':
                 test_status = "✅ 通过"
                 test_detail = f"验证方法: {validation_method}"
@@ -998,7 +1023,7 @@ class RepairOrchestrator:
 - 修复分支: `{branch_name}`
 - 错误类型: {error_types_str}
 - 修改文件: {len(state['modified_files'])} 个
-- 变更行数: {state['change_lines']} 行
+- 变更行数: {change_lines} 行
 - 相关PR: {pr_link}
 - 原始CI日志: {ci_logs_link}
 
@@ -1086,7 +1111,10 @@ class RepairOrchestrator:
                     error_type_str = ', '.join(error_types)
                     # 获取PR提交者昵称和bug数量
                     pr_author = event.payload.get('sender', {}).get('login', '未知用户')
-                    bug_count = len(state['error_locations'])
+                    # 统计涉bug文件数（按文件路径去重，比 len(error_locations) 更准确）
+                    bug_files = {err.get('file_path', '') for err in state['error_locations']}
+                    bug_files.discard('')
+                    bug_count = len(bug_files) if bug_files else len(state['error_locations'])
 
                     # 给每个配置的用户发送通知
                     for user_id in self.lark_notify_users:
@@ -1132,7 +1160,9 @@ class RepairOrchestrator:
             # 获取PR提交者昵称和bug数量
             event = state['event']
             pr_author = event.payload.get('sender', {}).get('login', '未知用户')
-            bug_count = len(state['error_locations'])
+            bug_files = {err.get('file_path', '') for err in state['error_locations']}
+            bug_files.discard('')
+            bug_count = len(bug_files) if bug_files else len(state['error_locations'])
 
             # 给每个配置的用户发送通知
             for user_id in self.lark_notify_users:

@@ -126,7 +126,18 @@ def test_webhook_unsupported_event_type(client, test_secret):
 
 def test_webhook_duplicate_event(client, test_secret, event_bus):
     """测试重复事件处理"""
-    payload = {"action": "completed", "repository": {"full_name": "owner/repo"}}
+    payload = {
+        "action": "completed",
+        "repository": {
+            "full_name": "owner/repo",
+            "clone_url": "https://github.com/owner/repo.git"
+        },
+        "workflow_run": {
+            "head_branch": "main",
+            "conclusion": "failure",
+            "logs_url": "https://github.com/owner/repo/actions/runs/123/logs"
+        }
+    }
     payload_bytes = json.dumps(payload).encode()
     signature = hmac.new(test_secret.encode(), payload_bytes, hashlib.sha256).hexdigest()
 
@@ -166,7 +177,18 @@ async def test_webhook_queue_full(client, test_secret, event_bus):
     assert event_bus.qsize() == 10
 
     # 发送新的事件，应该返回503
-    payload = {"action": "completed", "repository": {"full_name": "owner/repo"}}
+    payload = {
+        "action": "completed",
+        "repository": {
+            "full_name": "owner/repo",
+            "clone_url": "https://github.com/owner/repo.git"
+        },
+        "workflow_run": {
+            "head_branch": "main",
+            "conclusion": "failure",
+            "logs_url": "https://github.com/owner/repo/actions/runs/123/logs"
+        }
+    }
     payload_bytes = json.dumps(payload).encode()
     signature = hmac.new(test_secret.encode(), payload_bytes, hashlib.sha256).hexdigest()
 

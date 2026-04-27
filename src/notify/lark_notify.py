@@ -316,7 +316,7 @@ async def send_repair_notification(
             "elements": [
                 {
                     "tag": "markdown",
-                    "content": f"**🎉 自动修复完成**\n我发现了 **{pr_author}** 提交的PR中存在的 **{bug_count}** 个 bug，已经为您修复，请 review！"
+                    "content": f"**🎉 自动修复完成**\n已修复 **{pr_author}** 提交的PR中的代码错误（涉及 {bug_count} 个文件），请 review！"
                 },
                 {"tag": "hr"},
                 {
