@@ -368,7 +368,6 @@ def run_webhook_server(
     # 初始化修复编排器
     orchestrator = None
     if settings.agent.enabled:
-        log.info("自动修复功能已启用")
         try:
             orchestrator = RepairOrchestrator(
                 github_token=settings.github.token,
@@ -387,14 +386,14 @@ def run_webhook_server(
     repair_status = "[green]已启用[/green]" if orchestrator else "[dim]未启用[/dim]"
     console.print(Panel(
         f"[bold #ffffff]SpiderClaw 总监控服务已启动[/bold #ffffff]\n\n"
-        f"监听地址: [bold #4488ff]http://{host}:{port}[/bold #4488ff]\n"
-        f"Webhook端点: [bold #4488ff]/webhook/github[/bold #4488ff]\n"
-        f"健康检查: [bold #4488ff]/health[/bold #4488ff]\n"
-        f"允许事件: [bold #4488ff]{', '.join(settings.webhook.allowed_events)}[/bold #4488ff]\n"
+        f"监听地址: [bold #20d5f0]http://{host}:{port}[/bold #20d5f0]\n"
+        f"Webhook端点: [bold #20d5f0]/webhook/github[/bold #20d5f0]\n"
+        f"健康检查: [bold #20d5f0]/health[/bold #20d5f0]\n"
+        f"允许事件: [bold #20d5f0]{', '.join(settings.webhook.allowed_events)}[/bold #20d5f0]\n"
         f"自动修复: {repair_status}\n\n"
         f"[dim]按 Ctrl+C 停止服务[/dim]",
-        title="[bold #4488ff]SpiderClaw 运行中[/bold #4488ff]",
-        border_style="#2453fc",
+        title="[bold #20d5f0]SpiderClaw 运行中[/bold #20d5f0]",
+        border_style="#20d5f0",
         padding=(1, 2)
     ))
     console.print()
@@ -403,8 +402,6 @@ def run_webhook_server(
         """事件消费循环"""
         if not orchestrator:
             return
-
-        log.info("事件消费循环已启动，等待CI失败事件...")
         while True:
             try:
                 event = await event_bus.subscribe()

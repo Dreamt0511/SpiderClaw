@@ -31,6 +31,16 @@ FIX_AGENT_SYSTEM_PROMPT = """
 - 如果原始代码使用了上述危险函数，修复时必须替换为安全替代方案
 - 如果无法安全替换，在 fix_description 中明确标注风险
 
+## 根因误差优先处理规则（新增）
+错误列表中可能包含链式错误（如 ModuleNotFoundError → ImportError），其中被标记为 `is_root_cause: true` 的是根因错误。
+
+1. **根因错误必须优先修复**：在错误列表中查找 `is_root_cause: true` 的条目，先修复这些根本原因
+2. **ModuleNotFoundError 处理**：如果根因是缺失模块：
+   - 优先使用条件导入：`try: import xxx; except ImportError: ...`
+   - 或者移除对缺失模块的依赖，改用标准库替代
+   - 绝对禁止添加 `pip install` 或修改 requirements.txt
+3. **后果错误自动解决**：根因修复后，由它引起的后果错误（chain_consequence）应自动消失，无需额外修复
+
 ## 函数契约保护原则（新增）
 修复函数时，必须严格遵守以下规则：
 
@@ -86,10 +96,24 @@ def multiply(a, b):
 - 修正错误的类型使用、变量引用、索引访问等
 - 添加必要的类型守卫或默认值处理（遵循契约保护规则）
 
-### 导入错误 (ImportError / ModuleNotFoundError)
-- 修正错误的导入路径
-- 添加缺失的 import 语句（仅限标准库或项目中已存在的模块）
-- 不要编造不存在的模块
+### 导入错误 (ImportError / ModuleNotFoundError) — ⚠️ 硬约束
+ModuleNotFoundError/ImportError 修复必须遵守以下硬约束，违反则本次修复直接视为失败：
+
+**仅允许以下两种修复方式**：
+1. 使用 `try/except ImportError` 包裹缺失的导入语句（保留原始导入意图）
+2. 移除未使用的导入语句（仅在确认该导入确实未被任何代码使用时）
+
+**绝对禁止**（任何违反都会导致修复被拒绝）：
+- ❌ 修改任何已有函数的内部逻辑或函数体
+- ❌ 新增任何与导入无关的代码行（包括 print、注释、类型标注等）
+- ❌ 删除或修改非导入行的已有代码（包括函数体、类定义、变量赋值等）
+- ❌ 添加 `pip install` 或修改 requirements.txt
+- ❌ 对文件进行任何"优化"或"重构"
+
+**修复范围限制**：
+- 仅能修改目标文件的导入区域（文件顶部的前 N 行 import/from 语句）
+- 如果缺失模块可以通过移动已有导入位置解决，优先使用移动而非新增
+- 不得修改该文件的任何其他区域（函数体、类定义、模块级变量等）
 
 ### 逻辑错误
 - 分析代码意图，修正错误的逻辑判断
@@ -140,6 +164,8 @@ FIX_AGENT_USER_PROMPT = """
 ```
 {ci_logs}
 ```
+
+{root_cause_section}
 
 ## 必须执行的步骤
 1. 对每个有 file_path 的错误文件调用 read_file 工具读取真实内容

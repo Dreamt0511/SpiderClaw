@@ -199,6 +199,37 @@ class FixAgent:
             # 失败的测试用例
             failed_tests_section = (f"""- {"\n- ".join(failed_tests)}""" if failed_tests and len(failed_tests) > 0 else "")
 
+            # 根因错误识别与优先处理
+            root_cause_errors = [
+                err for err in error_locations if err.get("is_root_cause")
+            ]
+            root_cause_section = ""
+            if root_cause_errors:
+                root_cause_lines = []
+                for err in root_cause_errors:
+                    fp = err.get("file_path", "未知文件")
+                    et = err.get("error_type", "UnknownError")
+                    em = err.get("error_message", "")
+                    chain_info = ""
+                    if err.get("chain_consequence"):
+                        chain_info = f"\n      → 导致: {err['chain_consequence'][:100]}"
+                    root_cause_lines.append(
+                        f"- **{et}**: {em[:100]}（文件: {fp}）{chain_info}"
+                    )
+
+                root_cause_section = """\
+## ⚠️ 根因错误（必须优先修复）
+以下错误是链式错误中的根本原因，**必须先修复它们**：
+
+""" + "\n".join(root_cause_lines) + """
+
+**规则**：
+- 根因错误必须优先处理，后果错误（由根因导致的二次错误）会在根因修复后自动消除
+- 如果根因是 ModuleNotFoundError → 使用条件导入（try/except ImportError）或移除对缺失模块的依赖
+- 根因错误修复前，本次修复不被视为成功\
+"""
+                logger.info(f"检测到 {len(root_cause_errors)} 个根因错误")
+
             # 使用模板构建用户输入
             import json
 
@@ -238,6 +269,7 @@ class FixAgent:
                 ci_logs=ci_logs,
                 error_locations=error_locations_json,
                 repo_path=self.repo_path,
+                root_cause_section=root_cause_section,
                 review_feedback_section=review_feedback_section,
                 risk_warnings_section=risk_warnings_section,
                 test_output_section=test_output_section,

@@ -125,6 +125,21 @@ class TestAgent:
             logger.info(f"从错误位置推断命令: {inferred}")
             return inferred
 
+        # --- 模式2（次高优先级）：从错误消息提取 Python 命令 ---
+        if error_locations:
+            for err in error_locations:
+                error_msg = err.get("error_message", "")
+                # 匹配 CI 错误中常见的命令形式
+                for cmd_prefix in ['pytest ', 'python ', 'python3 ', 'nosetests ', 'tox ']:
+                    lines = error_msg.split('\n')
+                    for line in lines:
+                        line = line.strip()
+                        if line.lower().startswith(cmd_prefix) and 'Error' not in line:
+                            cmd = line.split('|')[0].split('&&')[0].strip()
+                            if self._safety_filter(cmd):
+                                logger.info(f"从错误消息提取命令: {cmd}")
+                                return cmd
+
         # --- 无日志时直接返回 ---
         if not ci_logs:
             logger.warning("未能从 CI 日志中提取到任何命令")
@@ -270,19 +285,32 @@ class TestAgent:
                         all_passed = False
                         results.append(f"[FAIL] {error_type}: 编译失败: {e}")
 
-            # 2. ImportError 检测 — 尝试导入模块
+            # 2. ImportError 检测 — 使用 subprocess 验证模块导入
+            # 使用子进程而非 in-process __import__，避免当前运行环境的迷惑性
             if error_type in ("ImportError", "ModuleNotFoundError"):
-                # 从错误消息中提取缺失模块名
                 import re
                 match = re.search(r"No module named '(\w+)'", error_msg)
                 if match:
                     module_name = match.group(1)
                     try:
-                        __import__(module_name)
-                        results.append(f"[PASS] {error_type}: 模块 {module_name} 导入成功")
-                    except ImportError:
+                        check_result = subprocess.run(
+                            ["python", "-c", f"import {module_name}"],
+                            capture_output=True, text=True, timeout=15
+                        )
+                        if check_result.returncode == 0:
+                            results.append(f"[PASS] {error_type}: 模块 {module_name} 导入成功")
+                        else:
+                            all_passed = False
+                            stderr_tail = check_result.stderr.strip()[:100]
+                            results.append(
+                                f"[FAIL] {error_type}: 模块 {module_name} 仍未找到: {stderr_tail}"
+                            )
+                    except subprocess.TimeoutExpired:
                         all_passed = False
-                        results.append(f"[FAIL] {error_type}: 模块 {module_name} 仍未找到")
+                        results.append(f"[FAIL] {error_type}: 验证模块 {module_name} 超时")
+                    except Exception as e:
+                        all_passed = False
+                        results.append(f"[FAIL] {error_type}: 验证模块 {module_name} 失败: {e}")
                 else:
                     # 无法提取模块名，使用通用检查
                     full_path = os.path.join(self.repo_path, file_path) if file_path else None
@@ -381,23 +409,31 @@ class TestAgent:
                     error_line = exec_result.get("error_line", 0)
 
                     # 检查是否是原始错误还是新错误
-                    is_original_error = any(
-                        error_type == err.get("error_type", "")
-                        and err.get("error_message", "")[:30] in error_msg[:30]
-                        for err in error_locations
-                    )
-
-                    if is_original_error:
+                    # 导入失败是致命错误，应阻止通过
+                    if error_type in ("ModuleNotFoundError", "ImportError"):
                         results.append(
-                            f"[FAIL] 文件 {fp}: 原始错误未修复 - {error_type}: {error_msg} "
+                            f"[FAIL] 文件 {fp}: 导入失败 - {error_type}: {error_msg} "
                             f"(行 {error_line})"
                         )
                         all_passed = False
                     else:
-                        results.append(
-                            f"[WARN] 文件 {fp}: 有新错误 - {error_type}: {error_msg} "
-                            f"(行 {error_line})，但原始错误已消失"
+                        is_original_error = any(
+                            error_type == err.get("error_type", "")
+                            and err.get("error_message", "")[:30] in error_msg[:30]
+                            for err in error_locations
                         )
+
+                        if is_original_error:
+                            results.append(
+                                f"[FAIL] 文件 {fp}: 原始错误未修复 - {error_type}: {error_msg} "
+                                f"(行 {error_line})"
+                            )
+                            all_passed = False
+                        else:
+                            results.append(
+                                f"[WARN] 文件 {fp}: 有新错误 - {error_type}: {error_msg} "
+                                f"(行 {error_line})，但原始错误已消失"
+                            )
 
             if results:
                 if all_passed:
@@ -408,7 +444,7 @@ class TestAgent:
                         "output": "\n".join(results),
                         "details": "Code Interpreter 验证全部通过，置信度: 高",
                     }
-                elif any("✗" in r for r in results):
+                elif any("[FAIL]" in r for r in results):
                     return {
                         "validation_status": "failure",
                         "validation_method": "code_interpreter",

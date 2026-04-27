@@ -781,6 +781,78 @@ def parse_python_errors(log_content: str) -> List[Dict]:
                         "traceback": context_str
                     })
 
+    # --- 错误链检测与合并（ModuleNotFoundError → ImportError 等）---
+    # 当一个文件有多个错误且存在因果关系时，合并为根因+后果结构
+    merged_errors = []
+    skip_indices: set = set()
+
+    for i, err in enumerate(errors):
+        if i in skip_indices:
+            continue
+
+        file_path = err.get("file_path", "")
+        error_type = err.get("error_type", "")
+        error_msg = err.get("error_message", "")
+
+        # 检测当前错误是否是 ImportError（可能由 ModuleNotFoundError 引起）
+        if error_type == "ImportError":
+            # 当 file_path 为空时，尝试从错误消息中提取文件名
+            imp_file = file_path
+            if not imp_file:
+                m = re.search(r"'([^']+\.py)'", error_msg)
+                if m:
+                    imp_file = m.group(1)
+            if not imp_file:
+                m = re.search(r'"([^"]+\.py)"', error_msg)
+                if m:
+                    imp_file = m.group(1)
+
+            # 在同文件（或同逻辑块）中查找 ModuleNotFoundError（根因）
+            for j, err2 in enumerate(errors):
+                if j in skip_indices or j == i:
+                    continue
+
+                err2_type = err2.get("error_type", "")
+                if err2_type != "ModuleNotFoundError":
+                    continue
+
+                err2_path = err2.get("file_path", "")
+                err2_msg = err2.get("error_message", "")
+
+                # 从 err2（ModuleNotFoundError）的消息中提取文件名
+                err2_file = err2_path
+                if not err2_file:
+                    m = re.search(r"'([^']+\.py)'", err2_msg)
+                    if m:
+                        err2_file = m.group(1)
+
+                # 匹配条件：同一文件路径 or 从消息中提取的文件名匹配 or 相邻错误
+                paths_match = (
+                    file_path and err2_path and file_path == err2_path
+                ) or (
+                    imp_file and err2_file and imp_file == err2_file
+                ) or (
+                    imp_file and err2_path and imp_file == err2_path
+                ) or (
+                    err2_file and file_path and err2_file == file_path
+                )
+                # 都没有文件信息但相邻（来自同一 CI 错误块）
+                adjacent = abs(i - j) == 1
+
+                if paths_match or (not file_path and not err2_path and adjacent):
+                    err2["is_root_cause"] = True
+                    err2["chain_consequence"] = error_msg
+                    err2["chain_source_error"] = err2_msg
+                    err2["chain_type"] = "ModuleNotFoundError → ImportError"
+                    skip_indices.add(i)
+                    break
+
+        if i not in skip_indices:
+            err["is_root_cause"] = err.get("is_root_cause", False)
+            merged_errors.append(err)
+
+    errors = merged_errors
+
     return errors
 
 

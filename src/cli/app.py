@@ -1,20 +1,96 @@
 """CLI主入口"""
+
 import sys
+import time
+import random
 from typing import Optional
 from pathlib import Path
 import typer
 from rich.console import Console
+from rich.text import Text
 
 app = typer.Typer(
     name="spiderclaw",
     help="SpiderClaw-事件驱动的自动诊断与修复系统",
     add_completion=False,
     rich_markup_mode="rich",
-    invoke_without_command=True
+    invoke_without_command=True,
 )
 console = Console()
 CONFIG_PATH = Path("config/agent-config.yaml")
 
+
+def print_banner():
+    """打印启动 Logo"""
+    console.clear()
+
+    # 占位 Logo — 请替换为实际 ASCII art
+    logo_placeholder = r"""
+                    ███      █████                             ████                           
+                   ░░░      ░░███                             ░░███                           
+  █████  ████████  ████   ███████   ██████  ████████   ██████  ░███   ██████   █████ ███ █████
+ ███░░  ░░███░░███░░███  ███░░███  ███░░███░░███░░███ ███░░███ ░███  ░░░░░███ ░░███ ░███░░███ 
+░░█████  ░███ ░███ ░███ ░███ ░███ ░███████  ░███ ░░░ ░███ ░░░  ░███   ███████  ░███ ░███ ░███ 
+ ░░░░███ ░███ ░███ ░███ ░███ ░███ ░███░░░   ░███     ░███  ███ ░███  ███░░███  ░░███████████  
+ ██████  ░███████  █████░░████████░░██████  █████    ░░██████  █████░░████████  ░░████░████   
+░░░░░░   ░███░░░  ░░░░░  ░░░░░░░░  ░░░░░░  ░░░░░      ░░░░░░  ░░░░░  ░░░░░░░░    ░░░░ ░░░░    
+         ░███                                                                                 
+         █████                                                                                
+        ░░░░░                  
+
+    """
+
+    # 配色方案：暗夜蓝 + 冷灰 + 暗金点缀
+    logo_color = "#20d5f0"       # 主色调
+    ice = "#e8eef5"             # 冰白，用于标题文字
+    warm_gold = "#1ed3c1"       # 暗金点缀
+    muted_gray = "#7a8ba0"      # 中等灰，用于副文本
+    dim_gray = "#5a6b7c"        # 暗灰，用于提示
+
+    # Logo 主体用渐变蓝
+    logo = Text(logo_placeholder, style=logo_color)
+
+    # 标题
+    title = Text()
+    title.append("\n Welcome to ", style=ice)
+    title.append("SpiderClaw", style=f"bold {logo_color}")
+    title.append(" !  ", style=ice)
+    # 暗金下划线装饰
+    title.append("\n" + "─" * 36, style=warm_gold)
+
+    # 随机语录
+    QUOTES = [
+        "在我机器上能跑啊。",
+        "Git提交，推送，祈祷。",
+        "开发环境没问题啊。",
+        "愿源码与你同在。",
+        "你好, 世界。",
+        "能力越大，SpiderClaw越强。",
+        "这不是bug，是特性。",
+        "重启试试。",
+        "凌晨三点，灵感迸发。",
+        "代码和人，有一个能跑就行。",
+        "这不是我的bug，是依赖问题。",
+        "写代码一时爽，debug火葬场。",
+        "我写的不是bug，是隐藏特性。",
+        "一切皆对象，对象皆null。",
+        "这段代码很脆弱，别看它。",
+        "printf是最好的调试器。",
+        "能跑就别动。",
+    ]
+    quote_text = Text(f"\n  ✦ {random.choice(QUOTES)}", style=muted_gray)
+
+    # 启动提示
+    tip = Text(
+        f"\n  SpiderClaw 已完成启动。Ctrl+C 退出。\n", style=dim_gray
+    )
+
+    console.print(logo)
+    console.print(title)
+    time.sleep(0.1)
+    console.print(quote_text)
+    console.print()
+    console.print(tip)
 
 def _setup_feishu():
     """飞书通知配置向导"""
@@ -23,27 +99,29 @@ def _setup_feishu():
     from rich.panel import Panel
     from rich.status import Status
 
-    spider_style = questionary.Style([
-        ('qmark', 'fg:#4488ff bold'),
-        ('question', 'fg:#66bbff bold'),
-        ('answer', 'fg:#4488ff bold'),
-        ('pointer', 'fg:#66bbff bold'),
-        ('highlighted', 'fg:#66bbff bold'),
-        ('selected', 'fg:#66bbff'),
-        ('instruction', 'fg:#808080 dim'),
-    ])
+    spider_style = questionary.Style(
+        [
+            ("qmark", "fg:#20d5f0 bold"),
+            ("question", "fg:#20d5f0 bold"),
+            ("answer", "fg:#20d5f0 bold"),
+            ("pointer", "fg:#20d5f0 bold"),
+            ("highlighted", "fg:#20d5f0 bold"),
+            ("selected", "fg:#20d5f0"),
+            ("instruction", "fg:#808080 dim"),
+        ]
+    )
 
     console.clear()
-    console.print(Panel(
-        "欢迎使用 [bold #4488ff]SpiderClaw[/bold #4488ff] 飞书配置向导\n\n[dim]扫码授权后将自动完成应用创建和配置写入。[/dim]",
-        title="[bold white]飞书通知配置[/bold white]",
-        border_style="#2453fc"
-    ))
+    console.print(
+        Panel(
+            "欢迎使用 [bold #20d5f0]SpiderClaw[/bold #20d5f0] 飞书配置向导\n\n[dim]扫码授权后将自动完成应用创建和配置写入。[/dim]",
+            title="[bold white]飞书通知配置[/bold white]",
+            border_style="#20d5f0",
+        )
+    )
 
     confirm = questionary.confirm(
-        "是否开始配置飞书通知？",
-        default=True,
-        style=spider_style
+        "是否开始配置飞书通知？", default=True, style=spider_style
     ).ask()
 
     if not confirm:
@@ -62,10 +140,16 @@ def _setup_feishu():
         return
 
     if not result:
-        console.print("[bold #ff4444][配置失败!][/bold #ff4444]  授权过程出错，请重试！")
+        console.print(
+            "[bold #ff4444][配置失败!][/bold #ff4444]  授权过程出错，请重试！"
+        )
         return
 
-    with Status("[bold #4488ff]正在写入配置文件...[/bold #4488ff]", spinner="dots", spinner_style="#66bbff"):
+    with Status(
+        "[bold #20d5f0]正在写入配置文件...[/bold #20d5f0]",
+        spinner="dots",
+        spinner_style="#20d5f0",
+    ):
         try:
             if CONFIG_PATH.exists():
                 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -84,23 +168,33 @@ def _setup_feishu():
 
             CONFIG_PATH.parent.mkdir(exist_ok=True)
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+                yaml.dump(
+                    config,
+                    f,
+                    default_flow_style=False,
+                    allow_unicode=True,
+                    sort_keys=False,
+                )
 
         except Exception as e:
-            console.print(f"[bold #ff4444][写入配置失败!][/bold #ff4444]  错误信息: {str(e)}")
+            console.print(
+                f"[bold #ff4444][写入配置失败!][/bold #ff4444]  错误信息: {str(e)}"
+            )
             return
 
-    console.print(Panel(
-        f"飞书通知配置成功！\n\n"
-        f"应用信息：\n"
-        f"App ID: [#4488ff]{result['app_id']}[/#4488ff]\n"
-        f"App Secret: [#4488ff]{result['app_secret']}[/#4488ff]\n\n"
-        f"后续配置：\n"
-        f"通过在终端中输入 lark-cli auth status 获取当前登录状态，即可获取userOpenId。\n"
-        f"请在 [#4488ff]config/agent-config.yaml[/#4488ff] 中添加需要通知的用户/群组ID。\n\n"
-        f"配置完成后，在SpiderClaw总监控服务启动后，系统将自动发送修复结果通知！",
-        border_style="#66bbff"
-    ))
+    console.print(
+        Panel(
+            f"飞书通知配置成功！\n\n"
+            f"应用信息：\n"
+            f"App ID: [#20d5f0]{result['app_id']}[/#20d5f0]\n"
+            f"App Secret: [#20d5f0]{result['app_secret']}[/#20d5f0]\n\n"
+            f"后续配置：\n"
+            f"通过在终端中输入 lark-cli auth status 获取当前登录状态，即可获取userOpenId。\n"
+            f"请在 [#20d5f0]config/agent-config.yaml[/#20d5f0] 中添加需要通知的用户/群组ID。\n\n"
+            f"配置完成后，在SpiderClaw总监控服务启动后，系统将自动发送修复结果通知！",
+            border_style="#20d5f0",
+        )
+    )
 
 
 @app.callback()
@@ -110,7 +204,7 @@ def main(
     config: Optional[str] = typer.Option(None, "--config", "-c", help="配置文件路径"),
     port: int = typer.Option(8000, "--port", "-p", help="Webhook监听端口"),
     host: str = typer.Option("0.0.0.0", "--host", "-h", help="Webhook监听地址"),
-    reload: bool = typer.Option(False, "--reload", help="热重载")
+    reload: bool = typer.Option(False, "--reload", help="热重载"),
 ):
     """
     SpiderClaw 事件驱动的自动诊断与修复系统
@@ -121,8 +215,11 @@ def main(
     if config:
         CONFIG_PATH = Path(config)
 
+    # 打印启动 Logo 并启动 Webhook 服务（仅无子命令时）
     if ctx.invoked_subcommand is None:
+        print_banner()
         from src.monitor.webhook_server import run_webhook_server
+
         run_webhook_server(host=host, port=port, reload=reload)
 
 

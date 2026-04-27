@@ -32,6 +32,11 @@ def generate_repair_notification(
     Returns:
         飞书卡片消息格式的字典
     """
+    import re as _re
+
+    # 确保 fix_description 中的列表项与上文有空格分隔
+    _desc = _re.sub(r'(?<!\n)\n(?=[-*] )', r'\n\n', fix_description)
+
     status_emoji = "✅" if repair_success else "❌"
     status_text = "修复成功" if repair_success else "修复失败"
 
@@ -74,7 +79,7 @@ def generate_repair_notification(
                 "tag": "div",
                 "text": {
                     "tag": "markdown",
-                    "content": f"**修复说明**\n{fix_description}",
+                    "content": f"**修复说明**\n{_desc}",
                 },
             },
         ],
@@ -302,7 +307,11 @@ async def send_repair_notification(
     Returns:
         是否发送成功
     """
+    import re as _re
     import json
+
+    # 确保 fix_description 中的列表项与上文有空格分隔
+    _desc = _re.sub(r'(?<!\n)\n(?=[-*] )', r'\n\n', fix_description)
 
     # 构造飞书卡片
     if repair_success and bug_count > 0:
@@ -328,7 +337,7 @@ async def send_repair_notification(
                 },
                 {
                     "tag": "markdown",
-                    "content": f"**📝 修复说明**\n{fix_description}"
+                    "content": f"**📝 修复说明**\n{_desc}"
                 }
             ]
         }

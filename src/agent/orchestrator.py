@@ -782,14 +782,22 @@ class RepairOrchestrator:
             # 标记为高危PR，create_pr节点会检查此标记
             return "create_pr"
 
-        # MEDIUM/LOW/NONE → 无论审查是否通过，进入测试阶段
+        # MEDIUM/LOW/NONE → 根据审查是否通过决定路由
         if not state.get("review_passed", False):
-            logger.info(
-                f"审查未通过但风险等级为{risk_level}，仍进入测试阶段"
+            retry_count = state.get("retry_count", 0)
+            max_retries = state.get("max_retries", 3)
+            if retry_count < max_retries:
+                logger.info(
+                    f"审查未通过(风险等级{risk_level})，重试修复 "
+                    f"(第 {retry_count} 次, 共 {max_retries} 次)"
+                )
+                return "fix_agent"
+            logger.warning(
+                f"审查未通过且重试已达上限({max_retries}次)，终止修复流程"
             )
-        else:
-            logger.info("审查通过，进入测试阶段")
+            return "handle_failure"
 
+        logger.info("审查通过，进入测试阶段")
         return "run_tests"
 
     async def _run_tests(self, state: RepairState) -> Dict[str, Any]:
@@ -950,12 +958,9 @@ class RepairOrchestrator:
                     "error_message": f"推送分支失败: {push_result}",
                 }
 
-            # 创建PR
-            pr_title = f"[SpiderClaw-自动修复]: {state['fix_description']}"
-
-            # 错误类型去重
-            error_types = list({err.get('error_type', 'Unknown') for err in state['error_locations']})
-            error_types_str = ', '.join(error_types)
+            # 创建 PR 标题
+            pr_author_title = event.payload.get('sender', {}).get('login', '未知用户')
+            pr_title = f"[SpiderClaw: fix]：对 {pr_author_title} 的 PR 进行的修复"
 
             # 相关PR链接
             pr_link = f"#{event.pr_number}" if event.pr_number else "无"
@@ -1017,8 +1022,13 @@ class RepairOrchestrator:
             risk_warning_display = '; '.join(risk_warnings) if risk_warnings else "无"
             risk_detail_section = '\n'.join(risk_section_parts) if risk_section_parts else ""
 
+            # 错误类型（用于 PR 正文显示）
+            error_types = list({err.get('error_type', 'Unknown') for err in state['error_locations']})
+            error_types_str = ', '.join(error_types)
+
             # 构建PR正文
             pr_body_parts = [f"""## 🎯 修复概览
+- **系统**: SpiderClaw 自动修复系统
 - 原错误分支: `{event.branch}`
 - 修复分支: `{branch_name}`
 - 错误类型: {error_types_str}
@@ -1068,12 +1078,17 @@ class RepairOrchestrator:
 | git checkout origin/{event.branch} -- . |
 """)
 
+                import re as _re
+            _fixed_desc = _re.sub(
+                r'(?<!\n)\n(?=[-*] )', r'\n\n',
+                state['fix_description']
+            )
             pr_body_parts.append(f"""
 <details>
 <summary>🔍 查看详细变更</summary>
 
 ## 修复说明
-{state['fix_description']}
+{_fixed_desc}
 
 ## 变更详情
 - 修改文件: {', '.join(state['modified_files'])}
