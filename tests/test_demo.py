@@ -3,7 +3,7 @@ import tempfile
 import os
 from pathlib import Path
 from src.bus.event_bus import EventBus
-from src.agent.orchestrator import Orchestrator
+from src.agent.orchestrator import RepairOrchestrator
 from src.monitor.file_watcher import FileWatcher
 
 async def test_basic_flow():
@@ -17,7 +17,7 @@ async def test_basic_flow():
     try:
         # 2. 初始化组件
         event_bus = EventBus()
-        orchestrator = Orchestrator()
+        orchestrator = RepairOrchestrator(github_token="", openai_api_key="")
         
         # 3. 订阅事件处理
         async def handle_event(event):

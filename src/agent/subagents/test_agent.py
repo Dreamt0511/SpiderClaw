@@ -7,8 +7,6 @@ import subprocess
 from collections import Counter
 from typing import Dict, Any, List, Optional
 
-from langchain_openai import ChatOpenAI
-
 from src.agent.tools.langchain_tools import execute_python_code
 
 logger = logging.getLogger(__name__)
@@ -43,8 +41,6 @@ class TestAgent:
     def __init__(
         self,
         repo_path: str,
-        llm_model: str = "gpt-4o",
-        temperature: float = 0.1,
         openai_api_key: str = None,
         openai_base_url: str = "https://api.openai.com/v1",
         test_command: str = "pytest"
@@ -54,22 +50,12 @@ class TestAgent:
 
         Args:
             repo_path: 本地仓库路径
-            llm_model: LLM模型名称
-            temperature: 温度参数
-            openai_api_key: OpenAI API密钥
-            openai_base_url: OpenAI API基础URL
+            openai_api_key: OpenAI API密钥（保留接口兼容）
+            openai_base_url: OpenAI API基础URL（保留接口兼容）
             test_command: 默认测试命令（当无法从日志提取时作为降级选项）
         """
         self.repo_path = repo_path
         self.test_command = test_command
-
-        # 初始化LLM（用于可选的失败分析）
-        self.llm = ChatOpenAI(
-            model=llm_model,
-            temperature=temperature,
-            api_key=openai_api_key,
-            base_url=openai_base_url
-        )
 
     # ---------- 安全过滤 ----------
 

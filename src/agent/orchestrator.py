@@ -1,18 +1,21 @@
-"""修复流程编排器 - 使用LangChain标准工具"""
+"""修复流程编排器 — 图构建 + 路由 + 节点实现"""
 
-import os
 import asyncio
 import datetime
 import logging
+import os
 import re
-from typing import Dict, Any, List
+from typing import Any
+
+from git import Repo
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Command
 
-from .state import RepairState
-from src.agent.subagents.fix_agent import FixAgent
-from src.agent.subagents.review_agent import ReviewAgent
-from src.agent.subagents.test_agent import TestAgent
+from src.agent.state import RepairState, ErrorLocation, FixAttempt
+from src.agent.agent_factory import AgentFactory, AgentConfig
+from src.agent.validation_gate import validate_fix
+from src.agent.instruction_templates import generate_instruction
+from src.agent.notification import NotificationService
 from src.agent.tools import (
     set_tool_context,
     clone_repository,
@@ -24,14 +27,25 @@ from src.agent.tools import (
     push_branch,
     create_pull_request,
 )
+from src.agent.tools.langchain_tools import read_file, write_file
 from src.bus.schemas import GitHubEvent
-from src.notify.lark_notify import send_repair_notification
 
 logger = logging.getLogger(__name__)
 
 
+def _all_import_errors(error_locations: list) -> bool:
+    """检查所有错误是否都是导入类错误"""
+    if not error_locations:
+        return False
+    for e in error_locations:
+        et = e.error_type if hasattr(e, 'error_type') else e.get('error_type', '')
+        if et not in ('ModuleNotFoundError', 'ImportError'):
+            return False
+    return True
+
+
 class RepairOrchestrator:
-    """修复流程编排器，使用LangChain标准工具"""
+    """修复流程编排器"""
 
     def __init__(
         self,
@@ -40,694 +54,525 @@ class RepairOrchestrator:
         openai_base_url: str = "https://api.openai.com/v1",
         llm_model: str = "gpt-4o",
         max_retries: int = 3,
-        max_change_lines: int = 20,
+        max_change_lines: int = 50,
         lark_notify_enabled: bool = False,
         lark_notify_users: list[str] = None,
     ):
-        """
-        初始化编排器
-
-        Args:
-            github_token: GitHub访问令牌
-            openai_api_key: OpenAI API密钥
-            openai_base_url: OpenAI API基础URL
-            llm_model: LLM模型名称
-            max_retries: 最大修复重试次数
-            max_change_lines: 最大允许变更行数
-            lark_notify_enabled: 是否启用飞书通知
-            lark_notify_users: 需要通知的飞书用户open_id列表
-        """
         self.github_token = github_token
-        self.openai_api_key = openai_api_key
-        self.openai_base_url = openai_base_url
-        self.llm_model = llm_model
         self.max_retries = max_retries
-        self.max_change_lines = max_change_lines
 
-        # 飞书通知配置
-        self.lark_notify_enabled = lark_notify_enabled
-        self.lark_notify_users = lark_notify_users or []
+        # Agent 配置
+        agent_config = AgentConfig(
+            llm_model=llm_model,
+            openai_api_key=openai_api_key,
+            openai_base_url=openai_base_url,
+            github_token=github_token,
+            max_change_lines=max_change_lines,
+        )
+        self.agent_factory = AgentFactory(agent_config)
+        self.notification = NotificationService(
+            enabled=lark_notify_enabled,
+            notify_users=lark_notify_users or [],
+        )
 
-        # 事件去重：已处理的PR或提交SHA
-        self.processed_events = set()
+        self.processed_events: set[str] = set()
         self.lock = asyncio.Lock()
 
-        # 构建状态图
         self.graph = self._build_graph()
 
-    def _build_graph(self) -> StateGraph:
-        """
-        构建修复流程状态图
+    # ==================== 图构建 ====================
 
-        Returns:
-            StateGraph: 编译后的状态图
-        """
+    def _build_graph(self):
         workflow = StateGraph(RepairState)
 
-        # 添加节点
         workflow.add_node("collect_context", self._collect_context)
         workflow.add_node("fix_agent", self._run_fix_agent)
+        workflow.add_node("validation_gate", self._validation_gate)
         workflow.add_node("review_changes", self._review_changes)
         workflow.add_node("run_tests", self._run_tests)
         workflow.add_node("create_pr", self._create_pull_request)
         workflow.add_node("handle_failure", self._handle_failure)
 
-        # 定义边
         workflow.add_edge(START, "collect_context")
-        workflow.add_edge("collect_context", "fix_agent")
-        # 注意：fix_agent → review_changes 的边不在此定义
-        # _run_fix_agent 通过 Command(goto="review_changes") 显式路由
-        # 因为 Command(goto) 与固定边共存时固定边优先级更高
+        workflow.add_conditional_edges(
+            "collect_context",
+            self._route_after_context,
+            ["fix_agent", "handle_failure", END],
+        )
+        # fix_agent → validation_gate (via Command)
+        # validation_gate → review_changes or fix_agent (via Command)
 
-        # 审查后的条件路由
         workflow.add_conditional_edges(
             "review_changes",
             self._route_after_review,
             ["fix_agent", "run_tests", "handle_failure"],
         )
-
-        # 测试后的条件路由
         workflow.add_conditional_edges(
             "run_tests",
             self._route_after_test,
             ["fix_agent", "create_pr", "handle_failure"],
         )
-
-        # PR创建后的条件路由
         workflow.add_conditional_edges(
             "create_pr",
             self._route_after_create_pr,
             [END, "handle_failure"],
         )
-
         workflow.add_edge("handle_failure", END)
 
-        # 编译图
         return workflow.compile()
 
-    async def _collect_context(self, state: RepairState) -> Dict[str, Any]:
-        """
-        收集上下文节点：下载CI日志、克隆仓库、解析错误
+    # ==================== 重试上下文构建 ====================
 
-        Args:
-            state: 当前状态
+    @staticmethod
+    def _build_retry_context(
+        state: RepairState,
+        rejection_source: str,
+        violation_type: str = "",
+        rejection_data: dict | None = None,
+    ) -> dict:
+        """纯规则引擎。根据拒绝来源和结构化数据生成重试上下文。"""
+        rejection_data = rejection_data or {}
 
-        Returns:
-            Dict: 状态更新
-        """
+        # 确定 rejection_reason
+        if rejection_source == "gate":
+            reason = violation_type or rejection_data.get("violation_type", "boundary_violation")
+        elif rejection_source == "review":
+            reason = rejection_data.get("rejection_reason", "original_error_unresolved")
+        elif rejection_source == "test":
+            reason = "test_failure"
+        else:
+            reason = "unknown"
+
+        # 提取指令上下文
+        instruction_kwargs = {}
+        if rejection_source == "gate":
+            ctx = rejection_data.get("error_context", {})
+            instruction_kwargs.update(ctx)
+        elif rejection_source == "review":
+            instruction_kwargs["error_type"] = (
+                state.error_locations[0].error_type
+                if state.error_locations and hasattr(state.error_locations[0], 'error_type')
+                else "UnknownError"
+            )
+            instruction_kwargs["file_path"] = (
+                state.error_locations[0].file_path
+                if state.error_locations and hasattr(state.error_locations[0], 'file_path')
+                else "unknown"
+            )
+            instruction_kwargs["line_number"] = str(
+                state.error_locations[0].line_number
+                if state.error_locations and hasattr(state.error_locations[0], 'line_number')
+                else "?"
+            )
+        elif rejection_source == "test":
+            instruction_kwargs["n"] = len(state.failed_tests)
+            instruction_kwargs["failed_tests"] = ", ".join(state.failed_tests)
+
+        instruction = generate_instruction(reason, **instruction_kwargs)
+
+        attempt = FixAttempt(
+            attempt=state.retry_count,
+            diff_summary=(state.diff_content or "")[:200],
+            rejection_reason=reason,
+            rejected_by=rejection_source,
+        )
+
+        return {
+            "fix_history": state.fix_history + [attempt],
+            "mandatory_instructions": instruction,
+        }
+
+    # ==================== 节点: collect_context ====================
+
+    async def _collect_context(self, state: RepairState) -> dict[str, Any]:
         event: GitHubEvent = state["event"]
         logger.info(f"收集上下文: {event.event_id}, 仓库: {event.repository}")
 
         try:
-            # 事件去重：同一PR的同一分支只处理一次
-            # 使用PR编号+分支作为key，确保同一PR的多个事件（check_run, workflow_run）只处理一次
-            event_key = None
-            if event.pr_number and event.branch:
-                # 优先使用PR+分支作为去重key
-                event_key = (
-                    f"{event.repository}:pr:{event.pr_number}:branch:{event.branch}"
-                )
-            elif event.pr_number:
-                event_key = f"{event.repository}:pr:{event.pr_number}"
-            elif event.branch and hasattr(event, "head_sha") and event.head_sha:
-                event_key = (
-                    f"{event.repository}:branch:{event.branch}:sha:{event.head_sha}"
-                )
-            elif isinstance(event.payload, dict) and "head_sha" in event.payload:
-                event_key = f"{event.repository}:sha:{event.payload['head_sha']}"
-            elif (
-                isinstance(event.payload, dict)
-                and "check_run" in event.payload
-                and "head_sha" in event.payload["check_run"].get("check_suite", {})
-            ):
-                # check_run事件的head_sha在check_suite里
-                event_key = f"{event.repository}:sha:{event.payload['check_run']['check_suite']['head_sha']}"
-            elif isinstance(event.payload, dict) and "workflow_run" in event.payload:
-                # workflow_run事件的head_sha在workflow_run里
-                head_sha = event.payload["workflow_run"].get("head_sha", "")
-                head_branch = event.payload["workflow_run"].get("head_branch", "")
-                if head_sha and head_branch:
-                    event_key = (
-                        f"{event.repository}:branch:{head_branch}:sha:{head_sha}"
-                    )
-                else:
-                    event_key = f"{event.repository}:sha:{head_sha or 'unknown'}"
-            else:
-                # fallback 用 event_id
-                event_key = f"{event.repository}:event:{event.event_id}"
-
-            # 原子操作：检查和标记在同一个锁块中，避免并行重复处理
+            # 事件去重
+            event_key = self._make_event_key(event)
             async with self.lock:
                 if event_key in self.processed_events:
                     logger.info(f"事件 {event_key} 已处理过，跳过")
-                    return {
-                        "success": False,
-                        "error_message": "事件已处理过，跳过重复执行",
-                    }
-                # 立即标记为处理中，避免其他并行请求重复处理
+                    return {"success": False, "error_message": "事件已处理过"}
                 self.processed_events.add(event_key)
 
-            # 设置工具上下文
             set_tool_context({"github_token": self.github_token})
 
-            # 1. 获取CI日志：如果状态中已经有了就直接使用（本地测试场景），否则下载
+            # 1. 获取 CI 日志
             ci_logs = state.get("ci_logs", "")
             if not ci_logs and event.logs_url:
-                # 没有提供CI日志，需要从URL下载
                 logs_result = download_ci_logs.invoke({"logs_url": event.logs_url})
                 if not logs_result.startswith("Error:"):
                     ci_logs = logs_result
-                else:
-                    logger.warning(f"下载日志失败: {logs_result}")
 
             # 2. 解析错误
-            error_locations = []
+            error_locations_raw = []
             if ci_logs:
-                error_locations = parse_python_errors.invoke({"log_content": ci_logs})
+                error_locations_raw = parse_python_errors.invoke({"log_content": ci_logs})
 
-            logger.info(f"解析到Python错误数量: {len(error_locations)}")
-            if len(error_locations) > 0:
-                # 过滤ANSI颜色代码和特殊字符
-                ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[.*?[a-zA-Z])")
-                for i, err in enumerate(error_locations):
-                    file_path = err.get("file_path", "unknown")
-                    line_number = err.get("line_number", 0)
-                    error_type = err.get("error_type", "UnknownError")
-                    error_msg = err.get("error_message", "")[:100]
-                    # 清理特殊字符
-                    error_msg = ansi_escape.sub("", error_msg)
-                    error_msg = error_msg.encode("gbk", errors="ignore").decode("gbk")
-                    logger.info(
-                        f"  错误{i+1}: {file_path}:{line_number} {error_type}: {error_msg}"
-                    )
-
-            if not error_locations:
-                logger.warning("日志中未解析到任何Python错误，无需修复")
-                # 没有错误，直接结束流程
+            logger.info(f"解析到Python错误数量: {len(error_locations_raw)}")
+            if not error_locations_raw:
                 async with self.lock:
-                    if event_key in self.processed_events:
-                        self.processed_events.remove(event_key)
-                return {
-                    "success": False,
-                    "error_message": "日志中未检测到Python错误，无需修复",
-                }
+                    self.processed_events.discard(event_key)
+                return {"success": False, "error_message": "日志中未检测到Python错误"}
 
-            # 3. 克隆仓库（必须在任何需要访问仓库文件的操作之前执行）
-            repo_path = ""
-            if event.clone_url and event.branch:
-                clone_result = clone_repository.invoke(
-                    {"clone_url": event.clone_url, "branch": event.branch}
-                )
-                if not clone_result.startswith("Error:"):
-                    repo_path = clone_result
-                else:
-                    logger.error(f"克隆仓库失败: {clone_result}")
-                    # 克隆失败，移除去重标记，允许后续重试
-                    async with self.lock:
-                        if event_key in self.processed_events:
-                            self.processed_events.remove(event_key)
-                    return {"success": False, "error_message": clone_result}
-            else:
-                logger.error(
-                    f"缺少克隆信息: clone_url={event.clone_url}, branch={event.branch}"
-                )
+            # 3. 克隆仓库
+            if not event.clone_url or not event.branch:
                 async with self.lock:
-                    if event_key in self.processed_events:
-                        self.processed_events.remove(event_key)
-                return {
-                    "success": False,
-                    "error_message": "仓库克隆地址或分支为空，无法修复",
-                }
+                    self.processed_events.discard(event_key)
+                return {"success": False, "error_message": "缺少克隆信息"}
 
-            # 确保仓库路径有效
-            if not repo_path:
-                logger.error("仓库路径为空，无法继续修复")
-                async with self.lock:
-                    if event_key in self.processed_events:
-                        self.processed_events.remove(event_key)
-                return {"success": False, "error_message": "仓库克隆失败，路径为空"}
-
-            # 设置工具上下文的仓库路径，供后续工具使用
-            set_tool_context(
-                {"github_token": self.github_token, "repo_path": repo_path}
+            clone_result = clone_repository.invoke(
+                {"clone_url": event.clone_url, "branch": event.branch}
             )
-
-            # 过滤掉不存在的文件路径的错误（只保留实际存在的文件）
-            valid_error_locations = []
-            for err in error_locations:
-                file_path = err.get("file_path", "")
-                if not file_path or file_path == "<string>":
-                    # 没有文件路径但有错误类型和错误描述 → 保留，供修复 Agent 定位
-                    if err.get("error_type") and err.get("error_message"):
-                        logger.info(
-                            f"  保留无路径错误: {err.get('error_type')}: {err.get('error_message', '')[:100]}"
-                        )
-                        valid_error_locations.append(err)
-                    continue
-
-                # 清理路径中的相对路径符号和多余的分隔符
-                cleaned_file_path = file_path.lstrip("./\\").replace("\\", "/")
-
-                # 检查文件是否存在于克隆的仓库中
-                full_file_path = os.path.abspath(
-                    os.path.join(repo_path, cleaned_file_path)
-                )
-                repo_path_abs = os.path.abspath(repo_path)
-
-                # 确保文件在仓库目录内，并且确实存在
-                if (
-                    full_file_path.startswith(repo_path_abs)
-                    and os.path.exists(full_file_path)
-                    and os.path.isfile(full_file_path)
-                ):
-                    valid_error_locations.append(err)
-                    # 更新错误中的文件路径为相对路径（统一格式）
-                    relative_path = os.path.relpath(
-                        full_file_path, repo_path_abs
-                    ).replace("\\", "/")
-                    err["file_path"] = relative_path
-                else:
-                    logger.info(
-                        f"  过滤不存在的文件错误: {file_path} -> 清理后: {cleaned_file_path} -> 完整路径: {full_file_path}"
-                    )
-
-            error_locations = valid_error_locations
-            logger.info(f"过滤后有效Python错误数量: {len(error_locations)}")
-            for i, err in enumerate(error_locations):
-                logger.info(
-                    f"  有效错误{i+1}: {err.get('file_path', 'unknown')}:{err.get('line_number', 0)} {err.get('error_type', 'UnknownError')}: {err.get('error_message', '')[:100]}"
-                )
-
-            if not error_locations:
-                logger.warning("过滤后没有有效错误，无需修复")
-                # 没有有效错误，直接结束流程
+            if clone_result.startswith("Error:"):
                 async with self.lock:
-                    if event_key in self.processed_events:
-                        self.processed_events.remove(event_key)
+                    self.processed_events.discard(event_key)
+                return {"success": False, "error_message": clone_result}
+
+            repo_path = clone_result
+            set_tool_context({"github_token": self.github_token, "repo_path": repo_path})
+
+            # 4. 过滤有效错误
+            error_locations = self._filter_valid_errors(error_locations_raw, repo_path)
+            if not error_locations:
+                async with self.lock:
+                    self.processed_events.discard(event_key)
+                return {"success": False, "error_message": "过滤后没有有效错误"}
+
+            # 5. 错误分类处理
+            classification = self._classify_errors(error_locations, repo_path, ci_logs)
+            if classification.get("early_return"):
+                # 确保 early_return 携带完整上下文，避免下游节点报"缺少必要上下文"
                 return {
-                    "success": False,
-                    "error_message": "过滤后没有检测到需要修复的有效Python错误",
+                    **classification["early_return"],
+                    "repo_path": repo_path,
+                    "ci_logs": ci_logs,
+                    "error_locations": error_locations,
                 }
-
-            # 错误分类前置处理
-            is_syntax_error = False
-            missing_file_path = None
-            is_dependency_error = False
-            syntax_error_files = []  # 所有语法错误文件列表
-
-            for err in error_locations:
-                error_type = err.get("error_type", "").lower()
-                error_msg = err.get("error_message", "")
-                file_path = err.get("file_path")
-
-                # B类错误：语法/逻辑错误（最高优先级，不允许跳过）
-                if error_type == "syntaxerror" or "syntaxerror" in error_msg.lower():
-                    is_syntax_error = True
-                    if file_path and file_path not in syntax_error_files:
-                        syntax_error_files.append(file_path)
-
-            if syntax_error_files:
-                logger.info(f"检测到语法错误，涉及文件: {syntax_error_files}")
-
-                # A类错误：文件缺失
-                if (
-                    "no such file or directory" in error_msg.lower()
-                    or "could not open" in error_msg.lower()
-                ):
-                    # 提取缺失的文件路径
-                    file_match = re.search(
-                        r"No such file or directory: '([^']+)'", error_msg
-                    )
-                    if not file_match:
-                        file_match = re.search(r"Could not open '([^']+)'", error_msg)
-                    if file_match:
-                        missing_file_path = file_match.group(1)
-                        # 特殊处理：缺失requirements.txt属于A类
-                        if "requirements.txt" in missing_file_path.lower():
-                            logger.info(f"检测到缺失文件: {missing_file_path}")
-
-                # C类错误：依赖问题
-                if (
-                    error_type == "modulenotfounderror"
-                    or "modulenotfounderror" in error_msg.lower()
-                ):
-                    # 排除缺失requirements.txt的情况
-                    if "requirements.txt" not in error_msg.lower():
-                        is_dependency_error = True
-                        logger.info("检测到依赖缺失错误")
-
-            # 处理A类错误：缺失文件
-            if missing_file_path:
-                logger.info(f"创建缺失文件: {missing_file_path}")
-                from src.agent.tools.langchain_tools import write_file
-
-                # 写入空文件
-                write_result = write_file.invoke(
-                    {"file_path": f"{repo_path}/{missing_file_path}", "content": ""}
-                )
-                if write_result == "Success":
-                    logger.info(f"成功创建缺失文件: {missing_file_path}")
-                    return {
-                        "success": True,
-                        "fix_description": f"创建缺失文件: {missing_file_path}",
-                        "modified_files": [missing_file_path],
-                        "code_changes": {missing_file_path: ""},
-                    }
-                else:
-                    logger.error(f"创建缺失文件失败: {write_result}")
-                    return {
-                        "success": False,
-                        "error_message": f"创建缺失文件失败: {write_result}",
-                    }
-
-            # 处理C类错误：依赖问题
-            elif is_dependency_error:
-                logger.info("检测到依赖/配置错误，不需要修改代码")
-                return {
-                    "success": True,
-                    "error_message": "检测到依赖/环境错误，需要安装对应的依赖包，无需修改代码",
-                    "is_env_error": True,
-                }
-
-            # 处理语法错误无文件路径的情况，主动扫描仓库中的Python文件
-            elif is_syntax_error and not syntax_error_files:
-                logger.info("语法错误未关联到具体文件，开始扫描仓库中的Python文件")
-                scan_result = self._scan_syntax_files(repo_path, error_locations, ci_logs)
-                if "error" in scan_result:
-                    return {"success": False, "error_message": scan_result["error"]}
-                syntax_error_files = scan_result.get("syntax_error_files", [])
-                ci_logs = scan_result["ci_logs"]
-                error_locations = scan_result["error_locations"]
 
             return {
-                "ci_logs": ci_logs,
+                "ci_logs": classification.get("ci_logs", ci_logs),
                 "repo_path": repo_path,
-                "error_locations": error_locations,
+                "error_locations": classification.get("error_locations", error_locations),
                 "retry_count": 0,
                 "max_retries": self.max_retries,
-                "review_comments": "",  # 初始化审查反馈字段
-                "test_output": "",  # 初始化测试反馈字段
-                "risk_warnings": [],  # 初始化风险警告字段
-                "failed_tests": [],  # 初始化失败测试字段
-                "has_critical_risks": False,  # 初始化致命风险标记
-                "has_high_risks": False,  # 初始化高危风险标记
-                "risk_level": "NONE",  # 初始化风险等级
+                "review_comments": "",
+                "test_output": "",
+                "risk_warnings": [],
+                "failed_tests": [],
+                "risk_level": "NONE",
             }
 
         except Exception as e:
             logger.error(f"收集上下文失败: {e}", exc_info=True)
             return {"success": False, "error_message": f"收集上下文失败: {str(e)}"}
 
-    def _scan_syntax_files(
-        self, repo_path: str, error_locations: List[Dict], ci_logs: str
-    ) -> Dict[str, Any]:
-        """当语法错误未关联到具体文件时，扫描仓库中的Python文件定位语法错误"""
-        import ast
-        from src.agent.tools.langchain_tools import search_files, read_file
+    @staticmethod
+    def _make_event_key(event: GitHubEvent) -> str:
+        if event.pr_number and event.branch:
+            return f"{event.repository}:pr:{event.pr_number}:branch:{event.branch}"
+        if event.pr_number:
+            return f"{event.repository}:pr:{event.pr_number}"
+        if isinstance(event.payload, dict) and "head_sha" in event.payload:
+            return f"{event.repository}:sha:{event.payload['head_sha']}"
+        return f"{event.repository}:event:{event.event_id}"
+
+    @staticmethod
+    def _filter_valid_errors(error_locations: list[dict], repo_path: str) -> list[ErrorLocation]:
+        valid = []
+        repo_path_abs = os.path.abspath(repo_path)
+        for err in error_locations:
+            fp = err.get("file_path", "")
+            base_fields = {
+                "error_type": err.get("error_type", ""),
+                "error_message": err.get("error_message", ""),
+                "line_number": err.get("line_number", 0),
+                "source": err.get("source", ""),
+                "traceback": err.get("traceback", ""),
+                "is_root_cause": err.get("is_root_cause", False),
+                "chain_consequence": err.get("chain_consequence", ""),
+            }
+            if not fp or fp == "<string>":
+                if err.get("error_type") and err.get("error_message"):
+                    valid.append(ErrorLocation(file_path="", **base_fields))
+                continue
+
+            cleaned = fp.lstrip("./\\").replace("\\", "/")
+            full = os.path.abspath(os.path.join(repo_path, cleaned))
+            if full.startswith(repo_path_abs) and os.path.isfile(full):
+                rel = os.path.relpath(full, repo_path_abs).replace("\\", "/")
+                valid.append(ErrorLocation(file_path=rel, **base_fields))
+
+        logger.info(f"有效错误: {len(valid)}/{len(error_locations)}")
+        return valid
+
+    def _classify_errors(
+        self, error_locations: list[ErrorLocation], repo_path: str, ci_logs: str
+    ) -> dict:
+        """错误分类：A类(文件缺失) / B类(语法/逻辑) / C类(依赖)"""
+        is_syntax_error = False
+        syntax_error_files = []
+
+        for err in error_locations:
+            et = err.error_type.lower()
+            em = err.error_message.lower()
+
+            if et == "syntaxerror" or "syntaxerror" in em:
+                is_syntax_error = True
+                if err.file_path and err.file_path not in syntax_error_files:
+                    syntax_error_files.append(err.file_path)
+
+        # A类: 文件缺失
+        for err in error_locations:
+            em = err.error_message.lower()
+            if "no such file or directory" in em or "could not open" in em:
+                file_match = re.search(r"No such file or directory: '([^']+)'", err.error_message)
+                if not file_match:
+                    file_match = re.search(r"Could not open '([^']+)'", err.error_message)
+                if file_match:
+                    missing = file_match.group(1)
+                    if "requirements.txt" in missing:
+                        logger.info(f"检测到缺失文件: {missing}")
+                        write_file.invoke({"file_path": f"{repo_path}/{missing}", "content": ""})
+                        return {"early_return": {
+                            "success": True,
+                            "fix_description": f"创建缺失文件: {missing}",
+                            "modified_files": [missing],
+                            "code_changes": {missing: ""},
+                        }}
+
+        # C类: 依赖问题 — 不自动跳过，交给 FixAgent 判断
+        # ModuleNotFoundError/ImportError 可通过代码修复（添加 import、try/except 包裹等）
+        # FixAgent 如果判定确实需要环境变更，会在响应中设置 is_env_error: true
+        for err in error_locations:
+            et = err.error_type.lower()
+            if et in ("modulenotfounderror", "importerror"):
+                logger.info(f"检测到 {et}，交由 FixAgent 处理（可代码修复）")
+
+        # B类: 语法错误无文件路径
+        if is_syntax_error and not syntax_error_files:
+            result = self._scan_syntax_files(repo_path, error_locations, ci_logs)
+            if "error" in result:
+                return {"early_return": {"success": False, "error_message": result["error"]}}
+            return result
+
+        return {"error_locations": error_locations, "ci_logs": ci_logs}
+
+    @staticmethod
+    def _scan_syntax_files(repo_path: str, error_locations: list[ErrorLocation], ci_logs: str) -> dict:
+        """扫描仓库查找语法错误文件"""
+        import ast as _ast
+        from src.agent.tools.langchain_tools import search_files
 
         syntax_error_files = []
         py_files = search_files.invoke({"pattern": "**/*.py"})
 
         for file_path in py_files:
+            full_path = f"{repo_path}/{file_path}"
             try:
-                full_file_path = f"{repo_path}/{file_path}"
-                content = read_file.invoke({"file_path": full_file_path})
+                content = read_file.invoke({"file_path": full_path})
                 if not content.startswith("Error:"):
-                    ast.parse(content)
+                    _ast.parse(content)
             except SyntaxError as e:
                 if file_path not in syntax_error_files:
                     syntax_error_files.append(file_path)
-                logger.info(f"找到语法错误文件: {file_path}:{e.lineno}")
-                # 每个文件只更新一个 error_locations 条目，避免全部覆盖
+
                 updated = False
-                for err in error_locations:
-                    if (
-                        (err.get("error_type") == "SyntaxError"
-                         or "syntaxerror" in err.get("error_message", "").lower())
-                        and not err.get("file_path")
-                    ):
-                        err["file_path"] = file_path
-                        err["line_number"] = e.lineno
-                        err["error_message"] = str(e)
-                        err["error_type"] = "SyntaxError"
+                for i, err in enumerate(error_locations):
+                    if err.error_type == "SyntaxError" and not err.file_path:
+                        error_locations[i] = ErrorLocation(
+                            file_path=file_path,
+                            line_number=e.lineno,
+                            error_type="SyntaxError",
+                            error_message=str(e),
+                        )
                         updated = True
                         break
-
-                # 无对应条目时新增一个
                 if not updated:
-                    error_locations.append({
-                        "file_path": file_path,
-                        "line_number": e.lineno,
-                        "error_type": "SyntaxError",
-                        "error_message": str(e),
-                    })
+                    error_locations.append(ErrorLocation(
+                        file_path=file_path,
+                        line_number=e.lineno,
+                        error_type="SyntaxError",
+                        error_message=str(e),
+                    ))
 
-                syntax_error_details = (
-                    f'\nFile "{file_path}", line {e.lineno}\n'
-                    f"{e.text}\n{' ' * (e.offset - 1)}^\n"
-                    f"SyntaxError: {e.msg}\n"
-                )
-                ci_logs = ci_logs + "\n" + "=" * 50 + "\n"
-                ci_logs += "自动扫描找到的语法错误详情：\n"
-                ci_logs += syntax_error_details
-                ci_logs += "=" * 50 + "\n"
+                ci_logs += f"\n{'='*50}\n自动扫描找到的语法错误：\n{e}\n{'='*50}\n"
 
         if not syntax_error_files:
             return {"error": "语法错误发生在Python系统库中，无法自动修复"}
-        return {
-            "syntax_error_files": syntax_error_files,
-            "ci_logs": ci_logs,
-            "error_locations": error_locations,
-        }
+        return {"syntax_error_files": syntax_error_files, "ci_logs": ci_logs, "error_locations": error_locations}
+
+    # ==================== 节点: fix_agent ====================
 
     async def _run_fix_agent(self, state: RepairState) -> Command:
-        """
-        运行修复Agent节点
-
-        Args:
-            state: 当前状态
-
-        Returns:
-            Command: 状态更新和路由指令
-        """
         logger.info("运行修复Agent")
 
-        # 检查必要上下文
-        if (
-            not state["repo_path"]
-            or not state["error_locations"]
-            or not state["ci_logs"]
-        ):
-            error_msg = ""
-            if not state["repo_path"]:
-                error_msg = "缺少仓库路径，无法生成修复"
-            elif not state["error_locations"]:
-                error_msg = "缺少错误位置信息，无法生成修复"
-            elif not state["ci_logs"]:
-                error_msg = "缺少CI日志，无法生成修复"
+        # 依赖/环境错误不需要代码修复，直接结束
+        if state.get("is_env_error"):
+            logger.info("环境/配置/依赖错误，无需代码修复，流程结束")
+            return Command(update={"success": True}, goto=END)
 
+        if not state["repo_path"] or not state["error_locations"] or not state["ci_logs"]:
             return Command(
-                update={"success": False, "error_message": error_msg},
+                update={"success": False, "error_message": "缺少必要上下文"},
                 goto="handle_failure",
             )
 
         try:
-            # 重试时回滚所有变更，避免旧修复叠加
+            # 重试时回滚变更
             if state.get("retry_count", 0) > 0:
-                logger.info(f"检测到第 {state['retry_count']} 次重试，回滚所有本地变更")
-                from git import Repo
-
+                logger.info(f"第 {state['retry_count']} 次重试，回滚本地变更")
                 repo = Repo(state["repo_path"])
                 repo.git.checkout("--", ".")
 
-            # 创建修复Agent
-            fix_agent = FixAgent(
-                repo_path=state["repo_path"],
-                llm_model=self.llm_model,
-                openai_api_key=self.openai_api_key,
-                openai_base_url=self.openai_base_url,
-                github_token=self.github_token,
+            # 构建系统提示词覆盖（重试时将强制指令注入系统层，优先级高于用户提示词）
+            system_override = ""
+            mandatory = state.get("mandatory_instructions", "")
+            if mandatory:
+                system_override = (
+                    "## 🔴 最高优先级系统指令（覆盖所有其他规则）\n"
+                    + mandatory
+                    + "\n\n此指令优先级最高。忽略下方所有与此冲突的安全修复建议、代码优化建议。"
+                )
+
+            fix_agent = self.agent_factory.create_fix_agent(
+                state["repo_path"], system_prompt_override=system_override
             )
 
-            # 准备额外上下文：审查和测试反馈（如果有）
             extra_context = {}
-            review_comments = state.get("review_comments", "")
-            risk_warnings = state.get("risk_warnings", [])
-            test_output = state.get("test_output", "")
-            failed_tests = state.get("failed_tests", [])
+            if state.get("review_comments"):
+                extra_context["review_feedback"] = state["review_comments"]
+            if state.get("risk_warnings"):
+                extra_context["risk_warnings"] = state["risk_warnings"]
+            if state.get("test_output"):
+                extra_context["test_output"] = state["test_output"]
+            if state.get("failed_tests"):
+                extra_context["failed_tests"] = state["failed_tests"]
 
-            if review_comments:
-                extra_context["review_feedback"] = review_comments
-                logger.info(f"传入审查反馈: {review_comments[:200]}...")
-            if risk_warnings:
-                extra_context["risk_warnings"] = risk_warnings
-                logger.info(f"传入风险警告: {risk_warnings}")
-            if test_output:
-                extra_context["test_output"] = test_output
-                logger.info(f"传入测试输出: {test_output[:200]}...")
-            if failed_tests:
-                extra_context["failed_tests"] = failed_tests
-                logger.info(f"传入失败测试: {failed_tests}")
-
-            # 生成修复
             fix_result = await fix_agent.generate_fix(
                 ci_logs=state["ci_logs"],
                 error_locations=state["error_locations"],
+                original_codes=state.get("original_codes", {}),
+                mandatory_instructions=state.get("mandatory_instructions", ""),
+                fix_history=state.get("fix_history", []),
+                retry_count=state.get("retry_count", 0),
                 **extra_context,
             )
 
-            # 处理环境错误：不需要修复，直接成功结束
+            # 环境错误 → 直接结束
             if fix_result.get("is_env_error", False):
-                logger.info("环境/配置/依赖错误，无需代码修复，流程结束")
                 return Command(
-                    update={
-                        "success": True,
-                        "error_message": fix_result["fix_description"],
-                    },
+                    update={"success": True, "error_message": fix_result["fix_description"]},
                     goto=END,
                 )
 
-            # 修复失败：没有生成有效的代码变更
             if not fix_result.get("code_changes"):
                 return Command(
-                    update={
-                        "success": False,
-                        "error_message": "修复Agent未能生成有效修复代码",
-                    },
+                    update={"success": False, "error_message": "修复Agent未能生成有效修复代码"},
                     goto="handle_failure",
                 )
 
-            # 先读取所有需要修改文件的原始内容
-            from src.agent.tools.langchain_tools import read_file, write_file, get_diff
-            import difflib
-
+            # 读取原始代码
             original_codes = {}
-            for file_path in fix_result["code_changes"].keys():
+            for fp in fix_result["code_changes"]:
                 try:
-                    original_content = read_file.invoke({"file_path": file_path})
-                    if not original_content.startswith("Error:"):
-                        original_codes[file_path] = original_content
+                    content = read_file.invoke({"file_path": fp})
+                    if not content.startswith("Error:"):
+                        original_codes[fp] = content
                 except Exception as e:
-                    logger.warning(f"读取原始文件 {file_path} 失败: {str(e)}")
+                    logger.warning(f"读取原始文件 {fp} 失败: {e}")
 
-            # 验证修复是否真的修改了代码
-            logger.info("=== 代码变更验证 ===")
-            for file_path in fix_result["code_changes"].keys():
-                original = original_codes.get(file_path, "")
-                fixed = fix_result["code_changes"].get(file_path, "")
-                original_len = len(original)
-                fixed_len = len(fixed)
-                is_identical = original == fixed
-                logger.info(
-                    f"文件 {file_path}: 原始={original_len}字符, 修复={fixed_len}字符, 完全相同={is_identical}"
-                )
-                if not is_identical:
-                    # 显示实际差异（前后各50字符）
-                    diff = difflib.unified_diff(
-                        original.splitlines(True),
-                        fixed.splitlines(True),
-                        fromfile=f"原始/{file_path}",
-                        tofile=f"修复/{file_path}",
-                        n=2,
-                    )
-                    diff_text = "".join(diff)
-                    logger.info(f"文件 {file_path} 的差异:\n{diff_text[:1000]}")
-
-            # 检查是否所有修复文件都没有变化
-            unchanged_files = [
-                fp
-                for fp in fix_result["code_changes"].keys()
-                if original_codes.get(fp, "") == fix_result["code_changes"].get(fp, "")
-            ]
-            if unchanged_files and len(unchanged_files) == len(
-                fix_result["code_changes"]
-            ):
-                logger.error(
-                    f"修复Agent返回的代码与原始代码完全一致，没有实际修改！文件: {unchanged_files}"
-                )
-                # 直接让审查阶段处理（auto_compare_codes会检测到并拒绝）
-                # 但为了更好的错误信息，修改fix_description
-                fix_result["fix_description"] = (
-                    f"WARNING: 所有修复文件代码与原始代码完全一致，没有实际修改"
-                )
-                error_details = []
-                for err in state.get("error_locations", []):
-                    error_details.append(
-                        f"  {err.get('file_path','?')}:{err.get('line_number','?')} {err.get('error_type','?')}: {err.get('error_message','?')[:100]}"
-                    )
-                logger.error(f"检测到的原始错误:\n" + "\n".join(error_details))
-
-            # 应用修复到本地仓库
-            for file_path, content in fix_result["code_changes"].items():
-                write_result = write_file.invoke(
-                    {"file_path": file_path, "content": content}
-                )
-                if write_result != "Success":
-                    logger.warning(f"写入文件 {file_path} 失败: {write_result}")
-
-            # 获取diff
+            # 获取 diff
             diff_content = get_diff.invoke({"base_branch": state["event"].branch})
 
-            # 正常路径：返回状态更新并路由到 review_changes
-            update_state = {
-                "fix_description": fix_result["fix_description"],
-                "modified_files": fix_result["modified_files"],
-                "code_changes": fix_result["code_changes"],
-                "diff_content": diff_content,
-                "original_codes": original_codes,
-                "retry_count": state["retry_count"] + 1,
-            }
-
-            # 只有在首次修复且没有任何反馈时才重置反馈字段
-            # 重试时保留所有反馈信息，用于指导下一次修复
-            if (
-                state["retry_count"] == 0
-                and not state.get("review_comments")
-                and not state.get("test_output")
-            ):
-                update_state.update(
-                    {
-                        "review_comments": "",
-                        "test_output": "",
-                        "risk_warnings": [],
-                        "failed_tests": [],
-                    }
-                )
-
-            return Command(update=update_state, goto="review_changes")
+            # 返回更新，路由到 validation_gate
+            return Command(
+                update={
+                    "fix_description": fix_result["fix_description"],
+                    "code_changes": fix_result["code_changes"],
+                    "modified_files": fix_result["modified_files"],
+                    "diff_content": diff_content,
+                    "original_codes": original_codes,
+                    "retry_count": state.get("retry_count", 0) + 1,
+                    "current_phase": "validation",
+                },
+                goto="validation_gate",
+            )
 
         except Exception as e:
             logger.error(f"修复Agent执行失败: {e}", exc_info=True)
             return Command(
-                update={
-                    "success": False,
-                    "error_message": f"修复Agent执行失败: {str(e)}",
-                },
+                update={"success": False, "error_message": f"修复Agent执行失败: {str(e)}"},
                 goto="handle_failure",
             )
 
-    async def _review_changes(self, state: RepairState) -> Dict[str, Any]:
-        """
-        审查代码变更节点（使用审查Agent）
+    # ==================== 节点: validation_gate ====================
 
-        Args:
-            state: 当前状态
+    async def _validation_gate(self, state: RepairState) -> Command:
+        logger.info("运行校验门禁")
 
-        Returns:
-            Dict: 状态更新
-        """
+        validation = validate_fix(
+            fix_result={
+                "code_changes": state["code_changes"],
+                "fix_description": state["fix_description"],
+                "modified_files": state["modified_files"],
+                "is_env_error": state.get("is_env_error", False),
+            },
+            original_codes=state["original_codes"],
+            error_locations=state["error_locations"],
+        )
+
+        if validation.passed:
+            # 通过：写入文件，进入审查
+            for fp, content in state["code_changes"].items():
+                write_file.invoke({"file_path": fp, "content": content})
+
+            logger.info("校验通过，进入审查")
+            return Command(
+                update={"current_phase": "review"},
+                goto="review_changes",
+            )
+
+        # 不通过：构建重试上下文
+        logger.warning(f"校验失败: {validation.violation_type} - {validation.details}")
+        retry_context = self._build_retry_context(
+            state, "gate",
+            violation_type=validation.violation_type,
+            rejection_data={
+                "violation_type": validation.violation_type,
+                "details": validation.details,
+                "error_context": validation.error_context,
+            },
+        )
+
+        if state["retry_count"] < state["max_retries"]:
+            return Command(
+                update={
+                    **retry_context,
+                    "retry_count": state["retry_count"],
+                    "current_phase": "retry_from_gate",
+                },
+                goto="fix_agent",
+            )
+
+        return Command(
+            update={
+                **retry_context,
+                "success": False,
+                "error_message": f"校验失败且重试耗尽: {validation.details}",
+            },
+            goto="handle_failure",
+        )
+
+    # ==================== 节点: review_changes ====================
+
+    async def _review_changes(self, state: RepairState) -> dict[str, Any]:
         logger.info("运行审查Agent")
 
         try:
-            # 创建审查Agent
-            review_agent = ReviewAgent(
-                llm_model=self.llm_model,
-                openai_api_key=self.openai_api_key,
-                openai_base_url=self.openai_base_url,
-                max_change_lines=self.max_change_lines,
-            )
-
-            # 执行审查
+            review_agent = self.agent_factory.create_review_agent()
             review_result = await review_agent.review_changes(
                 error_locations=state["error_locations"],
                 fix_description=state["fix_description"],
@@ -737,7 +582,6 @@ class RepairOrchestrator:
                 repo_path=state["repo_path"],
                 original_codes=state.get("original_codes"),
             )
-
             return review_result
 
         except Exception as e:
@@ -745,102 +589,27 @@ class RepairOrchestrator:
             return {
                 "review_passed": False,
                 "review_comments": f"审查过程出错: {str(e)}",
-                "change_lines": 0,
                 "risk_warnings": [str(e)],
+                "risk_level": "NONE",
+                "rejection_reason": "",
             }
 
-    def _route_after_review(self, state: RepairState) -> str:
-        """
-        审查后的路由逻辑（基于四级风险分级）
+    # ==================== 节点: run_tests ====================
 
-        - CRITICAL → 立即终止修复流程，绝不创建PR
-        - HIGH → 强制重试修复，重试用尽后创建带"禁止合并"标签的PR
-        - MEDIUM/LOW/NONE → 无论审查是否通过，进入测试阶段
-        """
-        # 如果有明确的错误消息且success为False，说明之前的节点已经失败
-        if state.get("success") is False and state.get("error_message"):
-            logger.error(f"流程已失败: {state.get('error_message', '未知错误')}")
-            return "handle_failure"
-
-        risk_level = state.get("risk_level", "NONE")
-        retry_count = state.get("retry_count", 0)
-
-        # CRITICAL → 立即终止，绝不创建PR（优先检查标记，更可靠）
-        if state.get("has_critical_risks", False) or risk_level == "CRITICAL":
-            logger.error(
-                f"致命安全风险，终止修复流程: {state.get('risk_warnings', [])}"
-            )
-            return "handle_failure"
-
-        # HIGH → 强制重试，重试用尽后创建带"禁止合并"标签的PR
-        if state.get("has_high_risks", False) or risk_level == "HIGH":
-            max_retries = state.get("max_retries", 3)
-            if retry_count < max_retries:
-                logger.info(
-                    f"存在高危风险，重试修复 (第 {retry_count + 1} 次,"
-                    f" 共 {max_retries} 次)"
-                )
-                return "fix_agent"
-            logger.warning(
-                f"重试 {max_retries} 次后仍存在高危风险，"
-                f"创建带'禁止合并'标签的PR，转人工处理"
-            )
-            # 标记为高危PR，create_pr节点会检查此标记
-            return "create_pr"
-
-        # MEDIUM/LOW/NONE → 根据审查是否通过决定路由
-        if not state.get("review_passed", False):
-            retry_count = state.get("retry_count", 0)
-            max_retries = state.get("max_retries", 3)
-            if retry_count < max_retries:
-                logger.info(
-                    f"审查未通过(风险等级{risk_level})，重试修复 "
-                    f"(第 {retry_count} 次, 共 {max_retries} 次)"
-                )
-                return "fix_agent"
-            logger.warning(
-                f"审查未通过且重试已达上限({max_retries}次)，终止修复流程"
-            )
-            return "handle_failure"
-
-        logger.info("审查通过，进入测试阶段")
-        return "run_tests"
-
-    async def _run_tests(self, state: RepairState) -> Dict[str, Any]:
-        """
-        运行测试节点（使用测试Agent）
-
-        Args:
-            state: 当前状态
-
-        Returns:
-            Dict: 状态更新
-        """
+    async def _run_tests(self, state: RepairState) -> dict[str, Any]:
         logger.info("运行测试Agent")
 
         try:
-            # 创建测试Agent
-            test_agent = TestAgent(
-                repo_path=state["repo_path"],
-                llm_model=self.llm_model,
-                openai_api_key=self.openai_api_key,
-                openai_base_url=self.openai_base_url,
-                test_command="pytest",
-            )
-
-            # 执行动态验证（传入 CI 日志用于提取原始失败命令）
+            test_agent = self.agent_factory.create_test_agent(state["repo_path"])
             test_result = await test_agent.verify_fix(
                 error_locations=state["error_locations"],
                 fix_description=state["fix_description"],
                 diff_content=state["diff_content"],
                 ci_logs=state.get("ci_logs", ""),
             )
-
-            # 补充兼容字段供下游使用（如果有）
             logger.info(
                 f"验证结果: status={test_result.get('validation_status', 'N/A')}, "
-                f"method={test_result.get('validation_method', 'N/A')}, "
-                f"command={test_result.get('command_used', 'N/A')}"
+                f"method={test_result.get('validation_method', 'N/A')}"
             )
             return test_result
 
@@ -849,327 +618,54 @@ class RepairOrchestrator:
             return {
                 "validation_status": "uncertain",
                 "validation_method": "error",
-                "command_used": "",
-                "test_passed": False,
                 "test_output": f"测试执行失败: {str(e)}",
                 "failed_tests": [],
-                "verification_summary": f"测试过程出错: {str(e)}",
             }
 
-    def _route_after_test(self, state: RepairState) -> str:
-        """
-        测试后的路由逻辑（基于 validation_status 三元决策）
+    # ==================== 节点: create_pr ====================
 
-        - "success"  → 创建 PR
-        - "uncertain" → 仍然创建 PR，但标记需人工确认
-        - "failure"   → 重试（未达上限）或失败（已达上限）
-        """
-        # 如果有明确的错误消息且success为False，说明之前的节点已经失败
-        if state.get("success") is False and state.get("error_message"):
-            logger.error(f"流程已失败: {state.get('error_message', '未知错误')}")
-            return "handle_failure"
-
-        validation_status = state.get("validation_status", "")
-
-        # 验证通过 → 创建 PR
-        if validation_status == "success":
-            logger.info("验证通过，准备创建 PR")
-            return "create_pr"
-
-        # 不确定（无测试用例/超时/命令被拦截） → 仍创建 PR，标记需人工确认
-        if validation_status == "uncertain":
-            logger.warning("验证结果不确定，仍创建 PR（标记需人工确认）")
-            return "create_pr"
-
-        # 验证失败 → 重试或重试用尽后创建 PR（标记需人工确认）
-        if validation_status == "failure":
-            retry_count = state.get("retry_count", 0)
-            if retry_count < state["max_retries"]:
-                logger.info(
-                    f"验证失败，重试修复 (第 {retry_count + 1} 次, 共 {state['max_retries']} 次)"
-                )
-                return "fix_agent"
-            logger.warning(
-                f"重试 {state['max_retries']} 次后验证仍未通过，"
-                f"仍然创建 PR（标记需人工确认）"
-            )
-            return "create_pr"
-
-        # 向后兼容：如果 validation_status 为空，回退到旧的 test_passed 逻辑
-        logger.warning("validation_status 为空，回退到旧的 test_passed 逻辑")
-        if not state.get("test_passed", False):
-            retry_count = state.get("retry_count", 0)
-            if retry_count < state["max_retries"]:
-                logger.info(f"测试失败（旧逻辑），重试修复 (第 {retry_count + 1} 次)")
-                return "fix_agent"
-            logger.warning(
-                f"重试 {state['max_retries']} 次后测试仍未通过（旧逻辑），"
-                f"仍然创建 PR（标记需人工确认）"
-            )
-            return "create_pr"
-
-        logger.info("测试通过（旧逻辑），准备创建 PR")
-        return "create_pr"
-
-    def _route_after_create_pr(self, state: RepairState) -> str:
-        """
-        PR创建后的路由逻辑
-
-        - success → END
-        - failure → handle_failure（发送飞书通知）
-        """
-        if state.get("success") is False:
-            logger.error(f"创建PR失败: {state.get('error_message', '未知错误')}")
-            return "handle_failure"
-        return END
-
-    async def _create_pull_request(self, state: RepairState) -> Dict[str, Any]:
-        """
-        创建PR节点
-
-        Args:
-            state: 当前状态
-
-        Returns:
-            Dict: 状态更新
-        """
+    async def _create_pull_request(self, state: RepairState) -> dict[str, Any]:
         event: GitHubEvent = state["event"]
         logger.info(f"创建PR: {event.repository}")
 
         try:
-            from git import Repo
-
             repo = Repo(state["repo_path"])
 
-            # 创建新分支
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             branch_name = f"autofix/{event.event_type}_{timestamp}"
 
-            create_branch_result = create_branch.invoke({"branch_name": branch_name})
-            if create_branch_result != "Success":
-                return {
-                    "success": False,
-                    "error_message": f"创建分支失败: {create_branch_result}",
-                }
+            if create_branch.invoke({"branch_name": branch_name}) != "Success":
+                return {"success": False, "error_message": "创建分支失败"}
 
-            # 提交变更
             commit_message = f"Auto-fix: {state['fix_description']}\n\nGenerated by SpiderClaw AutoFix Agent."
             commit_result = commit_changes.invoke(
                 {"message": commit_message, "files": state["modified_files"]}
             )
             if commit_result.startswith("Error:"):
-                return {
-                    "success": False,
-                    "error_message": f"提交变更失败: {commit_result}",
-                }
+                return {"success": False, "error_message": f"提交变更失败: {commit_result}"}
 
-            # 设置工具上下文
-            set_tool_context(
-                {"repo_path": state["repo_path"], "github_token": self.github_token}
-            )
+            set_tool_context({"repo_path": state["repo_path"], "github_token": self.github_token})
 
-            # 推送分支
-            push_result = push_branch.invoke({"branch_name": branch_name})
-            if push_result != "Success":
-                return {
-                    "success": False,
-                    "error_message": f"推送分支失败: {push_result}",
-                }
+            if push_branch.invoke({"branch_name": branch_name}) != "Success":
+                return {"success": False, "error_message": "推送分支失败"}
 
-            # 创建 PR 标题
+            pr_body = self.notification.build_pr_body(state, branch_name)
+
             pr_author_title = event.payload.get('sender', {}).get('login', '未知用户')
             pr_title = f"[SpiderClaw: fix]：对 {pr_author_title} 的 PR 进行的修复"
 
-            # 相关PR链接
-            pr_link = f"#{event.pr_number}" if event.pr_number else "无"
-
-            # 原始CI日志链接
-            ci_logs_link = f"[链接]({event.logs_url})" if event.logs_url else "无"
-
-            # 审查结果状态
-            review_status = "✅ 通过" if state['review_passed'] else "❌ 不通过"
-
-            # 验证结果状态（三元）
-            validation_status = state.get('validation_status', '')
-            validation_method = state.get('validation_method', '')
-            validation_command = state.get('validation_command', '')
-
-            # 确保 change_lines 正确（从 diff 内容计算作为回退）
-            change_lines = state.get("change_lines", 0)
-            if change_lines == 0 and state.get("diff_content"):
-                # 从 diff 内容计算实际变更行数
-                diff = state["diff_content"]
-                adds = len([l for l in diff.split('\n') if l.startswith('+') and not l.startswith('+++')])
-                deletes = len([l for l in diff.split('\n') if l.startswith('-') and not l.startswith('---')])
-                change_lines = adds + deletes
-
-            if validation_status == 'success':
-                test_status = "✅ 通过"
-                test_detail = f"验证方法: {validation_method}"
-                if validation_command:
-                    test_detail += f" | 命令: {validation_command}"
-            elif validation_status == 'uncertain':
-                test_status = "⚠️ 不确定"
-                test_detail = (
-                    f"验证方法: {validation_method}，"
-                    f"无法完全自动验证修复正确性，请人工确认"
-                )
-                if validation_command:
-                    test_detail += f" | 命令: {validation_command}"
-            else:
-                test_status = "❌ 不通过"
-                test_detail = f"验证方法: {validation_method}"
-                if validation_command:
-                    test_detail += f" | 命令: {validation_command}"
-
-            # 风险警告（区分严重/警告）
-            risk_warnings = state.get('risk_warnings', []) or []
-            critical_risks = [r for r in risk_warnings if r.startswith('[严重]')]
-            normal_warnings = [r for r in risk_warnings if not r.startswith('[严重]')]
-
-            risk_section_parts = []
-            if critical_risks:
-                risk_section_parts.append("### ⚠️ 未解决的严重风险")
-                risk_section_parts.extend(f"- {r}" for r in critical_risks)
-                risk_section_parts.append("")
-            if normal_warnings:
-                risk_section_parts.append("### 低风险警告")
-                risk_section_parts.extend(f"- {r}" for r in normal_warnings)
-                risk_section_parts.append("")
-
-            risk_warning_display = '; '.join(risk_warnings) if risk_warnings else "无"
-            risk_detail_section = '\n'.join(risk_section_parts) if risk_section_parts else ""
-
-            # 错误类型（用于 PR 正文显示）
-            error_types = list({err.get('error_type', 'Unknown') for err in state['error_locations']})
-            error_types_str = ', '.join(error_types)
-
-            # 构建PR正文
-            pr_body_parts = [f"""## 🎯 修复概览
-- **系统**: SpiderClaw 自动修复系统
-- 原错误分支: `{event.branch}`
-- 修复分支: `{branch_name}`
-- 错误类型: {error_types_str}
-- 修改文件: {len(state['modified_files'])} 个
-- 变更行数: {change_lines} 行
-- 相关PR: {pr_link}
-- 原始CI日志: {ci_logs_link}
-
-## ✅ 检查结果
-- 代码审查: {review_status}
-- 测试验证: {test_status}
-- 验证详情: {test_detail}
-- 风险警告: {risk_warning_display}
-{risk_detail_section}
-"""]
-
-            # 有严重风险时在 PR 顶部加醒目警告
-            if critical_risks:
-                pr_body_parts.insert(0, f"""| 🚨 此 PR 包含未解决的严重风险，请谨慎合并 |
-| --- |
-| 自动修复尝试 {state.get('max_retries', '?')} 次后仍存在严重风险， |
-| **务必人工审查所有变更后再合并**。 |
-
-""")
-
-            # HIGH风险重试用尽后创建的PR：加"禁止合并"醒目标签
-            if state.get("has_high_risks", False) or state.get("risk_level") == "HIGH":
-                pr_body_parts.insert(0, f"""| 🚨 禁止合并 🚨 |
-| --- |
-| 此PR包含高危风险（如不安全的子进程调用、硬编码密钥、函数契约破坏等）， |
-| 重试 {state.get('max_retries', '?')} 次后仍未能消除。 |
-| **强烈建议人工审查所有变更，确认安全后再决定是否合并**。 |
-
-""")
-
-            # uncertain 时在 PR 顶部额外加一个醒目警告
-            if validation_status == 'uncertain':
-                pr_body_parts.insert(0, f"""| ⚠️ 自动验证结果不确定 |
-| --- |
-| 原始验证命令「{validation_command or '无'}」无法确定修复正确性。 |
-| 此 PR 由系统自动生成，**请人工审查和验证后合并**。 |
-
-""")
-                pr_body_parts.append(f"""---
-| ⚠️ 如需回退，请使用以下命令重置到 CI 失败前的状态 |
-| --- |
-| git checkout origin/{event.branch} -- . |
-""")
-
-            _fixed_desc = re.sub(
-                r'(?<!\n)\n(?=[-*] )', r'\n\n',
-                state['fix_description']
-            )
-            pr_body_parts.append(f"""
-<details>
-<summary>🔍 查看详细变更</summary>
-
-## 修复说明
-{_fixed_desc}
-
-## 变更详情
-- 修改文件: {', '.join(state['modified_files'])}
-
-## 代码Diff
-```diff
-{state['diff_content']}
-```
-</details>
-
----
-此PR由SpiderClaw自动修复系统生成
-""")
-
-            pr_body = '\n'.join(pr_body_parts)
-
-            pr_url = create_pull_request.invoke(
-                {
-                    "repo_full_name": event.repository,
-                    "head_branch": branch_name,
-                    "base_branch": event.branch,
-                    "title": pr_title,
-                    "body": pr_body,
-                }
-            )
+            pr_url = create_pull_request.invoke({
+                "repo_full_name": event.repository,
+                "head_branch": branch_name,
+                "base_branch": event.branch,
+                "title": pr_title,
+                "body": pr_body,
+            })
 
             if not pr_url.startswith("Error:"):
-                # 从URL中提取PR编号
-                pr_number = int(pr_url.split("/")[-1]) if pr_url else None
-
-                # 发送飞书成功通知
-                if self.lark_notify_enabled and self.lark_notify_users:
-                    # 提取错误类型
-                    error_types = list({err.get('error_type', 'Unknown') for err in state['error_locations']})
-                    error_type_str = ', '.join(error_types)
-                    # 获取PR提交者昵称和bug数量
-                    pr_author = event.payload.get('sender', {}).get('login', '未知用户')
-                    # 统计涉bug文件数（按文件路径去重，比 len(error_locations) 更准确）
-                    bug_files = {err.get('file_path', '') for err in state['error_locations']}
-                    bug_files.discard('')
-                    bug_count = len(bug_files) if bug_files else len(state['error_locations'])
-
-                    # 给每个配置的用户发送通知
-                    for user_id in self.lark_notify_users:
-                        asyncio.create_task(
-                            send_repair_notification(
-                                repair_success=True,
-                                error_type=error_type_str,
-                                source_branch=event.branch,
-                                pr_url=pr_url,
-                                fix_description=state['fix_description'],
-                                receive_id=user_id,
-                                receive_id_type="open_id",
-                                pr_author=pr_author,
-                                bug_count=bug_count
-                            )
-                        )
-
-                return {
-                    "pr_url": pr_url,
-                    "pr_number": pr_number,
-                    "success": True,
-                    "error_message": "",
-                }
+                pr_number = int(pr_url.split("/")[-1]) if pr_url else 0
+                self.notification.send_pr_created(state)
+                return {"pr_url": pr_url, "pr_number": pr_number, "success": True}
             else:
                 return {"success": False, "error_message": pr_url}
 
@@ -1177,61 +673,105 @@ class RepairOrchestrator:
             logger.error(f"创建PR失败: {e}", exc_info=True)
             return {"success": False, "error_message": f"创建PR失败: {str(e)}"}
 
-    async def _handle_failure(self, state: RepairState) -> Dict[str, Any]:
-        """
-        处理失败节点
-        """
+    # ==================== 节点: handle_failure ====================
+
+    async def _handle_failure(self, state: RepairState) -> dict[str, Any]:
         error_msg = state.get("error_message", "未知错误")
         logger.error(f"修复流程失败: {error_msg}")
 
-        # 发送飞书失败通知
-        if self.lark_notify_enabled and self.lark_notify_users:
-            # 提取错误类型
-            error_types = list({err.get('error_type', 'Unknown') for err in state['error_locations']})
-            error_type_str = ', '.join(error_types) if error_types else 'Unknown'
-            # 获取PR提交者昵称和bug数量
-            event = state['event']
-            pr_author = event.payload.get('sender', {}).get('login', '未知用户')
-            bug_files = {err.get('file_path', '') for err in state['error_locations']}
-            bug_files.discard('')
-            bug_count = len(bug_files) if bug_files else len(state['error_locations'])
-
-            # 给每个配置的用户发送通知
-            for user_id in self.lark_notify_users:
-                asyncio.create_task(
-                    send_repair_notification(
-                        repair_success=False,
-                        error_type=error_type_str,
-                        source_branch=event.branch,
-                        pr_url="",
-                        fix_description=state.get('fix_description', '修复失败'),
-                        receive_id=user_id,
-                        receive_id_type="open_id",
-                        error_message=error_msg,
-                        pr_author=pr_author,
-                        bug_count=bug_count
-                    )
-                )
-
-        # 临时目录会在工具上下文被覆盖时自动清理
+        self.notification.send_failure(state)
         return {"success": False, "error_message": error_msg}
 
-    async def run(self, event: GitHubEvent, ci_logs: str = "") -> Dict[str, Any]:
-        """
-        运行修复流程
+    # ==================== 路由 ====================
 
-        Args:
-            event: GitHub事件对象
-            ci_logs: 可选的CI日志内容，如果提供则不下载日志（用于本地测试）
+    def _route_after_context(self, state: RepairState) -> str:
+        """上下文收集后路由：环境错误直接结束，失败去 handle_failure，否则进入修复"""
+        if state.get("success") is False and state.get("error_message"):
+            return "handle_failure"
+        if state.get("is_env_error"):
+            logger.info("环境/依赖错误，跳过代码修复，流程结束")
+            return END
+        return "fix_agent"
 
-        Returns:
-            Dict: 最终修复结果
+    def _route_after_review(self, state: RepairState) -> str:
+        if state.get("success") is False and state.get("error_message"):
+            return "handle_failure"
+
+        risk_level = state.get("risk_level", "NONE")
+        retry_count = state.get("retry_count", 0)
+
+        if state.get("has_critical_risks", False) or risk_level == "CRITICAL":
+            logger.error(f"致命风险，终止: {state.get('risk_warnings', [])}")
+            return "handle_failure"
+
+        if state.get("has_high_risks", False) or risk_level == "HIGH":
+            if retry_count < state.get("max_retries", 3):
+                logger.info(f"高危风险，重试 ({retry_count + 1}/{state['max_retries']})")
+                return "fix_agent"
+            return "create_pr"
+
+        if not state.get("review_passed", False):
+            if retry_count < state.get("max_retries", 3):
+                logger.info(f"审查未通过，重试 ({retry_count + 1}/{state['max_retries']})")
+                return "fix_agent"
+            return "handle_failure"
+
+        return "run_tests"
+
+    def _route_after_test(self, state: RepairState) -> str:
+        """测试后路由 — 优化逻辑：
+        - success/uncertain → create_pr（不重试）
+        - failure + import错误 → create_pr（导入类修复无法验证）
+        - failure + 逻辑错误 + retries < max → fix_agent 重试
+        - 重试耗尽 → handle_failure
         """
+        if state.get("success") is False and state.get("error_message"):
+            return "handle_failure"
+
+        validation_status = state.get("validation_status", "")
+
+        if validation_status == "success":
+            logger.info("验证通过，创建 PR")
+            return "create_pr"
+
+        if validation_status == "uncertain":
+            logger.warning("验证不确定，仍创建 PR")
+            return "create_pr"
+
+        if validation_status == "failure":
+            # 导入类错误修复后无法运行原代码验证，直接创建 PR
+            if _all_import_errors(state.get("error_locations", [])):
+                logger.info("导入类错误，验证失败是预期的，创建 PR")
+                return "create_pr"
+
+            if state.get("retry_count", 0) < state.get("max_retries", 3):
+                logger.info(f"验证失败，重试 ({state.get('retry_count', 0) + 1}/{state['max_retries']})")
+                return "fix_agent"
+
+            logger.warning(f"重试 {state['max_retries']} 次后验证仍未通过，创建 PR")
+            return "create_pr"
+
+        # 向后兼容：validation_status 为空
+        logger.warning("validation_status 为空，回退到旧逻辑")
+        if not state.get("test_passed", False):
+            if state.get("retry_count", 0) < state.get("max_retries", 3):
+                return "fix_agent"
+            return "create_pr"
+        return "create_pr"
+
+    def _route_after_create_pr(self, state: RepairState) -> str:
+        if state.get("success") is False:
+            return "handle_failure"
+        return END
+
+    # ==================== 入口 ====================
+
+    async def run(self, event: GitHubEvent, ci_logs: str = "") -> dict[str, Any]:
+        """运行修复流程"""
         logger.info(f"启动修复流程: {event.event_id}")
 
         try:
-            # 初始化状态
-            initial_state: RepairState = {
+            initial_state = {
                 "event": event,
                 "ci_logs": ci_logs,
                 "repo_path": "",
@@ -1243,26 +783,25 @@ class RepairOrchestrator:
                 "diff_content": "",
                 "review_passed": False,
                 "review_comments": "",
-                "change_lines": 0,
                 "risk_warnings": [],
-                "has_critical_risks": False,
-                "has_high_risks": False,
                 "risk_level": "NONE",
-                "test_passed": False,
-                "test_output": "",
-                "failed_tests": [],
+                "rejection_reason": "",
                 "validation_status": "",
                 "validation_method": "",
                 "validation_command": "",
-                "pr_url": None,
-                "pr_number": None,
+                "test_output": "",
+                "failed_tests": [],
+                "fix_history": [],
+                "mandatory_instructions": "",
+                "pr_url": "",
+                "pr_number": 0,
                 "success": False,
                 "error_message": "",
                 "retry_count": 0,
                 "max_retries": self.max_retries,
+                "current_phase": "",
             }
 
-            # 运行图
             final_state = await self.graph.ainvoke(initial_state)
 
             logger.info(f"修复流程完成: 成功={final_state['success']}")
@@ -1275,6 +814,6 @@ class RepairOrchestrator:
             logger.error(f"修复流程异常: {e}", exc_info=True)
             return {"success": False, "error_message": f"修复流程异常: {str(e)}"}
 
-    async def run_repair(self, event: GitHubEvent, ci_logs: str = "") -> Dict[str, Any]:
-        """向后兼容别名，与run()功能相同。"""
+    async def run_repair(self, event: GitHubEvent, ci_logs: str = "") -> dict[str, Any]:
+        """向后兼容别名"""
         return await self.run(event, ci_logs=ci_logs)
