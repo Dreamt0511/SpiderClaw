@@ -198,7 +198,7 @@ async def shutdown(signal: signal.Signals, server: fastapi.Server, event_bus: Ev
 
 ## 九、配置说明
 
-### YAML配置示例（config/agent-config.yaml）
+### YAML配置示例（src/config/agent-config.yaml）
 ```yaml
 webhook:
   github:
@@ -239,7 +239,7 @@ Options:
   --host TEXT              监听主机地址 (默认: 0.0.0.0)
   --port INTEGER           监听端口 (默认: 8000)
   --secret TEXT            GitHub Webhook密钥
-  --config PATH            配置文件路径 (默认: config/agent-config.yaml)
+  --config PATH            配置文件路径 (默认: src/config/agent-config.yaml)
   --log-level TEXT         日志级别 (DEBUG/INFO/WARNING/ERROR)
   --reload                 启用热重载（开发环境）
   --help                   显示帮助信息

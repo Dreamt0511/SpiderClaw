@@ -113,7 +113,13 @@ class RepairOrchestrator:
             ["fix_agent", "create_pr", "handle_failure"],
         )
 
-        workflow.add_edge("create_pr", END)
+        # PR创建后的条件路由
+        workflow.add_conditional_edges(
+            "create_pr",
+            self._route_after_create_pr,
+            [END, "handle_failure"],
+        )
+
         workflow.add_edge("handle_failure", END)
 
         # 编译图
@@ -905,6 +911,18 @@ class RepairOrchestrator:
         logger.info("测试通过（旧逻辑），准备创建 PR")
         return "create_pr"
 
+    def _route_after_create_pr(self, state: RepairState) -> str:
+        """
+        PR创建后的路由逻辑
+
+        - success → END
+        - failure → handle_failure（发送飞书通知）
+        """
+        if state.get("success") is False:
+            logger.error(f"创建PR失败: {state.get('error_message', '未知错误')}")
+            return "handle_failure"
+        return END
+
     async def _create_pull_request(self, state: RepairState) -> Dict[str, Any]:
         """
         创建PR节点
@@ -1078,8 +1096,7 @@ class RepairOrchestrator:
 | git checkout origin/{event.branch} -- . |
 """)
 
-                import re as _re
-            _fixed_desc = _re.sub(
+            _fixed_desc = re.sub(
                 r'(?<!\n)\n(?=[-*] )', r'\n\n',
                 state['fix_description']
             )

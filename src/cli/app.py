@@ -17,7 +17,7 @@ app = typer.Typer(
     invoke_without_command=True,
 )
 console = Console()
-CONFIG_PATH = Path("config/agent-config.yaml")
+CONFIG_PATH = Path("src/config/agent-config.yaml")
 
 
 def print_banner():
@@ -55,40 +55,16 @@ def print_banner():
     title.append("\n Welcome to ", style=ice)
     title.append("SpiderClaw", style=f"bold {logo_color}")
     title.append(" !  ", style=ice)
-    # 暗金下划线装饰
+    #下划线装饰
     title.append("\n" + "─" * 36, style=warm_gold)
-
-    # 随机语录
-    QUOTES = [
-        "在我机器上能跑啊。",
-        "Git提交，推送，祈祷。",
-        "开发环境没问题啊。",
-        "愿源码与你同在。",
-        "你好, 世界。",
-        "能力越大，SpiderClaw越强。",
-        "这不是bug，是特性。",
-        "重启试试。",
-        "凌晨三点，灵感迸发。",
-        "代码和人，有一个能跑就行。",
-        "这不是我的bug，是依赖问题。",
-        "写代码一时爽，debug火葬场。",
-        "我写的不是bug，是隐藏特性。",
-        "一切皆对象，对象皆null。",
-        "这段代码很脆弱，别看它。",
-        "printf是最好的调试器。",
-        "能跑就别动。",
-    ]
-    quote_text = Text(f"\n  ✦ {random.choice(QUOTES)}", style=muted_gray)
 
     # 启动提示
     tip = Text(
-        f"\n  SpiderClaw 已完成启动。Ctrl+C 退出。\n", style=dim_gray
+        f"  SpiderClaw 已完成启动。按 Ctrl+C 退出。\n", style=dim_gray
     )
 
     console.print(logo)
     console.print(title)
-    time.sleep(0.1)
-    console.print(quote_text)
     console.print()
     console.print(tip)
 
@@ -190,7 +166,7 @@ def _setup_feishu():
             f"App Secret: [#20d5f0]{result['app_secret']}[/#20d5f0]\n\n"
             f"后续配置：\n"
             f"通过在终端中输入 lark-cli auth status 获取当前登录状态，即可获取userOpenId。\n"
-            f"请在 [#20d5f0]config/agent-config.yaml[/#20d5f0] 中添加需要通知的用户/群组ID。\n\n"
+            f"请在 [#20d5f0]src/config/agent-config.yaml[/#20d5f0] 中添加需要通知的用户/群组ID。\n\n"
             f"配置完成后，在SpiderClaw总监控服务启动后，系统将自动发送修复结果通知！",
             border_style="#20d5f0",
         )

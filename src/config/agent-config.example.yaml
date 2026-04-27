@@ -1,5 +1,5 @@
 # SpiderClaw 配置文件示例
-# 复制此文件为 config/agent-config.yaml 并根据实际情况修改
+# 复制此文件为 src/config/agent-config.yaml 并根据实际情况修改
 
 # Webhook服务配置
 webhook:

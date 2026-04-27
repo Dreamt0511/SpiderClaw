@@ -12,7 +12,7 @@ from src.agent.orchestrator import RepairOrchestrator
 from src.bus.schemas import GitHubEvent
 
 # 加载配置
-settings = get_settings(config_path="config/agent-config.yaml")
+settings = get_settings(config_path="src/config/agent-config.yaml")
 
 async def test_bug1_duplicate_events():
     """测试Bug1：同一PR的事件重复处理"""

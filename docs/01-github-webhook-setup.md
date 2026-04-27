@@ -36,10 +36,10 @@ openssl rand -hex 32
 #### 方式一：使用配置文件（推荐）
 ```bash
 # 复制配置模板
-cp config/agent-config.yaml.example config/agent-config.yaml
+cp src/config/agent-config.example.yaml src/config/agent-config.yaml
 
 # 编辑配置文件，填写GitHub Webhook密钥
-vim config/agent-config.yaml
+vim src/config/agent-config.yaml
 ```
 
 #### 方式二：使用环境变量
@@ -56,7 +56,7 @@ python main.py webhook start --secret "your-webhook-secret-here" --port 8000
 ### 5. 启动服务
 ```bash
 # 使用配置文件启动
-python main.py webhook start --config config/agent-config.yaml
+python main.py webhook start --config src/config/agent-config.yaml
 
 # 开发模式（热重载）
 python main.py webhook start --reload --secret "test-secret"

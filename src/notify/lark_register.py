@@ -100,7 +100,7 @@ async def register_lark_app() -> Optional[Dict[str, str]]:
                         f"应用凭据\n"
                         f"App ID: {app_id}\n"
                         f"App Secret: {app_secret}\n\n"
-                        f"请将以上凭据配置到 config/agent-config.yaml 中",
+                        f"请将以上凭据配置到 src/config/agent-config.yaml 中",
                         title="授权成功",
                         border_style="white"
                     ))

@@ -18,7 +18,7 @@ from src.agent.subagents.review_agent import ReviewAgent
 from src.agent.subagents.test_agent import TestAgent
 
 # 从配置文件加载配置
-settings = get_settings(config_path="config/agent-config.yaml")
+settings = get_settings(config_path="src/config/agent-config.yaml")
 OPENAI_API_KEY = settings.openai.api_key
 OPENAI_BASE_URL = settings.openai.base_url
 LLM_MODEL = settings.openai.model_name
@@ -353,7 +353,7 @@ if __name__ == "__main__":
 
 if __name__ == "__main__":
     if not OPENAI_API_KEY:
-        print("请在config/agent-config.yaml中配置openai.api_key")
+        print("请在src/config/agent-config.yaml中配置openai.api_key")
         sys.exit(1)
 
     asyncio.run(test_empty_context())

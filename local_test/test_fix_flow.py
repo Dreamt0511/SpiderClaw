@@ -16,7 +16,7 @@ from src.bus.schemas import GitHubEvent
 from src.agent.tools.langchain_tools import set_tool_context, clone_repository
 
 # 读取配置文件
-config_path = Path(__file__).parent.parent / "config" / "agent-config.yaml"
+config_path = Path(__file__).parent.parent / "src" / "config" / "agent-config.yaml"
 with open(config_path, 'r', encoding='utf-8') as f:
     config = yaml.safe_load(f)
 

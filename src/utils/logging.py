@@ -12,7 +12,7 @@ import json
 
 def setup_logging(
     log_level: str = "INFO",
-    log_dir: str = "logs",
+    log_dir: str = "src/logs",
     service_name: str = "spiderclaw",
     json_format: bool = True,
     retention_days: int = 30

@@ -26,7 +26,7 @@ class WebhookConfig(BaseModel):
 class LoggingConfig(BaseModel):
     """日志配置"""
     level: str = Field(default="INFO", description="日志级别")
-    dir: str = Field(default="logs", description="日志目录")
+    dir: str = Field(default="src/logs", description="日志目录")
     retention_days: int = Field(default=30, description="日志保留天数")
     json_format: bool = Field(default=True, description="是否使用JSON格式输出")
 
@@ -100,13 +100,13 @@ class Settings(BaseSettings):
         从YAML配置文件加载配置
 
         Args:
-            config_path: 配置文件路径，默认查找config/agent-config.yaml
+            config_path: 配置文件路径，默认查找src/config/agent-config.yaml
 
         Returns:
             Settings: 配置实例
         """
         if not config_path:
-            config_path = "config/agent-config.yaml"
+            config_path = "src/config/agent-config.yaml"
 
         config_path = Path(config_path)
         if not config_path.exists():

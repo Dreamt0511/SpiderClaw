@@ -390,8 +390,7 @@ def run_webhook_server(
         f"Webhook端点: [bold #20d5f0]/webhook/github[/bold #20d5f0]\n"
         f"健康检查: [bold #20d5f0]/health[/bold #20d5f0]\n"
         f"允许事件: [bold #20d5f0]{', '.join(settings.webhook.allowed_events)}[/bold #20d5f0]\n"
-        f"自动修复: {repair_status}\n\n"
-        f"[dim]按 Ctrl+C 停止服务[/dim]",
+        f"自动修复: {repair_status}",
         title="[bold #20d5f0]SpiderClaw 运行中[/bold #20d5f0]",
         border_style="#20d5f0",
         padding=(1, 2)

@@ -133,7 +133,7 @@ cython_debug/
 Thumbs.db
 
 # Configuration files (keep examples)
-agent-config.yaml
+src/config/agent-config.yaml
 
 # Logs
 logs/
