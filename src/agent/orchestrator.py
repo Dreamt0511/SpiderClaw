@@ -60,6 +60,7 @@ class RepairOrchestrator:
     ):
         self.github_token = github_token
         self.max_retries = max_retries
+        self.max_change_lines = max_change_lines
 
         # Agent 配置
         agent_config = AgentConfig(
@@ -577,6 +578,7 @@ class RepairOrchestrator:
             },
             original_codes=state["original_codes"],
             error_locations=state["error_locations"],
+            max_change_lines=state.get("max_change_lines", self.max_change_lines),
         )
 
         if validation.passed:

@@ -25,6 +25,7 @@ def validate_fix(
     fix_result: dict,
     original_codes: dict[str, str],
     error_locations: list[ErrorLocation],
+    max_change_lines: int = 50,
 ) -> ValidationResult:
     """
     后置硬校验：检查修复是否符合错误类型的边界约束。
@@ -65,6 +66,10 @@ def validate_fix(
         return result
 
     result = _check_func_scope(fix_result, original_codes, errors)
+    if not result.passed:
+        return result
+
+    result = _check_change_limit(fix_result, original_codes, max_change_lines)
     if not result.passed:
         return result
 
@@ -232,12 +237,60 @@ def _check_syntax_error(
     return ValidationResult(passed=True)
 
 
+def _check_change_limit(
+    fix_result: dict,
+    original_codes: dict[str, str],
+    max_allowed: int = 50,
+) -> ValidationResult:
+    """检查总修改行数是否超过上限，防止过度修复"""
+    for fp, new_code in fix_result.get("code_changes", {}).items():
+        orig = original_codes.get(fp, "")
+        if not orig:
+            continue
+
+        diff = list(difflib.unified_diff(
+            orig.splitlines(keepends=True),
+            new_code.splitlines(keepends=True),
+            n=0,
+        ))
+        added = sum(1 for l in diff if l.startswith("+") and not l.startswith("+++"))
+        removed = sum(1 for l in diff if l.startswith("-") and not l.startswith("---"))
+        total = added + removed
+
+        if total > max_allowed:
+            logger.warning(
+                f"修改行数超限: {fp} 变动 {total} 行（+{added}/-{removed}），"
+                f"超过上限 {max_allowed}"
+            )
+            return ValidationResult(
+                passed=False,
+                violation_type="change_limit_exceeded",
+                details=f"文件 {fp} 变动 {total} 行（+{added}/-{removed}），超过上限 {max_allowed} 行",
+            )
+
+    return ValidationResult(passed=True)
+
+
+def _is_import_line(code_line: str) -> bool:
+    """判断一行是否为 import 语句"""
+    stripped = code_line.strip()
+    return stripped.startswith("import ") or stripped.startswith("from ")
+
+
+def _is_nameerror_only(errors: list[dict]) -> bool:
+    """判断所有错误是否都是 NameError"""
+    return all(e.get("error_type") == "NameError" for e in errors)
+
+
 def _check_func_scope(
     fix_result: dict,
     original_codes: dict[str, str],
     error_locations: list[dict],
 ) -> ValidationResult:
-    """函数级错误：修改必须在出错函数 AST 节点内"""
+    """函数级错误：修改必须在出错函数 AST 节点内
+
+    例外：NameError 允许在模块级添加 import 语句（这是正确修复方式）
+    """
     func_errors = [
         e for e in error_locations
         if e.get("error_type") in (
@@ -248,6 +301,8 @@ def _check_func_scope(
     if not func_errors:
         return ValidationResult(passed=True)
 
+    is_name_err = _is_nameerror_only(func_errors)
+
     for fp, new_code in fix_result.get("code_changes", {}).items():
         orig = original_codes.get(fp, "")
         if not orig:
@@ -255,9 +310,8 @@ def _check_func_scope(
 
         try:
             orig_ast = ast.parse(orig)
-            new_ast = ast.parse(new_code)
         except SyntaxError:
-            continue  # 语法错误交给 _check_syntax_error
+            continue
 
         for e in func_errors:
             if e.get("file_path") != fp or e.get("line_number", 0) <= 0:
@@ -273,6 +327,13 @@ def _check_func_scope(
 
             for changed_lineno in changed_line_nums:
                 if changed_lineno < func_start or changed_lineno > func_end:
+                    # NameError 允许在模块级添加 import 语句
+                    if is_name_err and changed_lineno < func_start:
+                        new_lines = new_code.splitlines()
+                        if 1 <= changed_lineno <= len(new_lines):
+                            changed_line = new_lines[changed_lineno - 1]
+                            if _is_import_line(changed_line):
+                                continue  # 允许：NameError 需要添加 import
                     logger.warning(
                         f"函数范围越界: L{changed_lineno} 不在函数 {func_node.name} "
                         f"范围 ({func_start}-{func_end})"
