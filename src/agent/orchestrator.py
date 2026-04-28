@@ -166,8 +166,9 @@ class RepairOrchestrator:
                 else "?"
             )
         elif rejection_source == "test":
-            instruction_kwargs["n"] = len(state.failed_tests)
-            instruction_kwargs["failed_tests"] = ", ".join(state.failed_tests)
+            ft = rejection_data.get("failed_tests", state.failed_tests or [])
+            instruction_kwargs["n"] = len(ft)
+            instruction_kwargs["failed_tests"] = ", ".join(ft)
 
         instruction = generate_instruction(reason, **instruction_kwargs)
 
@@ -636,6 +637,17 @@ class RepairOrchestrator:
                 repo_path=state["repo_path"],
                 original_codes=state.get("original_codes"),
             )
+
+            # 审查未通过时构建重试上下文，让 Fix Agent 收到强信号
+            if not review_result.get("review_passed", False):
+                retry_context = self._build_retry_context(
+                    state, "review",
+                    rejection_data={
+                        "rejection_reason": review_result.get("rejection_reason", "original_error_unresolved"),
+                    },
+                )
+                review_result.update(retry_context)
+
             return review_result
 
         except Exception as e:
@@ -661,6 +673,16 @@ class RepairOrchestrator:
                 diff_content=state["diff_content"],
                 ci_logs=state.get("ci_logs", ""),
             )
+
+            # 验证失败时构建重试上下文，让 Fix Agent 收到强信号
+            if test_result.get("validation_status") == "failure":
+                retry_context = self._build_retry_context(
+                    state, "test",
+                    rejection_data={
+                        "failed_tests": test_result.get("failed_tests", []),
+                    },
+                )
+                test_result.update(retry_context)
             logger.info(
                 f"验证结果: status={test_result.get('validation_status', 'N/A')}, "
                 f"method={test_result.get('validation_method', 'N/A')}"
