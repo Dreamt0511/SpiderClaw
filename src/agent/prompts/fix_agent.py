@@ -143,12 +143,12 @@ ModuleNotFoundError/ImportError 修复必须遵守以下硬约束，违反则本
 2. 修复后代码必须与原始代码存在实际差异
 3. 最小修改原则：只修复错误，不做其他优化
 4. 审查反馈必须100%采纳
-5. fix_description 必须使用简洁的中文描述修复内容
+5. fix_description 必须使用简洁的中文描述修复内容，每个修复点单独一行（用换行分隔）
 
 ## 输出格式
 ```json
 {{
-    "fix_description": "简要描述修复内容",
+    "fix_description": "1. 修复xxx\n2. 修复xxx\n3. 修复xxx",
     "modified_files": ["文件路径1", "文件路径2"],
     "code_changes": {{
         "文件路径1": "修复后的完整文件内容",
@@ -195,7 +195,7 @@ FIX_AGENT_USER_PROMPT = """
 返回严格的JSON格式，包含所有修复的文件：
 ```json
 {{
-    "fix_description": "简要描述修复内容",
+    "fix_description": "1. 修复xxx\n2. 修复xxx\n3. 修复xxx",
     "modified_files": ["文件路径1"],
     "code_changes": {{
         "文件路径1": "修复后的完整文件内容"
