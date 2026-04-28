@@ -10,6 +10,7 @@ from langchain_openai import ChatOpenAI
 
 from src.agent.prompts.review_agent_prompts import REVIEW_AGENT_SYSTEM_PROMPT, REVIEW_AGENT_USER_PROMPT
 from src.agent.security_rules import SecurityRule, CRITICAL_RULES, HIGH_RULES, MEDIUM_RULES, LOW_RULES
+from src.agent.state import ErrorLocation
 from src.agent.tools import set_tool_context
 
 logger = logging.getLogger(__name__)
@@ -114,10 +115,11 @@ class ReviewAgent:
         kept_risks: Dict[str, list] = {k: [] for k in LEVELS}
         removed_risks: Dict[str, list] = {k: [] for k in LEVELS}
 
-        for level in ["critical", "high", "medium", "low"]:
-            if not original_codes:
-                new_risks[level] = fixed_risks[level]
-            else:
+        if not original_codes:
+            logger.warning("original_codes 为空，所有风险视为新引入")
+            new_risks = {k: v.copy() for k, v in fixed_risks.items()}
+        else:
+            for level in ["critical", "high", "medium", "low"]:
                 def _risk_pattern(r: str) -> str:
                     m = re.search(r'包含敏感操作:\s*(.+)', r)
                     return m.group(1) if m else r
@@ -141,6 +143,23 @@ class ReviewAgent:
         if original_codes:
             contract_warnings = self._detect_contract_changes(code_changes, original_codes)
         new_risks["high"].extend(contract_warnings)
+
+        # 代码退化检测：检查新引入的危险模式（原始代码中没有，修复后新增的）
+        _DEGRADED_PATTERNS = [
+            (r'\beval\s*\(', "eval() 是危险的代码执行函数"),
+            (r'\bexec\s*\(', "exec() 是危险的代码执行函数"),
+            (r'\bos\.system\s*\(', "os.system() 可被命令注入攻击"),
+            (r'return\s+password\b(?!.*hash)', "密码以明文形式返回"),
+            (r'f".*SELECT.*WHERE.*\{', "SQL 查询使用 f-string，存在注入风险"),
+        ]
+        if original_codes:
+            for file_path, new_code in code_changes.items():
+                orig_code = original_codes.get(file_path, "")
+                for pattern, description in _DEGRADED_PATTERNS:
+                    if re.search(pattern, new_code) and not re.search(pattern, orig_code):
+                        new_risks["high"].append(
+                            f"[HIGH] 新引入安全风险 ({file_path}): {description}"
+                        )
 
         if change_lines > self.max_change_lines:
             new_risks["low"].append(
@@ -273,7 +292,7 @@ class ReviewAgent:
 
     async def review_changes(
         self,
-        error_locations: List[Dict],
+        error_locations: List[ErrorLocation],
         fix_description: str,
         modified_files: List[str],
         code_changes: Dict[str, str],
@@ -339,13 +358,13 @@ class ReviewAgent:
             # 格式化错误信息
             error_info = []
             for error in error_locations:
-                if error.get("file_path") and error.get("line_number"):
+                if error.file_path and error.line_number:
                     error_info.append(
-                        f"{error['file_path']}:{error['line_number']} "
-                        f"{error['error_type']}: {error['error_message']}"
+                        f"{error.file_path}:{error.line_number} "
+                        f"{error.error_type}: {error.error_message}"
                     )
                 else:
-                    error_info.append(f"{error['error_type']}: {error['error_message']}")
+                    error_info.append(f"{error.error_type}: {error.error_message}")
             error_info_str = "\n".join(error_info) if error_info else "无明确错误位置"
 
             # original_codes 必须由调用方传入，不存在时直接报错（不再回退到磁盘）

@@ -3,12 +3,13 @@
 from typing import Dict, Any, List
 import json
 import logging
+import re
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 
 from src.agent.state import ErrorLocation, FixAttempt
 from src.agent.prompts.fix_agent import FIX_AGENT_SYSTEM_PROMPT, FIX_AGENT_USER_PROMPT
-from src.agent.tools.langchain_tools import all_tools, set_tool_context
+from src.agent.tools.langchain_tools import all_tools, set_tool_context, search_code, search_files
 
 logger = logging.getLogger(__name__)
 
@@ -185,6 +186,84 @@ class FixAgent:
                 if fp and fp != "<string>" and fp not in target_files:
                     target_files.append(fp)
 
+            # 如果没有 file_path，尝试从错误消息搜索定位
+            if not target_files and error_locations:
+                all_error_msgs = []
+                for err in error_locations:
+                    msg = err.error_message if hasattr(err, 'error_message') else err.get('error_message', '')
+                    etype = err.error_type if hasattr(err, 'error_type') else err.get('error_type', '')
+                    if msg:
+                        all_error_msgs.append(f"{etype}: {msg}")
+
+                combined = ' '.join(all_error_msgs)
+
+                # 策略1: 从错误消息中提取文件路径 File "xxx.py"
+                file_paths_in_msg = re.findall(r'File "([^"]+\.py)"', combined)
+                for p in file_paths_in_msg:
+                    if p != "<string>" and p not in target_files:
+                        target_files.append(p)
+                if target_files:
+                    logger.info(f"从错误消息中提取到文件路径: {target_files}")
+
+                # 策略2: NameError — name 'xxx' is not defined
+                if not target_files:
+                    name_match = re.search(r"name '(\w+)' is not defined", combined)
+                    if name_match:
+                        missing_name = name_match.group(1)
+                        search_result = search_code.invoke({"keyword": missing_name, "file_type": "py"})
+                        if search_result:
+                            target_files = list(set(r["file_path"] for r in search_result))
+                            logger.info(f"通过搜索 '{missing_name}' 定位到文件: {target_files}")
+
+                # 策略3: ImportError — No module named 'xxx'
+                if not target_files:
+                    import_match = re.search(r"No module named '?(\w+)'?", combined)
+                    if import_match:
+                        missing_module = import_match.group(1)
+                        target_files = [f"{missing_module.replace('.', '/')}.py"]
+                        logger.info(f"通过模块名猜测文件: {target_files}")
+
+                # 策略4: 从错误消息中提取带 .py 的文件名
+                if not target_files:
+                    py_files_in_msg = re.findall(r"(\w+\.py)", combined)
+                    for f in py_files_in_msg:
+                        if f not in target_files:
+                            target_files.append(f)
+                    if target_files:
+                        logger.info(f"从错误消息中提取 .py 文件名: {target_files}")
+
+                # 策略5: 提取错误消息中的关键词（函数名、变量名等），搜索代码库
+                if not target_files:
+                    keywords = set()
+                    for msg in all_error_msgs:
+                        parts = re.split(r"['\"]", msg)
+                        for part in parts:
+                            if part.isidentifier() and len(part) > 2 and not part.startswith('_'):
+                                keywords.add(part)
+                    for kw in sorted(keywords, key=len, reverse=True)[:5]:
+                        search_result = search_code.invoke({"keyword": kw, "file_type": "py"})
+                        if search_result:
+                            target_files = list(set(r["file_path"] for r in search_result))
+                            logger.info(f"通过关键词 '{kw}' 定位到文件: {target_files}")
+                            break
+
+                # 策略6: 兜底 — 列出所有 Python 文件
+                if not target_files:
+                    all_py_files = search_files.invoke({"pattern": "**/*.py"})
+                    if all_py_files:
+                        target_files = all_py_files[:10]
+                        logger.warning(f"无法定位错误文件，使用全部 Python 文件: {target_files}")
+                    else:
+                        logger.error("仓库中无 Python 文件")
+                        return {
+                            "fix_description": "仓库中没有找到 Python 文件",
+                            "modified_files": [],
+                            "code_changes": {},
+                            "error": "no_target_file",
+                        }
+
+                logger.info(f"目标文件: {target_files}")
+
             set_tool_context(
                 {"repo_path": self.repo_path, "github_token": self.github_token}
             )
@@ -274,6 +353,8 @@ class FixAgent:
    - 你 **只能** 修复这个文件，绝对不允许修改或返回其他任何文件
    - 在你的JSON响应中，`modified_files`数组 **必须** 只包含["{file_path}"]
    - 在你的JSON响应中，`code_changes`对象的key **必须** 是"{file_path}"
+2. **只修复上报的错误本身**：不要做安全替代（eval→ast.literal_eval 等）、代码优化、重构。
+   只修改与错误直接相关的代码行，其他代码原样保留。
 """
                 else:
                     files_str = "、".join(target_files)
@@ -282,6 +363,8 @@ class FixAgent:
    - 你 **只能** 修复列表中的这些文件，绝对不允许修改或返回其他任何文件
    - 在你的JSON响应中，`modified_files`数组 **必须** 只包含["{files_json}"]
    - 在你的JSON响应中，`code_changes`对象的key **必须** 是上述列表中的文件路径
+2. **只修复上报的错误本身**：不要做安全替代（eval→ast.literal_eval 等）、代码优化、重构。
+   只修改与错误直接相关的代码行，其他代码原样保留。
 """
                 logger.info(f"构建目标文件指令: {force_instruction_content[:300]}...")
             else:
@@ -289,7 +372,6 @@ class FixAgent:
 
             user_input = FIX_AGENT_USER_PROMPT.format(
                 force_instruction_content=force_instruction_content,
-                ci_logs=ci_logs,
                 error_locations=error_locations_json,
                 repo_path=self.repo_path,
                 root_cause_section=root_cause_section,
@@ -304,7 +386,7 @@ class FixAgent:
 
             logger.info(f"用户提示词构建完成，长度: {len(user_input)}")
 
-            config = {"recursion_limit": 10}
+            config = {"recursion_limit": 50}
             result = await self.agent.ainvoke({"input": user_input}, config=config)
             logger.info("Agent调用完成")
 
@@ -347,7 +429,7 @@ class FixAgent:
                     raise ValueError(f"修复结果缺少必要字段: {field}")
 
             def normalize_path(path):
-                return path.replace("\\", "/").lstrip("./")
+                return path.replace("\\", "/").removeprefix("./")
 
             fix_result["modified_files"] = [
                 normalize_path(f) for f in fix_result["modified_files"]
@@ -360,11 +442,11 @@ class FixAgent:
 
             # 修复结果验证
             if target_files:
-                expected_files = [f.lstrip("./").replace("\\", "/") for f in target_files]
+                expected_files = [f.removeprefix("./").replace("\\", "/") for f in target_files]
                 expected_files = list(set(expected_files))
 
                 returned_files = [
-                    f.lstrip("./").replace("\\", "/")
+                    f.removeprefix("./").replace("\\", "/")
                     for f in fix_result.get("code_changes", {}).keys()
                 ]
                 invalid_files = [

@@ -4,10 +4,11 @@ INSTRUCTION_TEMPLATES = {
     # === Gate 拒绝（validation_gate.py） ===
 
     "import_line_violation": (
-        "🚨 强制性指令：本次你【只能】修改 import / from ... import 语句。"
-        "绝对不允许修改任何函数体、类定义、变量赋值、注释或其他代码。"
-        "如果该模块未在代码中使用，直接删除该 import 行。"
-        "如果该模块确实需要但未安装，将 is_env_error 标记为 true。"
+        "🚨 强制性指令：本次你【只能】修改 import / from ... import 语句。\n"
+        "上一轮违规内容：{details}\n"
+        "绝对不允许修改任何函数体、类定义、变量赋值、注释或其他代码。\n"
+        "如果该模块未在代码中使用，直接删除该 import 行。\n"
+        "如果该模块确实需要但未安装，将 is_env_error 标记为 true。\n"
         "再次越界则修复直接失败。"
     ),
 

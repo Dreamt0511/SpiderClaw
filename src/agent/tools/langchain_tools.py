@@ -114,6 +114,8 @@ def search_files(pattern: str, file_type: Optional[str] = None) -> List[str]:
     """
     搜索仓库中匹配的文件。
 
+    支持隐藏目录（如 .github/），解决 glob.glob 默认跳过 dot 目录的问题。
+
     Args:
         pattern: 搜索模式，支持glob语法，例如"*.py"、"src/**/*.ts"
         file_type: 可选，文件类型过滤，例如"py"、"js"
@@ -121,23 +123,39 @@ def search_files(pattern: str, file_type: Optional[str] = None) -> List[str]:
     Returns:
         List[str]: 匹配的文件路径列表（相对于仓库根目录）
     """
-    import glob
+    import glob as glob_module
 
     repo_path = get_tool_context().get("repo_path", "")
     if not repo_path:
         return []
 
-    if file_type:
-        pattern = f"**/*.{file_type}"
+    ext = f".{file_type}" if file_type else None
 
-    search_pattern = os.path.join(repo_path, pattern)
-    matching_files = glob.glob(search_pattern, recursive=True)
+    matching_files = []
+    for root, dirs, files in os.walk(repo_path):
+        # 跳过 .git 目录
+        if ".git" in root.split(os.sep):
+            continue
+        for f in files:
+            if ext and not f.endswith(ext):
+                continue
+            full_path = os.path.join(root, f)
+            if ext:
+                matching_files.append(full_path)
+            else:
+                # fnmatch 不支持 **/ 通配符，转换为普通通配符
+                match_pattern = pattern
+                if match_pattern.startswith("**/"):
+                    match_pattern = match_pattern[3:]
+                if glob_module.fnmatch.fnmatch(
+                    os.path.relpath(full_path, repo_path), match_pattern
+                ):
+                    matching_files.append(full_path)
 
-    # 转换为相对路径
+    # 转换为相对路径，统一使用 / 分隔符
     relative_paths = [
-        os.path.relpath(file_path, repo_path)
+        os.path.relpath(file_path, repo_path).replace("\\", "/")
         for file_path in matching_files
-        if os.path.isfile(file_path)
     ]
 
     return relative_paths
@@ -407,382 +425,402 @@ def download_ci_logs(logs_url: str) -> str:
         return f"Error: 下载CI日志失败: {str(e)}"
 
 
+def _is_system_path(file_path: str) -> bool:
+    """判断文件路径是否为 Python 标准库或系统路径，而非项目文件。"""
+    if not file_path:
+        return False
+
+    # 已知的项目工作目录前缀（CI 环境下）
+    PROJECT_PREFIXES = ("/github/workspace/", "./", "/home/runner/work/")
+    # 系统/Python 安装路径特征
+    SYSTEM_INDICATORS = ("/lib/python", "\\lib\\python", "/site-packages/", "\\site-packages\\")
+
+    lower = file_path.lower()
+
+    # 绝对路径且不在项目前缀中 → 系统文件
+    if file_path.startswith("/"):
+        if any(file_path.startswith(p) for p in PROJECT_PREFIXES):
+            return False
+        # 包含 Python 标准库路径特征
+        if any(indicator in lower for indicator in SYSTEM_INDICATORS):
+            return True
+        return True  # 其他绝对路径均视为系统路径
+
+    return False
+
+
 @tool
 def parse_python_errors(log_content: str) -> List[Dict]:
     """
-    解析Python Traceback错误信息。
+    解析Python Traceback错误信息，适配 SpiderClaw CI 多阶段多文件检查格式。
+
+    支持:
+    - 标准 Python Traceback / SyntaxError / 简单错误行
+    - CI ::group::检查: <file> 文件组格式（运行时检查阶段）
+    - CI 路径前缀（/github/workspace/ 等）自动剥离
+    - 多文件同名错误独立捕获（不因去重丢失跨文件错误）
 
     Args:
         log_content: CI日志内容
 
     Returns:
-        List[Dict]: 错误列表，每个元素包含file_path、line_number、error_type、error_message、traceback等字段
+        List[Dict]: 错误列表
     """
-    errors = []
-
-    # 预处理：移除每行开头的时间戳前缀（如 2026-04-24T16:24:21.8873818Z ）
     import re
+
+    # ===================== 1. 预处理 =====================
     timestamp_pattern = r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s+'
     original_lines = log_content.split('\n')
     processed_lines = []
     for line in original_lines:
-        # 移除时间戳前缀
         processed_line = re.sub(timestamp_pattern, '', line)
         processed_lines.append(processed_line)
     processed_content = '\n'.join(processed_lines)
 
-    # 匹配Traceback块
-    traceback_pattern = re.compile(
-        r'Traceback \(most recent call last\):\n'
-        r'(?:  File "([^"]+)", line (\d+)[^\n]*\n.*?\n)+?'
-        r'([^\n:]+): (.*?)\n',
-        re.DOTALL | re.MULTILINE
-    )
+    # ANSI 码清理
+    processed_content = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', processed_content)
 
-    # 匹配没有Traceback头部的语法错误（如IndentationError、SyntaxError等）
-    syntax_error_pattern = re.compile(
-        r'^File "([^"]+)", line (\d+)[^\n]*\n'
-        r'(?:.*?\n)*?'
-        r'([A-Z][a-zA-Z0-9]*Error): (.*?)$',
-        re.MULTILINE
-    )
+    # ===================== 2. CI 路径标准化 =====================
+    def _normalize_ci_path(fp: str) -> str:
+        """将 CI 环境绝对路径转换为相对路径
 
-    # 匹配简单错误行，支持多种前缀格式
-    simple_error_pattern = re.compile(
-        r'^(?:E\s+|ERROR:\s+|\[ERROR\]\s+|ERROR\s+\|\s+)?([A-Z][a-zA-Z0-9]*Error):?\s*(.*)$',
-        re.MULTILINE
-    )
+        处理的 CI 路径格式:
+        - /github/workspace/src/file.py        → src/file.py
+        - /home/runner/work/repo/repo/./f.py   → f.py
+        - /home/runner/work/repo/./f.py         → f.py
+        """
+        for prefix in ["/github/workspace/", "/home/runner/work/"]:
+            if fp.startswith(prefix):
+                stripped = fp[len(prefix):]
+                # 处理 /home/runner/work/{repo}/{repo}/./path 格式
+                # 找到 /./ 标记，取其后的部分即相对于仓库根目录的路径
+                dot_slash = stripped.find('/./')
+                if dot_slash != -1:
+                    stripped = stripped[dot_slash + 3:]  # 跳过 "/./"
+                # 去除开头的 ./
+                if stripped.startswith('./'):
+                    stripped = stripped[2:]
+                return stripped
+        # 处理 <string> 和纯相对路径
+        if fp.startswith('./'):
+            return fp[2:]
+        return fp
 
-    # 匹配pytest失败总结行
-    pytest_failure_pattern = re.compile(
-        r'^FAILED\s+.*?::.*?\s+-\s+([A-Z][a-zA-Z0-9]*Error):?\s*(.*)$',
-        re.MULTILINE
-    )
+    # ===================== 3. 核心模式匹配 =====================
+    def _match_patterns(content: str, ci_stage: str = "") -> List[Dict]:
+        """对给定内容运行所有错误匹配模式，返回错误列表"""
+        local_errors: List[Dict] = []
 
-    # 匹配pytest失败详情格式（短测试摘要之后的详细traceback段）
-    pytest_detail_pattern = re.compile(
-        r'_{10,}\s+FAILED.*?_{10,}\n.*?([A-Z][a-zA-Z0-9]*Error): (.*?)\n',
-        re.DOTALL
-    )
+        # ----- 3a. 编译正则 -----
 
-    # 匹配Flask错误页面片段（如 ValueError: ... / werkzeug.exceptions...）
-    flask_error_pattern = re.compile(
-        r'(?:werkzeug\.|flask\.).*?([A-Z][a-zA-Z0-9]*(?:Error|Exception)): (.*?)$',
-        re.MULTILINE
-    )
+        # 标准 Traceback
+        traceback_pattern = re.compile(
+            r'Traceback \(most recent call last\):\n'
+            r'(?:  File "([^"]+)", line (\d+)[^\n]*\n.*?\n)+?'
+            r'([^\n:]+): (.*?)\n',
+            re.DOTALL | re.MULTILINE,
+        )
 
-    # 匹配Django错误页面片段
-    django_error_pattern = re.compile(
-        r'(?:django\.core\.|django\.db\.).*?([A-Z][a-zA-Z0-9]*(?:Error|Exception)): (.*?)$',
-        re.MULTILINE
-    )
+        # 语法错误（无 Traceback 头部）
+        syntax_error_pattern = re.compile(
+            r'^File "([^"]+)", line (\d+)[^\n]*\n'
+            r'(?:.*?\n)*?'
+            r'([A-Z][a-zA-Z0-9]*Error): (.*?)$',
+            re.MULTILINE,
+        )
 
-    # 匹配ERROR: 开头的非标准错误行
-    error_prefix_pattern = re.compile(
-        r'^ERROR:\s*(.*)$',
-        re.MULTILINE
-    )
+        # 简单错误行（支持 E / ERROR: 前缀）
+        simple_error_pattern = re.compile(
+            r'^(?:E\s+|ERROR:\s+|\[ERROR\]\s+|ERROR\s+\|\s+)?'
+            r'([A-Z][a-zA-Z0-9]*Error):?\s*(.*)$',
+            re.MULTILINE,
+        )
 
-    # 匹配裸 Error: 后跟描述的格式（非标准但常见）
-    bare_error_pattern = re.compile(
-        r'^Error:\s*(.*?)$',
-        re.MULTILINE
-    )
+        # pytest 失败总结行
+        pytest_failure_pattern = re.compile(
+            r'^FAILED\s+.*?::.*?\s+-\s+([A-Z][a-zA-Z0-9]*Error):?\s*(.*)$',
+            re.MULTILINE,
+        )
 
-    # 匹配 "ERROR: ..." 格式（CI 常见）
-    error_generic = re.compile(
-        r'^ERROR:\s*(.*?)(?:\s*$)',
-        re.MULTILINE
-    )
+        # pytest 失败详情段
+        pytest_detail_pattern = re.compile(
+            r'_{10,}\s+FAILED.*?_{10,}\n.*?([A-Z][a-zA-Z0-9]*Error): (.*?)\n',
+            re.DOTALL,
+        )
 
-    # 匹配 pytest 失败详情
-    pytest_detail = re.compile(
-        r'E\s+([A-Z][a-zA-Z0-9]*Error):\s*(.*?)$',
-        re.MULTILINE
-    )
+        # Flask 框架错误
+        flask_error_pattern = re.compile(
+            r'(?:werkzeug\.|flask\.).*?'
+            r'([A-Z][a-zA-Z0-9]*(?:Error|Exception)): (.*?)$',
+            re.MULTILINE,
+        )
 
-    # 匹配 traceback 的简写形式
-    traceback_short = re.compile(
-        r'([A-Z][a-zA-Z0-9]*Error):\s*(.*?)\n\s*at\s+(\S+)',
-        re.MULTILINE
-    )
+        # Django 框架错误
+        django_error_pattern = re.compile(
+            r'(?:django\.core\.|django\.db\.).*?'
+            r'([A-Z][a-zA-Z0-9]*(?:Error|Exception)): (.*?)$',
+            re.MULTILINE,
+        )
 
-    # 提取所有Traceback
-    for match in traceback_pattern.finditer(processed_content):
-        full_traceback = match.group(0)
-        error_type = match.group(3)
-        error_message = match.group(4)
+        # ERROR: 前缀行
+        error_prefix_pattern = re.compile(r'^ERROR:\s*(.*)$', re.MULTILINE)
 
-        # 提取最准确的错误位置（Traceback的最后一个文件）
-        last_file_match = re.findall(r'File "([^"]+)", line (\d+)', full_traceback)[-1]
-        file_path, line_number = last_file_match[0], int(last_file_match[1])
+        # 裸 Error: 前缀行
+        bare_error_pattern = re.compile(r'^Error:\s*(.*?)$', re.MULTILINE)
 
-        # 过滤系统路径，只保留用户项目文件
-        is_system_file = (
-            file_path.startswith("/")
-            and not file_path.startswith("/github/workspace/")
-            and not file_path.startswith("./")
-            and not os.path.isabs(file_path) is False
-        ) or "python" in file_path.lower() and "lib" in file_path.lower()
+        # ----- 3b. Traceback 匹配 -----
+        for match in traceback_pattern.finditer(content):
+            full_tb = match.group(0)
+            error_type = match.group(3)
+            error_message = match.group(4)
 
-        if not is_system_file:
-            errors.append({
-                "type": "traceback",
-                "file_path": file_path,
-                "line_number": line_number,
-                "error_type": error_type,
-                "error_message": error_message,
-                "traceback": full_traceback
-            })
+            last_file = re.findall(r'File "([^"]+)", line (\d+)', full_tb)[-1]
+            file_path = _normalize_ci_path(last_file[0])
+            line_number = int(last_file[1])
 
-    # 提取没有Traceback头部的语法错误
-    for match in syntax_error_pattern.finditer(processed_content):
-        full_traceback = match.group(0)
-        file_path = match.group(1)
-        line_number = int(match.group(2))
-        error_type = match.group(3)
-        error_message = match.group(4)
+            if not _is_system_path(file_path):
+                local_errors.append({
+                    "type": "traceback",
+                    "file_path": file_path,
+                    "line_number": line_number,
+                    "error_type": error_type,
+                    "error_message": error_message,
+                    "traceback": full_tb,
+                    "ci_stage": ci_stage,
+                })
 
-        # 避免重复添加
-        error_key = (file_path, line_number, error_type, error_message)
-        existing_keys = {(e["file_path"], e["line_number"], e["error_type"], e["error_message"]) for e in errors}
-        if error_key not in existing_keys:
-            # 过滤系统路径，只保留用户项目文件
-            is_system_file = (
-                file_path.startswith("/")
-                and not file_path.startswith("/github/workspace/")
-                and not file_path.startswith("./")
-                and not os.path.isabs(file_path) is False
-            ) or "python" in file_path.lower() and "lib" in file_path.lower()
+        # ----- 3c. 语法错误匹配（去重键包含 file_path） -----
+        existing_keys = {
+            (e["file_path"], e["line_number"], e["error_type"], e["error_message"])
+            for e in local_errors
+        }
+        for match in syntax_error_pattern.finditer(content):
+            full_tb = match.group(0)
+            file_path = _normalize_ci_path(match.group(1))
+            line_number = int(match.group(2))
+            error_type = match.group(3)
+            error_message = match.group(4)
 
-            if not is_system_file:
-                errors.append({
+            key = (file_path, line_number, error_type, error_message)
+            if key not in existing_keys and not _is_system_path(file_path):
+                existing_keys.add(key)
+                local_errors.append({
                     "type": "syntax_error",
                     "file_path": file_path,
                     "line_number": line_number,
                     "error_type": error_type,
                     "error_message": error_message,
-                    "traceback": full_traceback
+                    "traceback": full_tb,
+                    "ci_stage": ci_stage,
                 })
 
-    # 提取简单错误（避免重复）
-    existing_errors = {(e["error_type"], e["error_message"]) for e in errors}
-    for match in simple_error_pattern.finditer(processed_content):
-        error_type = match.group(1)
-        error_message = match.group(2)
-        file_path = ""
-        line_number = 0
+        # ----- 3d. 简单错误行匹配（去重键改为 file_path+error_type+line_number） -----
+        existing_err_set = {
+            (e.get("file_path", ""), e["error_type"], e.get("line_number", 0))
+            for e in local_errors
+        }
 
-        # 专门处理语法错误（SyntaxError、IndentationError、TabError等）：尝试从上下文中提取文件路径
-        if error_type in ["SyntaxError", "IndentationError", "TabError"]:
-            # 获取当前匹配行的位置
-            match_pos = processed_content.find(match.group(0))
-            if match_pos != -1:
-                # 向前查找1000个字符，寻找文件路径模式
-                context_start = max(0, match_pos - 1000)
-                context = processed_content[context_start:match_pos]
-                # 匹配 File "xxx.py", line xx 模式
-                file_match = re.search(r'File "([^"]+\.py)", line (\d+)', context)
-                if file_match and file_match.group(1) != "<string>":
-                    file_path = file_match.group(1)
-                    line_number = int(file_match.group(2))
-                # 匹配CI日志中的语法错误标记行：❌ 语法错误: xxx.py
-                else:
-                    ci_syntax_match = re.search(r'语法错误:\s*([a-zA-Z0-9_\-/\\.]+\.py)', context)
-                    if ci_syntax_match:
-                        file_path = ci_syntax_match.group(1)
-                        # 尝试从错误信息中提取行号
-                        line_match = re.search(r'line (\d+)', match.group(0))
-                        if line_match:
-                            line_number = int(line_match.group(1))
-                # 匹配直接的文件名行，如 "File "/path/to/file.py""
-                if not file_path:
-                    simple_file_match = re.search(r'^.*?([a-zA-Z0-9_\-/\\]+\.py)', context, re.MULTILINE)
-                    if simple_file_match:
-                        file_path = simple_file_match.group(1)
+        def _ek(fp, et, ln):
+            return (fp or "", et or "", ln or 0)
 
-        if (error_type, error_message) not in existing_errors:
-            existing_errors.add((error_type, error_message))
-            # 过滤系统路径，只保留用户项目文件
-            is_system_file = (
-                file_path.startswith("/")
-                and not file_path.startswith("/github/workspace/")
-                and not file_path.startswith("./")
-                and not os.path.isabs(file_path) is False
-            ) or "python" in file_path.lower() and "lib" in file_path.lower()
+        for match in simple_error_pattern.finditer(content):
+            error_type = match.group(1)
+            error_message = match.group(2)
+            file_path = ""
+            line_number = 0
 
-            if not is_system_file:
-                errors.append({
+            # 向前查找最近的 File 行（取最后一个，最接近匹配位置）
+            match_pos = match.start()
+            context = content[max(0, match_pos - 1000):match_pos]
+            fms = re.findall(r'File "([^"]+\.py)", line (\d+)', context)
+            if fms and fms[-1][0] != "<string>":
+                file_path = _normalize_ci_path(fms[-1][0])
+                line_number = int(fms[-1][1])
+
+            key = _ek(file_path, error_type, line_number)
+            if key not in existing_err_set:
+                existing_err_set.add(key)
+                if not _is_system_path(file_path):
+                    local_errors.append({
+                        "type": "simple",
+                        "file_path": file_path,
+                        "line_number": line_number,
+                        "error_type": error_type,
+                        "error_message": error_message,
+                        "traceback": f"{error_type}: {error_message}",
+                        "ci_stage": ci_stage,
+                    })
+
+        # ----- 3e. pytest 失败总结行 -----
+        for match in pytest_failure_pattern.finditer(content):
+            et = match.group(1)
+            em = match.group(2)
+            key = _ek("", et, 0)
+            if key not in existing_err_set:
+                existing_err_set.add(key)
+                local_errors.append({
+                    "type": "pytest",
+                    "file_path": "",
+                    "line_number": 0,
+                    "error_type": et,
+                    "error_message": em,
+                    "traceback": f"{et}: {em}",
+                    "ci_stage": ci_stage or "test",
+                })
+
+        # ----- 3f. ERROR: 前缀行 -----
+        for match in error_prefix_pattern.finditer(content):
+            em = match.group(1).strip()
+            et = "UnknownError"
+            etm = re.match(r'([A-Z][a-zA-Z0-9]*Error):', em)
+            if etm:
+                et = etm.group(1)
+                em = em[len(et) + 1:].strip()
+            key = _ek("", et, 0)
+            if key not in existing_err_set:
+                existing_err_set.add(key)
+                local_errors.append({
                     "type": "simple",
-                    "file_path": file_path,
-                    "line_number": line_number,
-                    "error_type": error_type,
-                    "error_message": error_message,
-                    "traceback": f"{error_type}: {error_message}"
+                    "file_path": "",
+                    "line_number": 0,
+                    "error_type": et,
+                    "error_message": em,
+                    "traceback": f"{et}: {em}",
+                    "ci_stage": ci_stage,
                 })
 
-    # 提取pytest失败总结行
-    for match in pytest_failure_pattern.finditer(processed_content):
-        error_type = match.group(1)
-        error_message = match.group(2)
+        # ----- 3g. pytest 失败详情段 -----
+        for match in pytest_detail_pattern.finditer(content):
+            et = match.group(1)
+            em = match.group(2).strip()
+            context = content[max(0, match.start() - 500):match.start()]
+            fp = ""
+            ln = 0
+            fms = re.findall(r'File "([^"]+\.py)", line (\d+)', context)
+            if fms and fms[-1][0] != "<string>":
+                fp = _normalize_ci_path(fms[-1][0])
+                ln = int(fms[-1][1])
+            key = _ek(fp, et, ln)
+            if key not in existing_err_set and not _is_system_path(fp):
+                existing_err_set.add(key)
+                local_errors.append({
+                    "type": "pytest_detail",
+                    "file_path": fp,
+                    "line_number": ln,
+                    "error_type": et,
+                    "error_message": em,
+                    "traceback": f"{et}: {em}",
+                    "ci_stage": ci_stage or "test",
+                })
 
-        if (error_type, error_message) not in existing_errors:
-            existing_errors.add((error_type, error_message))
-            errors.append({
-                "type": "pytest",
-                "file_path": "",
-                "line_number": 0,
-                "error_type": error_type,
-                "error_message": error_message,
-                "traceback": f"{error_type}: {error_message}"
-            })
+        # ----- 3h. Flask / Django 框架错误 -----
+        for pattern, stage in [(flask_error_pattern, ci_stage),
+                                (django_error_pattern, ci_stage)]:
+            for match in pattern.finditer(content):
+                et = match.group(1)
+                em = match.group(2).strip()
+                key = _ek("", et, 0)
+                if key not in existing_err_set:
+                    existing_err_set.add(key)
+                    local_errors.append({
+                        "type": "framework",
+                        "file_path": "",
+                        "line_number": 0,
+                        "error_type": et,
+                        "error_message": em,
+                        "traceback": f"{et}: {em}",
+                        "ci_stage": stage,
+                    })
 
-    # 提取ERROR: 开头的错误行
-    for match in error_prefix_pattern.finditer(processed_content):
-        error_message = match.group(1).strip()
-        error_type = "UnknownError"
+        # ----- 3i. 裸 Error: 前缀行 -----
+        for match in bare_error_pattern.finditer(content):
+            em = match.group(1).strip()
+            if not em:
+                continue
+            et = "UnknownError"
+            etm = re.match(
+                r'([A-Z][a-zA-Z0-9]*(?:Error|Exception|Warning)):?\s*', em
+            )
+            if etm:
+                et = etm.group(1)
+                em = em[etm.end():].strip()
+            key = _ek("", et, 0)
+            if key not in existing_err_set:
+                existing_err_set.add(key)
+                local_errors.append({
+                    "type": "bare_error",
+                    "file_path": "",
+                    "line_number": 0,
+                    "error_type": et,
+                    "error_message": em,
+                    "traceback": f"{et}: {em}",
+                    "ci_stage": ci_stage,
+                })
 
-        # 尝试从错误信息中提取具体的错误类型
-        import re
-        error_type_match = re.match(r'([A-Z][a-zA-Z0-9]*Error):', error_message)
-        if error_type_match:
-            error_type = error_type_match.group(1)
-            # 移除错误类型前缀
-            error_message = error_message[len(error_type) + 1:].strip()
+        return local_errors
 
-        if (error_type, error_message) not in existing_errors:
-            existing_errors.add((error_type, error_message))
-            errors.append({
-                "type": "simple",
-                "file_path": "",
-                "line_number": 0,
-                "error_type": error_type,
-                "error_message": error_message,
-                "traceback": f"{error_type}: {error_message}"
-            })
+    # ===================== 4. CI 文件组解析 =====================
+    # 新的 CI 配置在"运行时检查"阶段为每个文件生成 ::group:: 块。
+    # 每个文件组独立处理，确保跨文件的同名错误不会被去重丢失。
+    all_errors: List[Dict] = []
 
-    # 提取pytest失败详情（短测试摘要后的详细traceback段）
-    for match in pytest_detail_pattern.finditer(processed_content):
-        error_type = match.group(1)
-        error_message = match.group(2).strip()
+    if '::group::检查:' in processed_content:
+        # 按 ::group::检查: 分割：parts[0] 为组前内容（语法检查+测试），
+        # parts[1:] 格式："<file>\n<content>...::endgroup::..."
+        parts = re.split(r'::group::检查:\s*', processed_content)
 
-        # 从匹配上下文中提取文件路径
-        context_start = max(0, match.start() - 500)
-        context = processed_content[context_start:match.start()]
-        file_path = ""
-        line_number = 0
-        file_match = re.search(r'File "([^"]+\.py)", line (\d+)', context)
-        if file_match and file_match.group(1) != "<string>":
-            file_path = file_match.group(1)
-            line_number = int(file_match.group(2))
+        # 组前内容（语法检查阶段、测试阶段输出）
+        if parts[0].strip():
+            all_errors.extend(_match_patterns(parts[0], ci_stage="syntax"))
 
-        if (error_type, error_message) not in existing_errors:
-            existing_errors.add((error_type, error_message))
-            errors.append({
-                "type": "pytest_detail",
-                "file_path": file_path,
-                "line_number": line_number,
-                "error_type": error_type,
-                "error_message": error_message,
-                "traceback": f"{error_type}: {error_message}"
-            })
+        # 每个文件组独立解析
+        for part in parts[1:]:
+            first_nl = part.find('\n')
+            if first_nl == -1:
+                continue
+            file_path = part[:first_nl].strip()
+            group_content = part[first_nl + 1:]
+            # 移除 ::endgroup:: 行
+            group_content = re.sub(
+                r'::endgroup::.*(\n|$)', '', group_content
+            ).strip()
 
-    # 提取Flask框架错误
-    for match in flask_error_pattern.finditer(processed_content):
-        error_type = match.group(1)
-        error_message = match.group(2).strip()
-        if (error_type, error_message) not in existing_errors:
-            existing_errors.add((error_type, error_message))
-            errors.append({
-                "type": "framework",
-                "file_path": "",
-                "line_number": 0,
-                "error_type": error_type,
-                "error_message": error_message,
-                "traceback": f"{error_type}: {error_message}"
-            })
+            file_errors = _match_patterns(group_content, ci_stage="runtime")
+            for e in file_errors:
+                if not e.get("file_path") and file_path:
+                    e["file_path"] = file_path
+                # 文件组内的错误如果没有 ci_stage，标记为 runtime
+                if not e.get("ci_stage"):
+                    e["ci_stage"] = "runtime"
+            all_errors.extend(file_errors)
+    else:
+        # 无文件组标记，整体处理（兼容旧格式）
+        all_errors = _match_patterns(processed_content)
 
-    # 提取Django框架错误
-    for match in django_error_pattern.finditer(processed_content):
-        error_type = match.group(1)
-        error_message = match.group(2).strip()
-        if (error_type, error_message) not in existing_errors:
-            existing_errors.add((error_type, error_message))
-            errors.append({
-                "type": "framework",
-                "file_path": "",
-                "line_number": 0,
-                "error_type": error_type,
-                "error_message": error_message,
-                "traceback": f"{error_type}: {error_message}"
-            })
-
-    # 提取裸 Error: 后跟描述的格式
-    for match in bare_error_pattern.finditer(processed_content):
-        error_message = match.group(1).strip()
-        if not error_message:
-            continue
-
-        error_type = "UnknownError"
-        # 尝试提取具体的错误类型
-        error_type_match = re.match(r'([A-Z][a-zA-Z0-9]*(?:Error|Exception|Warning)):?\s*', error_message)
-        if error_type_match:
-            error_type = error_type_match.group(1)
-            error_message = error_message[error_type_match.end():].strip()
-
-        # 提取变量名或缺失模块名等关键线索
-        key_clue = ""
-        # NameError线索: name 'xxx' is not defined
-        name_match = re.search(r"name '(\w+)'", error_message)
-        if name_match:
-            key_clue = f" (变量: {name_match.group(1)})"
-        # ImportError线索: No module named 'xxx'
-        module_match = re.search(r"No module named '?(\w+)'?", error_message)
-        if module_match:
-            key_clue = f" (缺失模块: {module_match.group(1)})"
-
-        if (error_type, error_message) not in existing_errors:
-            existing_errors.add((error_type, error_message))
-            errors.append({
-                "type": "bare_error",
-                "file_path": "",
-                "line_number": 0,
-                "error_type": error_type,
-                "error_message": error_message + key_clue,
-                "traceback": f"{error_type}: {error_message}"
-            })
-
-    # 兜底解析：如果没有找到任何错误，扫描包含错误关键词的行
-    if not errors:
-        # 错误关键词
+    # ===================== 5. 兜底解析 =====================
+    if not all_errors:
         error_keywords = ["Error", "ERROR", "FAILED", "Traceback"]
-        added_contexts = set()  # 避免重复添加相同的上下文
-
+        added_contexts = set()
         for i, line in enumerate(processed_lines):
-            # 检查是否包含错误关键词
-            if any(keyword in line for keyword in error_keywords):
-                # 获取前后各3行，注意边界
+            if any(kw in line for kw in error_keywords):
                 start = max(0, i - 3)
-                end = min(len(processed_lines), i + 4)  # +4因为切片是左闭右开
-                context_lines = processed_lines[start:end]
-                context_str = '\n'.join(context_lines)
-
-                # 避免重复添加相同的上下文
-                if context_str not in added_contexts:
-                    added_contexts.add(context_str)
-                    # 提取错误信息（取当前行作为错误信息）
-                    error_message = line.strip()
-                    errors.append({
+                end = min(len(processed_lines), i + 4)
+                ctx = '\n'.join(processed_lines[start:end])
+                if ctx not in added_contexts:
+                    added_contexts.add(ctx)
+                    all_errors.append({
                         "type": "unknown",
                         "file_path": "",
                         "line_number": 0,
                         "error_type": "UnknownError",
-                        "error_message": error_message,
-                        "traceback": context_str
+                        "error_message": line.strip(),
+                        "traceback": ctx,
+                        "ci_stage": "",
                     })
 
-    # --- 错误链检测与合并（ModuleNotFoundError → ImportError 等）---
-    # 当一个文件有多个错误且存在因果关系时，合并为根因+后果结构
+    errors = all_errors
+
+    # ===================== 6. 错误链检测与合并 =====================
     merged_errors = []
     skip_indices: set = set()
 
@@ -794,9 +832,7 @@ def parse_python_errors(log_content: str) -> List[Dict]:
         error_type = err.get("error_type", "")
         error_msg = err.get("error_message", "")
 
-        # 检测当前错误是否是 ImportError（可能由 ModuleNotFoundError 引起）
         if error_type == "ImportError":
-            # 当 file_path 为空时，尝试从错误消息中提取文件名
             imp_file = file_path
             if not imp_file:
                 m = re.search(r"'([^']+\.py)'", error_msg)
@@ -807,53 +843,63 @@ def parse_python_errors(log_content: str) -> List[Dict]:
                 if m:
                     imp_file = m.group(1)
 
-            # 在同文件（或同逻辑块）中查找 ModuleNotFoundError（根因）
             for j, err2 in enumerate(errors):
                 if j in skip_indices or j == i:
                     continue
-
-                err2_type = err2.get("error_type", "")
-                if err2_type != "ModuleNotFoundError":
+                if err2.get("error_type") != "ModuleNotFoundError":
                     continue
 
-                err2_path = err2.get("file_path", "")
-                err2_msg = err2.get("error_message", "")
-
-                # 从 err2（ModuleNotFoundError）的消息中提取文件名
-                err2_file = err2_path
-                if not err2_file:
-                    m = re.search(r"'([^']+\.py)'", err2_msg)
+                e2_fp = err2.get("file_path", "")
+                e2_msg = err2.get("error_message", "")
+                e2_file = e2_fp
+                if not e2_file:
+                    m = re.search(r"'([^']+\.py)'", e2_msg)
                     if m:
-                        err2_file = m.group(1)
+                        e2_file = m.group(1)
 
-                # 匹配条件：同一文件路径 or 从消息中提取的文件名匹配 or 相邻错误
                 paths_match = (
-                    file_path and err2_path and file_path == err2_path
-                ) or (
-                    imp_file and err2_file and imp_file == err2_file
-                ) or (
-                    imp_file and err2_path and imp_file == err2_path
-                ) or (
-                    err2_file and file_path and err2_file == file_path
+                    (file_path and e2_fp and file_path == e2_fp)
+                    or (imp_file and e2_file and imp_file == e2_file)
+                    or (imp_file and e2_fp and imp_file == e2_fp)
+                    or (e2_file and file_path and e2_file == file_path)
                 )
-                # 都没有文件信息但相邻（来自同一 CI 错误块）
                 adjacent = abs(i - j) == 1
 
-                if paths_match or (not file_path and not err2_path and adjacent):
+                if paths_match or (not file_path and not e2_fp and adjacent):
                     err2["is_root_cause"] = True
                     err2["chain_consequence"] = error_msg
-                    err2["chain_source_error"] = err2_msg
-                    err2["chain_type"] = "ModuleNotFoundError → ImportError"
                     skip_indices.add(i)
                     break
 
         if i not in skip_indices:
-            err["is_root_cause"] = err.get("is_root_cause", False)
+            err.setdefault("is_root_cause", False)
             merged_errors.append(err)
 
     errors = merged_errors
 
-    return errors
+    # ===================== 7. 最终去重 =====================
+    # 改进键：(file_path, error_type, line_number) → 不同文件的同名错误独立保留
+    seen: set = set()
+    unique_errors = []
+    for err in errors:
+        key = (
+            err.get("file_path", "") or "",
+            err.get("error_type", "") or "",
+            err.get("line_number", 0) or 0,
+        )
+        if key not in seen:
+            seen.add(key)
+            unique_errors.append(err)
+
+    # ===================== 8. 字段补全 =====================
+    for err in unique_errors:
+        if not err.get("source") and err.get("type"):
+            err["source"] = err["type"]
+        err.setdefault("is_root_cause", False)
+        err.setdefault("chain_consequence", "")
+        err.setdefault("ci_stage", "")
+
+    return unique_errors
 
 
 @tool

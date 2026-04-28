@@ -30,23 +30,24 @@ def setup_logging(
     # 创建日志目录
     Path(log_dir).mkdir(parents=True, exist_ok=True)
 
-    # 配置基础日志
+    # 配置基础日志级别
     level = getattr(logging, log_level.upper())
 
     # 修复Windows控制台编码问题
-    import sys
     if sys.platform == "win32":
         import io
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
-    logging.basicConfig(
-        level=level,
-        format="%(message)s",
-        stream=sys.stdout
-    )
+    # 清除已有 handlers，防止重复
+    root_logger = logging.getLogger()
+    for h in root_logger.handlers[:]:
+        root_logger.removeHandler(h)
+        h.close()
 
-    # 公共处理器
+    root_logger.setLevel(level)
+
+    # 公共处理器（不含渲染器 — 渲染交给 ProcessorFormatter）
     processors: list[Processor] = [
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
@@ -63,24 +64,38 @@ def setup_logging(
 
     processors.insert(1, add_service_name)
 
-    # 根据格式选择渲染器
-    if json_format:
-        processors.append(structlog.processors.JSONRenderer(
-            serializer=lambda obj, **kwargs: json.dumps(obj, ensure_ascii=False, **kwargs)
-        ))
-    else:
-        processors.append(structlog.dev.ConsoleRenderer())
+    # 桥接处理器：将 event_dict 转发到标准 logging handler 的 Formatter
+    processors.append(structlog.stdlib.ProcessorFormatter.wrap_for_formatter)
 
     # 配置structlog
     structlog.configure(
         processors=processors,
-        wrapper_class=structlog.BoundLogger,
+        wrapper_class=structlog.stdlib.BoundLogger,
         context_class=dict,
         logger_factory=structlog.stdlib.LoggerFactory(),
         cache_logger_on_first_use=True,
     )
 
-    # 配置日志文件处理器（按天滚动）
+    # 创建渲染器：控制台和文件使用不同格式
+    console_renderer: Processor = (
+        structlog.processors.JSONRenderer(
+            serializer=lambda obj, **kwargs: json.dumps(obj, ensure_ascii=False, **kwargs)
+        )
+        if json_format
+        else structlog.dev.ConsoleRenderer()
+    )
+    file_renderer: Processor = structlog.processors.JSONRenderer(
+        serializer=lambda obj, **kwargs: json.dumps(obj, ensure_ascii=False, **kwargs)
+    )
+
+    # 控制台 handler（格式由 json_format 控制）
+    console_formatter = structlog.stdlib.ProcessorFormatter(processor=console_renderer)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(console_formatter)
+    root_logger.addHandler(console_handler)
+
+    # 文件 handler（始终 JSON 格式，不含 ANSI 转义码）
+    file_formatter = structlog.stdlib.ProcessorFormatter(processor=file_renderer)
     log_file = Path(log_dir) / f"{service_name}.log"
     file_handler = logging.handlers.TimedRotatingFileHandler(
         log_file,
@@ -89,8 +104,17 @@ def setup_logging(
         backupCount=retention_days,
         encoding="utf-8"
     )
-    file_handler.setFormatter(logging.Formatter("%(message)s"))
-    logging.getLogger().addHandler(file_handler)
+    file_handler.setFormatter(file_formatter)
+    root_logger.addHandler(file_handler)
+
+    # 兜底文件 handler：直接写入纯文本格式，防止 structlog 桥接失败时日志丢失
+    plain_log_file = Path(log_dir) / f"{service_name}_plain.log"
+    plain_handler = logging.FileHandler(plain_log_file, encoding="utf-8", mode="a")
+    plain_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    )
+    plain_handler.setLevel(logging.DEBUG)
+    root_logger.addHandler(plain_handler)
 
     # 降低第三方库的日志级别
     logging.getLogger("uvicorn").setLevel(logging.WARNING)

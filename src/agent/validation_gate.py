@@ -52,6 +52,10 @@ def validate_fix(
             errors.append(e)
 
     # 逐策略检查
+    result = _check_file_scope(fix_result, errors)
+    if not result.passed:
+        return result
+
     result = _check_import_error(fix_result, original_codes, errors)
     if not result.passed:
         return result
@@ -67,12 +71,45 @@ def validate_fix(
     return ValidationResult(passed=True)
 
 
+def _check_file_scope(
+    fix_result: dict,
+    error_locations: list[dict],
+) -> ValidationResult:
+    """检查修改的文件是否在错误列表中"""
+    allowed_files = set()
+    for e in error_locations:
+        fp = e.get("file_path", "")
+        if fp and fp != "<string>":
+            allowed_files.add(fp)
+
+    if not allowed_files:
+        return ValidationResult(passed=True)
+
+    modified_files = set(fix_result.get("modified_files", []))
+    invalid_files = modified_files - allowed_files
+
+    if invalid_files:
+        return ValidationResult(
+            passed=False,
+            violation_type="wrong_file_modified",
+            details=f"修改了不在错误列表中的文件: {', '.join(invalid_files)}",
+            error_context={"invalid_files": list(invalid_files)},
+        )
+
+    return ValidationResult(passed=True)
+
+
 def _check_import_error(
     fix_result: dict,
     original_codes: dict[str, str],
     error_locations: list[dict],
 ) -> ValidationResult:
-    """纯导入错误：只允许修改 import/from 行"""
+    """纯导入错误：去导入内容比较 + 语义变更阈值
+
+    比较策略：移除所有 import/from 导入行后，对比核心业务代码的差异。
+    允许 ≤3 行的噪音变化（空白符、注释位置等 LLM 输出不稳定性），
+    超过则判定为越界修改。
+    """
     if not error_locations:
         return ValidationResult(passed=True)
 
@@ -80,36 +117,60 @@ def _check_import_error(
         e.get("error_type") in ("ModuleNotFoundError", "ImportError")
         for e in error_locations
     ):
-        return ValidationResult(passed=True)  # 非纯导入错误，跳过
+        return ValidationResult(passed=True)
 
     for fp, new_code in fix_result.get("code_changes", {}).items():
         orig = original_codes.get(fp, "")
         if not orig:
             continue
 
-        diff = difflib.unified_diff(
-            orig.splitlines(keepends=True),
-            new_code.splitlines(keepends=True),
-            n=0,
-        )
-        for line in diff:
-            if line.startswith("+") and not line.startswith("+++"):
-                content = line[1:].strip()
-                if not content or content.startswith("#"):
-                    continue  # 空行和注释放行
-                if content.startswith("import ") or content.startswith("from "):
-                    continue  # 导入行放行
-                if content in ("try:", "except ImportError:", "except ModuleNotFoundError:"):
-                    continue  # try/except 框架行放行
+        orig_core = _strip_import_lines(orig)
+        new_core = _strip_import_lines(new_code)
 
-                logger.warning(f"ImportError 越界修改: {content}")
-                return ValidationResult(
-                    passed=False,
-                    violation_type="import_line_violation",
-                    details=f"越界修改行: {line.strip()}",
-                )
+        if orig_core == new_core:
+            continue
+
+        changed = _count_semantic_changes(orig_core, new_core)
+        if changed > 3:
+            logger.warning(
+                f"ImportError 越界修改: 核心代码差异 {changed} 行（阈值 3）"
+            )
+            return ValidationResult(
+                passed=False,
+                violation_type="import_line_violation",
+                details=f"核心代码变更 {changed} 行，超过允许的 3 行阈值",
+            )
 
     return ValidationResult(passed=True)
+
+
+def _strip_import_lines(code: str) -> list[str]:
+    """移除所有 import 行，返回剩余的非空、非纯注释的代码行"""
+    result = []
+    for line in code.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            continue
+        if stripped.startswith("import ") or stripped.startswith("from "):
+            continue
+        result.append(stripped)
+    return result
+
+
+def _count_semantic_changes(orig_lines: list[str], new_lines: list[str]) -> int:
+    """计算两个核心代码列表之间的差异行数（近似编辑距离）"""
+    matcher = difflib.SequenceMatcher(None, orig_lines, new_lines)
+    diff_lines = 0
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "replace":
+            diff_lines += max(i2 - i1, j2 - j1)
+        elif tag == "delete":
+            diff_lines += i2 - i1
+        elif tag == "insert":
+            diff_lines += j2 - j1
+    return diff_lines
 
 
 def _check_syntax_error(

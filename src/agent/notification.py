@@ -23,7 +23,7 @@ class NotificationService:
         self.enabled = enabled
         self.notify_users = notify_users or []
 
-    def send_pr_created(self, state: RepairState) -> None:
+    def send_pr_created(self, state: RepairState, pr_url: str = "") -> None:
         """发送 PR 创建成功通知"""
         if not self.enabled or not self.notify_users:
             return
@@ -43,12 +43,11 @@ class NotificationService:
             else '未知用户'
         )
 
-        bug_files = {
+        bug_count = len(state.modified_files) or len({
             e.file_path if hasattr(e, 'file_path') else e.get('file_path', '')
             for e in state.error_locations
-        }
-        bug_files.discard('')
-        bug_count = len(bug_files) if bug_files else len(state.error_locations)
+            if (e.file_path if hasattr(e, 'file_path') else e.get('file_path', ''))
+        })
 
         branch = (
             event.branch if isinstance(event, object) and hasattr(event, 'branch')
@@ -62,7 +61,7 @@ class NotificationService:
                     repair_success=True,
                     error_type=error_type_str,
                     source_branch=branch,
-                    pr_url=state.pr_url,
+                    pr_url=pr_url,
                     fix_description=state.fix_description,
                     receive_id=user_id,
                     receive_id_type="open_id",
@@ -91,12 +90,11 @@ class NotificationService:
             else '未知用户'
         )
 
-        bug_files = {
+        bug_count = len(state.modified_files) or len({
             e.file_path if hasattr(e, 'file_path') else e.get('file_path', '')
             for e in state.error_locations
-        }
-        bug_files.discard('')
-        bug_count = len(bug_files) if bug_files else len(state.error_locations)
+            if (e.file_path if hasattr(e, 'file_path') else e.get('file_path', ''))
+        })
 
         branch = (
             event.branch if isinstance(event, object) and hasattr(event, 'branch')

@@ -20,12 +20,11 @@ def start(
     import os
 
     from src.config.settings import get_settings
-    from src.utils.logging import setup_logging, get_logger
+    from src.utils.logging import setup_logging
     from src.bus import get_event_bus, GitHubEvent
     from src.monitor import GitHubWebhookMonitor
     from src.agent.orchestrator import RepairOrchestrator
 
-    logger = get_logger(__name__)
     overrides = {}
 
     # Webhook配置覆盖
@@ -57,7 +56,7 @@ def start(
     # 设置SSL验证环境变量
     os.environ["SSL_VERIFY"] = str(settings.webhook.ssl_verify).lower()
 
-    # 设置日志
+    # 设置日志（先初始化，再创建 logger，确保 structlog 配置已生效）
     setup_logging(
         log_level=settings.logging.level,
         log_dir=settings.logging.dir,
@@ -65,6 +64,9 @@ def start(
         retention_days=settings.logging.retention_days,
         service_name="github-webhook"
     )
+
+    from src.utils.logging import get_logger
+    logger = get_logger(__name__)
 
     # 初始化事件总线
     event_bus = get_event_bus(

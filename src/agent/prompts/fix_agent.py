@@ -127,18 +127,21 @@ ModuleNotFoundError/ImportError 修复必须遵守以下硬约束，违反则本
 - 如果缺失模块可以通过移动已有导入位置解决，优先使用移动而非新增
 - 不得修改该文件的任何其他区域（函数体、类定义、模块级变量等）
 
+**⚡ 格式保持要求（ImportError 修复专属）**：
+- 如果只需添加 import 语句，**不要重排**函数/类/变量的定义顺序
+- 保持原始代码的**缩进、空行、注释位置**完全不变
+- 优先返回**最小变更**：只修改必要的 import 行，其余文件内容原样返回
+
 ### 逻辑错误
 - 分析代码意图，修正错误的逻辑判断
 - 保持最小修改原则
 
 ### 错误信息未指定文件路径
-当 error_locations 中的错误没有 file_path 字段（或为空）时，说明 CI 日志未能明确指出哪个文件出错。
-你必须**主动搜索、定位**问题代码，步骤：
+当 error_locations 中的错误没有 file_path 字段（或为空）时，你需要**主动搜索、定位**问题代码，步骤：
 1. 从错误类型（如 NameError、TypeError）和错误描述（如 "name 'os' is not defined"）提取关键词
 2. 使用 search_code 工具在仓库中搜索相关代码模式
 3. 使用 search_files 工具查找项目中所有 .py 文件
-4. 结合 CI 日志（ci_logs）中的命令信息（如 "python app.py"）推断可能的文件
-5. 使用 read_file 读取候选文件，确认问题所在
+4. 使用 read_file 读取候选文件，确认问题所在
 6. 确认后按对应错误类型的修复策略处理
 
 ## 通用规则
@@ -176,10 +179,7 @@ FIX_AGENT_USER_PROMPT = """
 
 ## 环境信息
 - 仓库根目录：{repo_path}
-- CI错误日志参考：
-```
-{ci_logs}
-```
+- 错误详情见上方 JSON（traceback 字段包含完整 CI 错误上下文）
 
 {root_cause_section}
 
@@ -191,7 +191,7 @@ FIX_AGENT_USER_PROMPT = """
    - 从错误类型和错误描述提取关键词（如 NameError: name 'os' → 搜索 'os'）
    - 使用 search_code 工具搜索问题相关的代码
    - 使用 search_files 查找项目中的 .py 文件
-   - 结合 CI 日志中的命令（如 python app.py）推断出错的文件
+   - 使用 search_files 和 search_code 搜索相关文件
    - 使用 read_file 读取候选文件确认问题
 3. 分析错误类型和根因，选择对应的修复策略
 4. 修复后代码必须与原始代码有实际差异

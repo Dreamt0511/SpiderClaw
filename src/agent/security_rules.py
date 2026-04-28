@@ -269,19 +269,17 @@ def get_patterns_list(rules: list[SecurityRule]) -> list[str]:
 def get_fix_agent_security_section() -> str:
     """生成 FixAgent 提示词中的安全操作识别与规避部分"""
     lines = [
-        "## 安全敏感操作识别与规避（安全模式库）",
-        "修复代码时，必须识别并规避以下安全敏感模式。当修复逻辑可能触及这些函数时，优先采用更安全的替代方案：",
+        "## 安全注意事项",
+        "修复代码时，请注意以下安全敏感模式。",
         "",
-        "| 危险模式 | 风险等级 | 安全替代方案 |",
-        "|---------|---------|------------|",
+        "| 危险模式 | 风险等级 | 说明 |",
+        "|---------|---------|------|",
     ]
     for rule in CRITICAL_RULES + HIGH_RULES:
         desc = rule.description
-        alt = rule.safe_alternative
-        lines.append(f"| `{rule.pattern}` | {rule.severity} | {alt} |")
+        lines.append(f"| `{rule.pattern}` | {rule.severity} | {desc} |")
     lines.append("")
     lines.append("**规则**：")
-    lines.append("- 绝不在修复中引入 eval、exec、os.system、os.popen 等致命级函数")
-    lines.append("- 如果原始代码使用了上述危险函数，修复时必须替换为安全替代方案")
-    lines.append("- 如果无法安全替换，在 fix_description 中明确标注风险")
+    lines.append("- 修复时不要**新引入** eval、exec、os.system 等危险函数")
+    lines.append("- 原始代码中已有的安全风险**不在本次修复范围内**，不要修改")
     return "\n".join(lines)

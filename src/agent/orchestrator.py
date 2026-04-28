@@ -148,6 +148,7 @@ class RepairOrchestrator:
         if rejection_source == "gate":
             ctx = rejection_data.get("error_context", {})
             instruction_kwargs.update(ctx)
+            instruction_kwargs["details"] = rejection_data.get("details", "")
         elif rejection_source == "review":
             instruction_kwargs["error_type"] = (
                 state.error_locations[0].error_type
@@ -210,6 +211,11 @@ class RepairOrchestrator:
             error_locations_raw = []
             if ci_logs:
                 error_locations_raw = parse_python_errors.invoke({"log_content": ci_logs})
+                # 保存到文件
+                os.makedirs("src/logs", exist_ok=True)
+                with open("src/logs/debug_ci_logs.txt", "a", encoding="utf-8") as f:
+                    f.write(ci_logs + "\n")
+                logger.info(f"CI日志已保存到 src/logs/debug_ci_logs.txt，长度: {len(ci_logs)}")
 
             logger.info(f"解析到Python错误数量: {len(error_locations_raw)}")
             if not error_locations_raw:
@@ -281,8 +287,24 @@ class RepairOrchestrator:
 
     @staticmethod
     def _filter_valid_errors(error_locations: list[dict], repo_path: str) -> list[ErrorLocation]:
+        """过滤有效错误，处理 CI 路径前缀（/github/workspace/ 等）到本地路径的映射"""
         valid = []
         repo_path_abs = os.path.abspath(repo_path)
+
+        # CI 环境常见路径前缀（GitHub Actions）
+        CI_PATH_PREFIXES = ["/github/workspace/", "/home/runner/work/"]
+
+        def _strip_ci_prefix(fp: str) -> str:
+            for prefix in CI_PATH_PREFIXES:
+                if fp.startswith(prefix):
+                    stripped = fp[len(prefix):]
+                    # 处理 /home/runner/work/{repo}/{repo}/./path 格式
+                    dot_slash = stripped.find('/./')
+                    if dot_slash != -1:
+                        stripped = stripped[dot_slash + 3:]
+                    return stripped
+            return fp
+
         for err in error_locations:
             fp = err.get("file_path", "")
             base_fields = {
@@ -293,13 +315,35 @@ class RepairOrchestrator:
                 "traceback": err.get("traceback", ""),
                 "is_root_cause": err.get("is_root_cause", False),
                 "chain_consequence": err.get("chain_consequence", ""),
+                "ci_stage": err.get("ci_stage", ""),
             }
             if not fp or fp == "<string>":
                 if err.get("error_type") and err.get("error_message"):
                     valid.append(ErrorLocation(file_path="", **base_fields))
                 continue
 
-            cleaned = fp.lstrip("./\\").replace("\\", "/")
+            # CI 环境绝对路径 → 剥离前缀后按相对路径处理
+            ci_stripped = _strip_ci_prefix(fp)
+            if ci_stripped != fp:
+                cleaned = ci_stripped.lstrip("/\\").replace("\\", "/")
+                full = os.path.abspath(os.path.join(repo_path, cleaned))
+                if full.startswith(repo_path_abs) and os.path.isfile(full):
+                    rel = os.path.relpath(full, repo_path_abs).replace("\\", "/")
+                    valid.append(ErrorLocation(file_path=rel, **base_fields))
+                continue
+
+            # 本地绝对路径 → 必须在仓库目录内才是项目文件
+            if os.path.isabs(fp):
+                abs_fp = os.path.abspath(fp)
+                if abs_fp.startswith(repo_path_abs) and os.path.isfile(abs_fp):
+                    rel = os.path.relpath(abs_fp, repo_path_abs).replace("\\", "/")
+                    valid.append(ErrorLocation(file_path=rel, **base_fields))
+                continue
+
+            # 修复 lstrip 吞掉点号目录的问题（如 ./.github/tt.py → .github/tt.py 而非 github/tt.py）
+            cleaned = fp.lstrip("/\\").replace("\\", "/")
+            if cleaned.startswith('./') or cleaned.startswith('.\\'):
+                cleaned = cleaned[2:]
             full = os.path.abspath(os.path.join(repo_path, cleaned))
             if full.startswith(repo_path_abs) and os.path.isfile(full):
                 rel = os.path.relpath(full, repo_path_abs).replace("\\", "/")
@@ -350,6 +394,16 @@ class RepairOrchestrator:
             et = err.error_type.lower()
             if et in ("modulenotfounderror", "importerror"):
                 logger.info(f"检测到 {et}，交由 FixAgent 处理（可代码修复）")
+
+                # 如果错误没有文件路径，尝试从 traceback 中提取
+                if not err.file_path and err.traceback:
+                    file_match = re.search(r'File\s+"([^"]+\.py)"', err.traceback)
+                    if file_match:
+                        err.file_path = file_match.group(1)
+                        line_match = re.search(r'line\s+(\d+)', err.traceback)
+                        if line_match:
+                            err.line_number = int(line_match.group(1))
+                        logger.info(f"从 traceback 补充文件路径: {err.file_path}:{err.line_number}")
 
         # B类: 语法错误无文件路径
         if is_syntax_error and not syntax_error_files:
@@ -664,7 +718,7 @@ class RepairOrchestrator:
 
             if not pr_url.startswith("Error:"):
                 pr_number = int(pr_url.split("/")[-1]) if pr_url else 0
-                self.notification.send_pr_created(state)
+                self.notification.send_pr_created(state, pr_url)
                 return {"pr_url": pr_url, "pr_number": pr_number, "success": True}
             else:
                 return {"success": False, "error_message": pr_url}

@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import hmac
 import logging
+import logging.handlers
 import os
 from datetime import datetime
 from typing import Optional, Callable, Awaitable
@@ -58,6 +59,30 @@ class GitHubWebhookMonitor(BaseMonitor):
         self.app = FastAPI(title="SpiderClaw GitHub Webhook", version="1.0.0")
         self._setup_routes()
         self._setup_middleware()
+
+        # 确保文件日志始终写入（绕过 structlog，直接写入日志文件）
+        log_dir = "src/logs"
+        os.makedirs(log_dir, exist_ok=True)
+        if not any(
+            isinstance(h, logging.handlers.TimedRotatingFileHandler)
+            and h.baseFilename.endswith("spiderclaw.log")
+            for h in logging.root.handlers
+        ):
+            file_handler = logging.handlers.TimedRotatingFileHandler(
+                os.path.join(log_dir, "spiderclaw.log"),
+                when="midnight",
+                interval=1,
+                backupCount=30,
+                encoding="utf-8",
+            )
+            file_handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S",
+                )
+            )
+            file_handler.setLevel(logging.DEBUG)
+            logging.root.addHandler(file_handler)
 
         # Uvicorn服务器实例
         self.server: Optional[uvicorn.Server] = None
@@ -278,7 +303,8 @@ class GitHubWebhookMonitor(BaseMonitor):
             host=self.host,
             port=self.port,
             reload=self.reload,
-            log_level="info"
+            log_level="info",
+            log_config=None,  # 防止 uvicorn 覆盖已有的日志配置（TimedRotatingFileHandler 等）
         )
         self.server = uvicorn.Server(self.config)
 
@@ -321,6 +347,7 @@ def run_webhook_server(
     from src.utils.logging import get_logger
     from src.bus import get_event_bus, GitHubEvent
     from src.agent.orchestrator import RepairOrchestrator
+    from logging.handlers import TimedRotatingFileHandler
 
     log = get_logger(__name__)
 
@@ -328,17 +355,35 @@ def run_webhook_server(
     for handler in logging.root.handlers[:]:
         logging.root.removeHandler(handler)
 
-    handler = RichHandler(
-        show_time=True,
-        show_level=True,
-        show_path=False,
-        markup=True
+    log_dir = "src/logs"
+    os.makedirs(log_dir, exist_ok=True)
+
+    # 文件日志
+    file_handler = TimedRotatingFileHandler(
+        os.path.join(log_dir, "spiderclaw.log"),
+        when="midnight",
+        interval=1,
+        backupCount=30,
+        encoding="utf-8",
     )
+    file_handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    file_handler.setLevel(logging.DEBUG)
+
+    # 控制台日志
+    console_handler = RichHandler(
+        show_time=True, show_level=True, show_path=False, markup=True
+    )
+
     logging.basicConfig(
         level="INFO",
         format="%(message)s",
         datefmt="[%X]",
-        handlers=[handler]
+        handlers=[console_handler, file_handler],
     )
 
     settings = get_settings()
@@ -391,7 +436,7 @@ def run_webhook_server(
         f"健康检查: [bold #20d5f0]/health[/bold #20d5f0]\n"
         f"允许事件: [bold #20d5f0]{', '.join(settings.webhook.allowed_events)}[/bold #20d5f0]\n"
         f"自动修复: [bold #20d5f0]{repair_status}[/bold #20d5f0]\n\n"
-        f"[bold #5a6b7c]备注：开发环境下可以使用 ngrok http 8000 来暴露服务，方便外部访问[/bold #5a6b7c]\n",
+        f"[#5a6b7c]备注：开发环境下可以使用 ngrok http 8000 来暴露服务，方便外部访问[#5a6b7c]\n",
         title="[bold #20d5f0]SpiderClaw 运行中[/bold #20d5f0]",
         border_style="#20d5f0",
         padding=(1, 2)

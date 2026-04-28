@@ -16,6 +16,7 @@ class ErrorLocation(BaseModel):
     source: str = ""       # "traceback", "syntax_error", "simple", "pytest"
     is_root_cause: bool = False         # 是否为链式错误的根因
     chain_consequence: str = ""         # 由根因导致的后果错误描述
+    ci_stage: str = ""     # "syntax" | "runtime" | "test" | "unknown"
 
 
 class FixAttempt(BaseModel):

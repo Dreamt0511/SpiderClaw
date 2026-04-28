@@ -7,6 +7,7 @@ import subprocess
 from collections import Counter
 from typing import Dict, Any, List, Optional
 
+from src.agent.state import ErrorLocation
 from src.agent.tools.langchain_tools import execute_python_code
 
 logger = logging.getLogger(__name__)
@@ -70,7 +71,7 @@ class TestAgent:
     # ---------- 命令提取 ----------
 
     def _extract_failure_command(
-        self, ci_logs: str, error_locations: List[Dict]
+        self, ci_logs: str, error_locations: List[ErrorLocation]
     ) -> Optional[str]:
         """从 CI 日志中提取原始失败命令
 
@@ -114,7 +115,7 @@ class TestAgent:
         # --- 模式2（次高优先级）：从错误消息提取 Python 命令 ---
         if error_locations:
             for err in error_locations:
-                error_msg = err.get("error_message", "")
+                error_msg = err.error_message
                 # 匹配 CI 错误中常见的命令形式
                 for cmd_prefix in ['pytest ', 'python ', 'python3 ', 'nosetests ', 'tox ']:
                     lines = error_msg.split('\n')
@@ -195,13 +196,13 @@ class TestAgent:
         return None
 
     def _infer_command_from_errors(
-        self, error_locations: List[Dict]
+        self, error_locations: List[ErrorLocation]
     ) -> Optional[str]:
         """从错误位置的文件路径推断验证命令"""
         py_files = [
-            err.get('file_path', '')
+            err.file_path
             for err in error_locations
-            if err.get('file_path', '').endswith('.py')
+            if err.file_path.endswith('.py')
         ]
         if py_files:
             most_common_file = Counter(py_files).most_common(1)[0][0]
@@ -237,7 +238,7 @@ class TestAgent:
     # ---------- 降级验证 ----------
 
     async def _replay_verification(
-        self, error_locations: List[Dict], ci_logs: str = ""
+        self, error_locations: List[ErrorLocation], ci_logs: str = ""
     ) -> Dict[str, Any]:
         """回放式验证：直接检测原始错误是否已修复
 
@@ -248,9 +249,9 @@ class TestAgent:
         all_passed = True
 
         for error in error_locations:
-            error_type = error.get("error_type", "")
-            error_msg = error.get("error_message", "")
-            file_path = error.get("file_path", "")
+            error_type = error.error_type
+            error_msg = error.error_message
+            file_path = error.file_path
 
             # 1. NameError 检测 — compile 不能捕获运行时 NameError
             #    这里仅做语法检查，真正的运行时验证交给 Code Interpreter
@@ -339,7 +340,7 @@ class TestAgent:
             }
 
     async def _fallback_verify(
-        self, error_locations: List[Dict],
+        self, error_locations: List[ErrorLocation],
         ci_logs: str = "",
         diff_content: str = "",
     ) -> Dict[str, Any]:
@@ -404,8 +405,8 @@ class TestAgent:
                         all_passed = False
                     else:
                         is_original_error = any(
-                            error_type == err.get("error_type", "")
-                            and err.get("error_message", "")[:30] in error_msg[:30]
+                            error_type == err.error_type
+                            and err.error_message[:30] in error_msg[:30]
                             for err in error_locations
                         )
 
@@ -449,12 +450,12 @@ class TestAgent:
 
         # --- 方案3: 语法错误 → ast.parse ---
         is_syntax_err = any(
-            err.get('error_type', '') in ('SyntaxError', 'IndentationError', 'TabError')
+            err.error_type in ('SyntaxError', 'IndentationError', 'TabError')
             for err in error_locations
         )
         if is_syntax_err:
             for err in error_locations:
-                fp = err.get('file_path', '')
+                fp = err.file_path
                 if not fp:
                     continue
                 full_path = os.path.join(self.repo_path, fp)
@@ -554,13 +555,13 @@ class TestAgent:
         }
 
     def _extract_modified_files(
-        self, error_locations: List[Dict], diff_content: str
+        self, error_locations: List[ErrorLocation], diff_content: str
     ) -> List[str]:
         """从错误位置和 diff 中提取修改的 .py 文件列表"""
         modified_files = set()
 
         for err in error_locations:
-            fp = err.get("file_path", "")
+            fp = err.file_path
             if fp and fp.endswith('.py'):
                 modified_files.add(fp)
 
@@ -598,7 +599,7 @@ class TestAgent:
         return py_files
 
     def _estimate_confidence(
-        self, error_locations: List[Dict], diff_content: str
+        self, error_locations: List[ErrorLocation], diff_content: str
     ) -> str:
         """基于错误类型和diff内容估算修复置信度"""
         if not diff_content:
@@ -606,7 +607,7 @@ class TestAgent:
 
         # 语法错误 + 有diff → 高置信度
         has_syntax_err = any(
-            err.get("error_type", "") in ("SyntaxError", "IndentationError", "TabError")
+            err.error_type in ("SyntaxError", "IndentationError", "TabError")
             for err in error_locations
         )
         if has_syntax_err and diff_content.strip():
@@ -614,7 +615,7 @@ class TestAgent:
 
         # NameError/ImportError + diff中包含import/变量定义 → 中高置信度
         has_name_err = any(
-            err.get("error_type", "") in ("NameError", "ImportError", "ModuleNotFoundError")
+            err.error_type in ("NameError", "ImportError", "ModuleNotFoundError")
             for err in error_locations
         )
         if has_name_err and ("import " in diff_content or "def " in diff_content):
@@ -627,7 +628,7 @@ class TestAgent:
         return "低"
 
     def _check_orig_errors_fixed(
-        self, error_locations: List[Dict], check_details: List[str]
+        self, error_locations: List[ErrorLocation], check_details: List[str]
     ) -> bool:
         """检查语义检查结果中是否表明原始错误已被修复"""
         # 如果没有出现"原始错误未修复"，则认为已修复
@@ -674,7 +675,7 @@ class TestAgent:
 
     async def verify_fix(
         self,
-        error_locations: List[Dict],
+        error_locations: List[ErrorLocation],
         fix_description: str,
         diff_content: str,
         ci_logs: str = "",
