@@ -390,7 +390,8 @@ def run_webhook_server(
         f"Webhook端点: [bold #20d5f0]/webhook/github[/bold #20d5f0]\n"
         f"健康检查: [bold #20d5f0]/health[/bold #20d5f0]\n"
         f"允许事件: [bold #20d5f0]{', '.join(settings.webhook.allowed_events)}[/bold #20d5f0]\n"
-        f"自动修复: {repair_status}",
+        f"自动修复: [bold #20d5f0]{repair_status}[/bold #20d5f0]\n\n"
+        f"[bold #5a6b7c]备注：开发环境下可以使用 ngrok http 8000 来暴露服务，方便外部访问[/bold #5a6b7c]\n",
         title="[bold #20d5f0]SpiderClaw 运行中[/bold #20d5f0]",
         border_style="#20d5f0",
         padding=(1, 2)
