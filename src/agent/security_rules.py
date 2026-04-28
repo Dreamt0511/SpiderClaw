@@ -269,17 +269,18 @@ def get_patterns_list(rules: list[SecurityRule]) -> list[str]:
 def get_fix_agent_security_section() -> str:
     """生成 FixAgent 提示词中的安全操作识别与规避部分"""
     lines = [
-        "## 安全注意事项",
-        "修复代码时，请注意以下安全敏感模式。",
+        "## 安全敏感操作识别与规避",
+        "修复时请注意以下安全敏感模式，在完成主要错误修复后应顺手替换安全风险。",
         "",
-        "| 危险模式 | 风险等级 | 说明 |",
-        "|---------|---------|------|",
+        "| 危险模式 | 风险等级 | 安全替代方案 |",
+        "|---------|---------|------------|",
     ]
     for rule in CRITICAL_RULES + HIGH_RULES:
-        desc = rule.description
-        lines.append(f"| `{rule.pattern}` | {rule.severity} | {desc} |")
+        lines.append(f"| `{rule.pattern}` | {rule.severity} | {rule.safe_alternative} |")
     lines.append("")
-    lines.append("**规则**：")
-    lines.append("- 修复时不要**新引入** eval、exec、os.system 等危险函数")
-    lines.append("- 原始代码中已有的安全风险**不在本次修复范围内**，不要修改")
+    lines.append("### 修复优先级（强制遵守）")
+    lines.append("1. **首要任务**：修复上报的 CI 错误（优先级最高，必须完成）")
+    lines.append("2. **次要任务**：上报错误修复完成后，顺手修复同文件中已有的安全问题")
+    lines.append("3. **禁止因小失大**：不得因修改安全问题而影响对主要错误的修复")
+    lines.append("4. **同一个 diff**：安全修改和错误修复在同一个 diff 中一起返回")
     return "\n".join(lines)
