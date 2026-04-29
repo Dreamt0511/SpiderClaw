@@ -61,7 +61,7 @@ class GitHubWebhookMonitor(BaseMonitor):
         self._setup_middleware()
 
         # 确保文件日志始终写入（绕过 structlog，直接写入日志文件）
-        log_dir = "src/logs"
+        log_dir = "logs"
         os.makedirs(log_dir, exist_ok=True)
         if not any(
             isinstance(h, logging.handlers.TimedRotatingFileHandler)
@@ -269,6 +269,10 @@ class GitHubWebhookMonitor(BaseMonitor):
             event.branch = workflow_run.get("head_branch", "")
             event.conclusion = workflow_run.get("conclusion", "")
             event.logs_url = workflow_run.get("logs_url", "")
+            # workflow_run 的 PR 编号在 pull_requests 数组中
+            prs = workflow_run.get("pull_requests", [])
+            if prs:
+                event.pr_number = prs[0].get("number")
 
         elif event_type == "pull_request":
             pr = payload.get("pull_request", {})
@@ -355,7 +359,7 @@ def run_webhook_server(
     for handler in logging.root.handlers[:]:
         logging.root.removeHandler(handler)
 
-    log_dir = "src/logs"
+    log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)
 
     # 文件日志

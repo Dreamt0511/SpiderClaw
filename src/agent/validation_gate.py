@@ -26,6 +26,7 @@ def validate_fix(
     original_codes: dict[str, str],
     error_locations: list[ErrorLocation],
     max_change_lines: int = 50,
+    target_files: list[str] | None = None,
 ) -> ValidationResult:
     """
     后置硬校验：检查修复是否符合错误类型的边界约束。
@@ -53,10 +54,8 @@ def validate_fix(
             errors.append(e)
 
     # 逐策略检查
-    result = _check_file_scope(fix_result, errors)
-    if not result.passed:
-        return result
-
+    # 注：文件级/函数级作用域检查已移除，Agent 可跨文件修复根因
+    #     保留语法/导入/行数/文件完整性限制作为基本安全护栏
     result = _check_import_error(fix_result, original_codes, errors)
     if not result.passed:
         return result
@@ -65,7 +64,7 @@ def validate_fix(
     if not result.passed:
         return result
 
-    result = _check_func_scope(fix_result, original_codes, errors)
+    result = _check_file_completeness(fix_result, errors, target_files)
     if not result.passed:
         return result
 
@@ -183,56 +182,31 @@ def _check_syntax_error(
     original_codes: dict[str, str],
     error_locations: list[dict],
 ) -> ValidationResult:
-    """语法错误：只允许修改错误行 ±3 行范围"""
-    syntax_errors = [
-        e for e in error_locations
-        if e.get("error_type") in ("SyntaxError", "IndentationError", "TabError")
-    ]
-    if not syntax_errors:
-        return ValidationResult(passed=True)
+    """语法错误：只校验修复后代码能否通过 ast.parse()，能通过即放行"""
+    syntax_files = set()
+    for e in error_locations:
+        if e.get("error_type") in ("SyntaxError", "IndentationError", "TabError"):
+            fp = e.get("file_path", "")
+            if fp:
+                syntax_files.add(fp)
 
-    allowed_ranges = []
-    for e in syntax_errors:
-        ln = e.get("line_number", 0)
-        if ln > 0:
-            allowed_ranges.append((ln - 3, ln + 3))
-
-    if not allowed_ranges:
+    if not syntax_files:
         return ValidationResult(passed=True)
 
     for fp, new_code in fix_result.get("code_changes", {}).items():
-        orig = original_codes.get(fp, "")
-        if not orig:
+        if fp not in syntax_files:
             continue
-
-        diff = list(difflib.unified_diff(
-            orig.splitlines(keepends=True),
-            new_code.splitlines(keepends=True),
-            n=0,
-        ))
-        line_num = 0
-        for line in diff:
-            if line.startswith("@@"):
-                match = re.search(r"\+(\d+)", line)
-                if match:
-                    line_num = int(match.group(1)) - 1
-            elif line.startswith("+") and not line.startswith("+++"):
-                line_num += 1
-                content = line[1:].strip()
-                if not content:
-                    continue
-                if not any(lo <= line_num <= hi for lo, hi in allowed_ranges):
-                    logger.warning(
-                        f"SyntaxError 越界: L{line_num} 不在允许范围 {allowed_ranges}"
-                    )
-                    return ValidationResult(
-                        passed=False,
-                        violation_type="syntax_line_violation",
-                        details=f"L{line_num} 超出允许范围（允许: {allowed_ranges}）",
-                        error_context={"error_lines": str([lo for lo, _ in allowed_ranges])},
-                    )
-            elif not line.startswith("-"):
-                line_num += 1
+        try:
+            ast.parse(new_code)
+            logger.info(f"语法修复验证通过: {fp}")
+        except SyntaxError as e:
+            logger.warning(f"语法修复后仍有错误: {fp}:{e}")
+            return ValidationResult(
+                passed=False,
+                violation_type="syntax_line_violation",
+                details=f"{fp}: 修复后仍有语法错误: {e}",
+                error_context={"affected_file": fp, "error_lines": str(e.lineno or "")},
+            )
 
     return ValidationResult(passed=True)
 
@@ -266,8 +240,51 @@ def _check_change_limit(
                 passed=False,
                 violation_type="change_limit_exceeded",
                 details=f"文件 {fp} 变动 {total} 行（+{added}/-{removed}），超过上限 {max_allowed} 行",
+                error_context={
+                    "actual_changes": total,
+                    "max_allowed": max_allowed,
+                    "file_path": fp,
+                },
             )
 
+    return ValidationResult(passed=True)
+
+
+def _check_file_completeness(
+    fix_result: dict,
+    error_locations: list[dict],
+    target_files: list[str] | None = None,
+) -> ValidationResult:
+    """检查所有目标文件是否都在 code_changes 中
+
+    优先使用 orchestrator 提供的 target_files（确定性列表），
+    兜底从 error_locations 提取。
+    """
+    if target_files:
+        expected = {fp.replace("\\", "/") for fp in target_files}
+    else:
+        expected = set()
+        for err in error_locations:
+            fp = err.get("file_path", "")
+            if fp and fp != "<string>":
+                expected.add(fp.replace("\\", "/"))
+
+    if not expected:
+        return ValidationResult(passed=True)
+
+    actual = set(fix_result.get("code_changes", {}).keys())
+    missing = expected - actual
+
+    if missing:
+        return ValidationResult(
+            passed=False,
+            violation_type="file_incomplete",
+            details=f"遗漏文件: {', '.join(sorted(missing))}",
+            error_context={
+                "missing_files": list(missing),
+                "all_target_files": sorted(expected),
+            },
+        )
     return ValidationResult(passed=True)
 
 
@@ -279,6 +296,8 @@ def _is_import_line(code_line: str) -> bool:
 
 def _is_nameerror_only(errors: list[dict]) -> bool:
     """判断所有错误是否都是 NameError"""
+    if not errors:
+        return False
     return all(e.get("error_type") == "NameError" for e in errors)
 
 
@@ -287,10 +306,10 @@ def _check_func_scope(
     original_codes: dict[str, str],
     error_locations: list[dict],
 ) -> ValidationResult:
-    """函数级错误：修改必须在出错函数 AST 节点内
+    """函数级错误：每条修改必须在对应的错误函数内
 
-    用新代码的 AST 判断修改行所属函数，避免插入行后行号偏移误判。
-    例外：NameError 允许在模块级添加 import 语句。
+    构建 (文件, 函数名) 白名单，允许多个不同函数的错误同时被修复。
+    NameError 允许在模块级添加 import 语句。
     """
     func_errors = [
         e for e in error_locations
@@ -304,6 +323,26 @@ def _check_func_scope(
 
     is_name_err = _is_nameerror_only(func_errors)
 
+    # Step 1: 构建 (文件, 函数名) 白名单
+    # 从原始 AST 中提取每个错误所在的函数名
+    allowed_funcs: dict[str, set[str]] = {}
+    for e in func_errors:
+        fp = e.get("file_path", "")
+        if not fp or e.get("line_number", 0) <= 0:
+            continue
+        orig = original_codes.get(fp, "")
+        if not orig:
+            continue
+        try:
+            orig_ast = ast.parse(orig)
+        except SyntaxError:
+            allowed_funcs.setdefault(fp, set()).add("*")
+            continue
+        func_node = _find_enclosing_function(orig_ast, e["line_number"])
+        if func_node is not None:
+            allowed_funcs.setdefault(fp, set()).add(func_node.name)
+
+    # Step 2: 逐文件检查修改行
     for fp, new_code in fix_result.get("code_changes", {}).items():
         orig = original_codes.get(fp, "")
         if not orig:
@@ -315,55 +354,40 @@ def _check_func_scope(
             continue
 
         changed_line_nums = _get_changed_line_numbers(orig, new_code)
+        allowed = allowed_funcs.get(fp, set())
 
-        for e in func_errors:
-            if e.get("file_path") != fp or e.get("line_number", 0) <= 0:
-                continue
+        for changed_lineno in changed_line_nums:
+            enclosing = _find_enclosing_function(new_ast, changed_lineno)
 
-            # 在原始 AST 中找到出错函数（只获取函数名，不比较行号）
-            try:
-                orig_ast = ast.parse(orig)
-            except SyntaxError:
-                continue
-            orig_func = _find_enclosing_function(orig_ast, e["line_number"])
-            if orig_func is None:
-                continue
-            func_name = orig_func.name
-
-            for changed_lineno in changed_line_nums:
-                # 在新 AST 中找到修改行所属的函数
-                enclosing = _find_enclosing_function(new_ast, changed_lineno)
-
-                if enclosing is None:
-                    # 模块级修改 — 仅 NameError 允许加 import
+            if enclosing is None:
+                # 模块级修改 — 仅 NameError 允许加 import
+                if is_name_err:
                     new_lines = new_code.splitlines()
                     changed_line = new_lines[changed_lineno - 1] if 1 <= changed_lineno <= len(new_lines) else ""
-                    if is_name_err and _is_import_line(changed_line):
+                    if _is_import_line(changed_line):
                         continue
-                    logger.warning(
-                        f"函数范围越界: L{changed_lineno} 不在任何函数内 "
-                        f"（错误位于函数 {func_name}）"
-                    )
-                    return ValidationResult(
-                        passed=False,
-                        violation_type="func_body_modified",
-                        details=f"修改 L{changed_lineno} 是模块级代码，不在函数 {func_name} 范围内",
-                        error_context={"func_name": func_name},
-                    )
+                logger.warning(
+                    f"函数范围越界: L{changed_lineno} 不在任何函数内"
+                )
+                return ValidationResult(
+                    passed=False,
+                    violation_type="func_body_modified",
+                    details=f"修改 L{changed_lineno} 是模块级代码，不在允许的函数范围内",
+                )
 
-                # 修改行在某个函数内 — 检查函数名是否匹配
-                if enclosing.name != func_name:
-                    logger.warning(
-                        f"函数范围越界: L{changed_lineno} 在函数 {enclosing.name} 中，"
-                        f"但错误位于函数 {func_name}"
-                    )
-                    return ValidationResult(
-                        passed=False,
-                        violation_type="func_body_modified",
-                        details=f"修改 L{changed_lineno} 属于函数 {enclosing.name}，"
-                                f"而非错误所在函数 {func_name}",
-                        error_context={"func_name": func_name},
-                    )
+            # 检查函数名是否在白名单中
+            if "*" not in allowed and enclosing.name not in allowed:
+                logger.warning(
+                    f"函数范围越界: L{changed_lineno} 在函数 {enclosing.name} 中，"
+                    f"但该函数不在错误白名单中 (允许: {allowed})"
+                )
+                return ValidationResult(
+                    passed=False,
+                    violation_type="func_body_modified",
+                    details=f"修改 L{changed_lineno} 属于函数 {enclosing.name}，"
+                            f"不在允许函数列表中: {allowed}",
+                    error_context={"func_name": enclosing.name, "allowed": list(allowed)},
+                )
 
     return ValidationResult(passed=True)
 

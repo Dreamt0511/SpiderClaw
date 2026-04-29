@@ -56,12 +56,26 @@ class NotificationService:
         )
 
         for user_id in self.notify_users:
+            # 构造原错误PR链接
+            repo = (
+                event.repository if isinstance(event, object) and hasattr(event, 'repository')
+                else event.get('repository', '') if isinstance(event, dict)
+                else ''
+            )
+            pr_num = (
+                event.pr_number if isinstance(event, object) and hasattr(event, 'pr_number')
+                else event.get('pr_number') if isinstance(event, dict)
+                else None
+            )
+            original_pr_url = f"https://github.com/{repo}/pull/{pr_num}" if repo and pr_num else ""
+
             asyncio.create_task(
                 send_repair_notification(
                     repair_success=True,
                     error_type=error_type_str,
                     source_branch=branch,
                     pr_url=pr_url,
+                    original_pr_url=original_pr_url,
                     fix_description=state.fix_description,
                     receive_id=user_id,
                     receive_id_type="open_id",
@@ -181,7 +195,7 @@ class NotificationService:
             risk_section_parts.extend(f"- {r}" for r in normal_warnings)
             risk_section_parts.append("")
 
-        risk_warning_display = '; '.join(risk_warnings) if risk_warnings else "无"
+        risk_warning_display = f"{len(risk_warnings)} 条" if risk_warnings else "无"
         risk_detail_section = '\n'.join(risk_section_parts) if risk_section_parts else ""
 
         error_types = list({

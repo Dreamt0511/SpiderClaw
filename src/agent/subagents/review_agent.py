@@ -1,23 +1,31 @@
-"""审查Agent实现 - LangChain标准版本"""
+"""审查Agent实现 — Phase 1 审查 + Phase 2 安全修复"""
 
 from typing import Dict, Any, List
 import ast
+import json
 import logging
 import difflib
 import re
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_openai import ChatOpenAI
+from langchain.agents import create_agent
+from langchain.agents.middleware import ToolCallLimitMiddleware
 
 from src.agent.prompts.review_agent_prompts import REVIEW_AGENT_SYSTEM_PROMPT, REVIEW_AGENT_USER_PROMPT
+from src.agent.prompts.review_agent_security_fix import (
+    REVIEW_AGENT_SECURITY_FIX_SYSTEM_PROMPT,
+    REVIEW_AGENT_SECURITY_FIX_USER_PROMPT,
+)
 from src.agent.security_rules import SecurityRule, CRITICAL_RULES, HIGH_RULES, MEDIUM_RULES, LOW_RULES
 from src.agent.state import ErrorLocation
 from src.agent.tools import set_tool_context
+from src.agent.tools.langchain_tools import read_file, write_file
 
 logger = logging.getLogger(__name__)
 
 
 class ReviewAgent:
-    """审查Agent，使用LangChain标准工具调用模式"""
+    """审查Agent — Phase 1 LLM 审查 + Phase 2 按需安全修复"""
 
     def __init__(
         self,
@@ -26,8 +34,12 @@ class ReviewAgent:
         openai_api_key: str = None,
         openai_base_url: str = "https://api.openai.com/v1",
         max_change_lines: int = 20,
+        repo_path: str = "",
+        github_token: str = "",
     ):
         self.max_change_lines = max_change_lines
+        self.repo_path = repo_path
+        self.github_token = github_token
 
         self.llm = ChatOpenAI(
             model=llm_model,
@@ -42,6 +54,8 @@ class ReviewAgent:
     _HIGH_RULES = HIGH_RULES
     _MEDIUM_RULES = MEDIUM_RULES
     _LOW_RULES = LOW_RULES
+
+    # ==================== 静态检查工具方法 ====================
 
     def _strip_line_comment(self, line: str) -> str:
         """去除单行中的 Python 注释部分"""
@@ -144,7 +158,7 @@ class ReviewAgent:
             contract_warnings = self._detect_contract_changes(code_changes, original_codes)
         new_risks["high"].extend(contract_warnings)
 
-        # 代码退化检测：检查新引入的危险模式（原始代码中没有，修复后新增的）
+        # 代码退化检测
         _DEGRADED_PATTERNS = [
             (r'\beval\s*\(', "eval() 是危险的代码执行函数"),
             (r'\bexec\s*\(', "exec() 是危险的代码执行函数"),
@@ -290,6 +304,51 @@ class ReviewAgent:
             "details": comparison_details
         }
 
+    # ==================== Phase 2 安全修复 ====================
+
+    @staticmethod
+    def _has_kept_risks(kept_risks: Dict[str, list]) -> bool:
+        """判断是否有残留安全风险需要 Phase 2 修复"""
+        return len(kept_risks.get("critical", [])) > 0 or len(kept_risks.get("high", [])) > 0
+
+    def _build_security_fix_prompt(
+        self,
+        kept_risks: Dict[str, list],
+        code_changes: Dict[str, str],
+    ) -> str:
+        """构建 Phase 2 安全修复的 user prompt（仅处理安全风险，不兜底遗漏文件）"""
+        kept_sections = []
+        for level in ("critical", "high", "medium", "low"):
+            for r in kept_risks.get(level, []):
+                kept_sections.append(f"  - {r}")
+        kept_risks_section = "\n".join(kept_sections) if kept_sections else "无"
+
+        code_changes_section = ""
+        for fp, content in code_changes.items():
+            code_changes_section += f"\n## {fp}\n```python\n{content}\n```\n"
+
+        remaining_lines = self.max_change_lines
+
+        return REVIEW_AGENT_SECURITY_FIX_USER_PROMPT.format(
+            code_changes_section=code_changes_section,
+            kept_risks_section=kept_risks_section,
+            remaining_lines=remaining_lines,
+        )
+
+    @staticmethod
+    def _apply_security_fixes(
+        fix_result: Dict, code_changes: Dict[str, str]
+    ) -> Dict[str, str]:
+        """合并安全修复结果到 code_changes"""
+        updated = dict(code_changes)
+        fix_changes = fix_result.get("code_changes", {})
+        for fp, content in fix_changes.items():
+            if content and content != "Error: 文件内容未提供":
+                updated[fp] = content
+        return updated
+
+    # ==================== 核心审查流程 ====================
+
     async def review_changes(
         self,
         error_locations: List[ErrorLocation],
@@ -300,11 +359,11 @@ class ReviewAgent:
         repo_path: str,
         original_codes: Dict[str, str] = None,
     ) -> Dict[str, Any]:
-        """审查代码变更"""
+        """审查代码变更 — Phase 1 审查 + Phase 2 按需安全修复"""
         try:
-            logger.info("运行审查Agent")
+            logger.info("运行审查Agent Phase 1: 静态检查 + LLM 审查")
 
-            # 静态安全检查
+            # 1. 静态安全检查
             static_result = self._static_security_check(
                 code_changes, diff_content, original_codes=original_codes
             )
@@ -367,7 +426,6 @@ class ReviewAgent:
                     error_info.append(f"{error.error_type}: {error.error_message}")
             error_info_str = "\n".join(error_info) if error_info else "无明确错误位置"
 
-            # original_codes 必须由调用方传入，不存在时直接报错（不再回退到磁盘）
             if original_codes is None:
                 logger.warning("original_codes 未传入，使用空字典")
                 original_codes = {}
@@ -449,6 +507,7 @@ class ReviewAgent:
 注意：已移除的风险视为安全改进；残留的原始风险不影响通过；新引入的风险将根据等级决定是否阻止。
 """
 
+            # Phase 1: LLM 审查
             user_input = REVIEW_AGENT_USER_PROMPT.format(
                 error_info_str=error_info_str,
                 code_comparison_section=code_comparison_section,
@@ -465,8 +524,6 @@ class ReviewAgent:
             response_content = result.content
             logger.info(f"审查Agent原始响应: {response_content[:500]}")
 
-            import json as _json
-
             json_match = re.search(
                 r"```json\s*(.*?)\s*```", response_content, re.DOTALL
             )
@@ -475,7 +532,7 @@ class ReviewAgent:
             else:
                 json_content = response_content.strip()
 
-            review_result = _json.loads(json_content)
+            review_result = json.loads(json_content)
 
             # 合并静态检查结果
             review_result["change_lines"] = static_result["change_lines"]
@@ -483,11 +540,14 @@ class ReviewAgent:
                 review_result["risk_warnings"] = []
             review_result["risk_warnings"].extend(static_result["risk_warnings"])
 
-            # 保留 rejection_reason（LLM 输出中的新字段）
             if "rejection_reason" not in review_result:
                 review_result["rejection_reason"] = ""
 
             llm_passed = bool(review_result.get("review_passed", False))
+            review_result["review_passed"] = llm_passed
+            review_result["risk_level"] = static_result["risk_level"]
+            review_result["has_critical_risks"] = static_result["has_critical_risks"]
+            review_result["has_high_risks"] = static_result["has_high_risks"]
 
             if not llm_passed and not auto_result["all_identical"]:
                 logger.warning(
@@ -495,13 +555,34 @@ class ReviewAgent:
                     f"({auto_result['changed_files_count']}/{len(modified_files)} 文件已修改)"
                 )
 
-            review_result["review_passed"] = llm_passed
-            review_result["risk_level"] = static_result["risk_level"]
-            review_result["has_critical_risks"] = static_result["has_critical_risks"]
-            review_result["has_high_risks"] = static_result["has_high_risks"]
-            logger.info(f"审查完成. 通过: {review_result['review_passed']}, "
-                        f"风险等级: {static_result['risk_level']}, "
-                        f"rejection_reason: {review_result.get('rejection_reason', 'N/A')}")
+            logger.info(f"Phase 1 审查完成. 通过: {review_result['review_passed']}, "
+                        f"风险等级: {static_result['risk_level']}")
+
+            # Phase 2: 仅安全修复 — 只在 Phase 1 审查通过后触发，审查未通过时让 Fix Agent 干净重试
+            has_kept = self._has_kept_risks(static_result.get("kept_risks", {}))
+            if llm_passed and has_kept:
+                logger.info(f"触发 Phase 2 安全修复: kept_risks={has_kept}")
+                phase2_result = await self._run_phase2_complementary_fix(
+                    kept_risks=static_result.get("kept_risks", {}),
+                    code_changes=code_changes,
+                    original_codes=original_codes,
+                )
+                if phase2_result.get("fixes_applied"):
+                    review_result["code_changes"] = phase2_result["code_changes"]
+                    review_result["security_fixes_applied"] = True
+                    if phase2_result.get("risk_warnings"):
+                        review_result["risk_warnings"].extend(phase2_result["risk_warnings"])
+                    # Phase 2 安全修复成功 → 无论 Phase 1 结果如何都放行
+                    if not review_result["review_passed"]:
+                        review_result["review_passed"] = True
+                        review_result["review_comments"] += "\n[Phase 2 安全修复已处理残留风险]"
+                        logger.info("Phase 2 安全修复成功，覆盖 Phase 1 拒绝结果，放行")
+                    else:
+                        logger.info("Phase 2 安全修复完成")
+                else:
+                    review_result["security_fixes_applied"] = False
+                    logger.info("Phase 2 跳过（Agent 未产生任何变更）")
+
             return review_result
 
         except Exception as e:
@@ -516,3 +597,125 @@ class ReviewAgent:
                 "risk_level": "NONE",
                 "rejection_reason": "",
             }
+
+    async def _run_phase2_complementary_fix(
+        self,
+        kept_risks: Dict[str, list],
+        code_changes: Dict[str, str],
+        original_codes: Dict[str, str],
+    ) -> Dict[str, Any]:
+        """Phase 2: 使用 create_agent 修复残留安全风险（不处理遗漏文件）
+
+        策略：Agent 持有 write_file 工具会直接写磁盘，不依赖 JSON 输出。
+        Agent 运行后扫描 tool_calls 找出写了哪些文件，再从磁盘读取最新内容。
+        """
+        try:
+            if self.repo_path:
+                set_tool_context({"repo_path": self.repo_path})
+                if self.github_token:
+                    set_tool_context({"github_token": self.github_token})
+
+            baseline = dict(code_changes)
+
+            # ★ 先把 code_changes 写入磁盘，确保 Phase 2 Agent 的 read_file 读到的是修改后的代码
+            for fp, content in code_changes.items():
+                write_file.invoke({"file_path": fp, "content": content})
+            logger.info(f"Phase 2 已将 {len(code_changes)} 个文件的修改写入磁盘供 Agent 读取")
+
+            fix_agent = create_agent(
+                model=self.llm,
+                tools=[read_file, write_file],
+                system_prompt=REVIEW_AGENT_SECURITY_FIX_SYSTEM_PROMPT,
+                middleware=[
+                    ToolCallLimitMiddleware(run_limit=5, exit_behavior="end"),
+                ],
+            )
+
+            prompt = self._build_security_fix_prompt(
+                kept_risks=kept_risks,
+                code_changes=code_changes,
+            )
+            result = await fix_agent.ainvoke({"input": prompt})
+
+            # 策略1: 从 tool_calls 中提取 write_file 的目标文件，从磁盘重新读取
+            written_files = set()
+            for msg in result.get("messages", []):
+                if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        if tc.get('name') == 'write_file':
+                            fp = tc['args'].get('file_path', '')
+                            if fp:
+                                written_files.add(fp.replace("\\", "/"))
+
+            if written_files:
+                logger.info(f"Phase 2 Agent 通过 write_file 写了 {len(written_files)} 个文件: {written_files}")
+                updated = dict(baseline)
+                for fp in written_files:
+                    content = read_file.invoke({"file_path": fp})
+                    if not content.startswith("Error:"):
+                        updated[fp] = content
+                    else:
+                        logger.warning(f"Phase 2 后读取 {fp} 失败: {content[:100]}")
+
+                if updated != baseline:
+                    # 重跑静态检查
+                    new_static = self._static_security_check(
+                        updated, "", original_codes=original_codes,
+                    )
+                    post_risk_warnings = []
+                    if new_static["has_critical_risks"] or new_static["has_high_risks"]:
+                        post_risk_warnings.append(
+                            "[WARNING] Phase 2 修复引入了新的风险，请人工审查: "
+                            + "; ".join(new_static["risk_warnings"])
+                        )
+                    return {
+                        "fixes_applied": True,
+                        "code_changes": updated,
+                        "risk_warnings": post_risk_warnings,
+                    }
+                else:
+                    logger.info("Phase 2 写入了文件但内容与 baseline 相同，视为无变更")
+                    return {"fixes_applied": False}
+
+            # 策略2: 兜底 — 试图从文本输出解析 JSON（兼容无工具调用的情况）
+            output = result.get("output", "")
+            json_match = re.search(r"```json\s*(.*?)\s*```", output, re.DOTALL)
+            if json_match:
+                fix_result = json.loads(json_match.group(1))
+            else:
+                try:
+                    fix_result = json.loads(output)
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning("Phase 2 Agent 未调用 write_file 且输出非 JSON 格式，跳过")
+                    return {"fixes_applied": False}
+
+            if not fix_result.get("code_changes"):
+                logger.info("Phase 2 未生成任何代码变更")
+                return {"fixes_applied": False}
+
+            updated_changes = self._apply_security_fixes(fix_result, code_changes)
+
+            if updated_changes == code_changes:
+                logger.info("Phase 2 生成的变更与现有相同，视为无变更")
+                return {"fixes_applied": False}
+
+            # 重跑静态检查
+            new_static = self._static_security_check(
+                updated_changes, "", original_codes=original_codes,
+            )
+            post_risk_warnings = []
+            if new_static["has_critical_risks"] or new_static["has_high_risks"]:
+                post_risk_warnings.append(
+                    "[WARNING] Phase 2 修复引入了新的风险，请人工审查: "
+                    + "; ".join(new_static["risk_warnings"])
+                )
+
+            return {
+                "fixes_applied": True,
+                "code_changes": updated_changes,
+                "risk_warnings": post_risk_warnings,
+            }
+
+        except Exception as e:
+            logger.error(f"Phase 2 补充修复失败: {e}", exc_info=True)
+            return {"fixes_applied": False}

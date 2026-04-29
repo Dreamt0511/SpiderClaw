@@ -288,6 +288,7 @@ async def send_repair_notification(
     error_message: str = "",
     pr_author: str = "未知用户",
     bug_count: int = 0,
+    original_pr_url: str = "",
 ) -> bool:
     """
     发送修复结果通知（使用飞书卡片格式）
@@ -303,6 +304,7 @@ async def send_repair_notification(
         error_message: 失败时的错误信息（可选）
         pr_author: PR提交者昵称
         bug_count: 修复的bug数量
+        original_pr_url: 原错误PR链接（可选）
 
     Returns:
         是否发送成功
@@ -343,17 +345,25 @@ async def send_repair_notification(
         }
 
         # 添加PR链接按钮
+        actions = []
         if pr_url:
+            actions.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "🔗 查看修复PR"},
+                "url": pr_url,
+                "type": "primary"
+            })
+        if original_pr_url:
+            actions.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "📋 查看原PR"},
+                "url": original_pr_url,
+                "type": "default"
+            })
+        if actions:
             card_content["elements"].append({
                 "tag": "action",
-                "actions": [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "🔗 查看PR"},
-                        "url": pr_url,
-                        "type": "primary"
-                    }
-                ]
+                "actions": actions
             })
     else:
         # 失败卡片

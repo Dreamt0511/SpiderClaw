@@ -1,6 +1,7 @@
 """修复流程编排器 — 图构建 + 路由 + 节点实现"""
 
 import asyncio
+import ast
 import datetime
 import logging
 import os
@@ -150,21 +151,24 @@ class RepairOrchestrator:
             ctx = rejection_data.get("error_context", {})
             instruction_kwargs.update(ctx)
             instruction_kwargs["details"] = rejection_data.get("details", "")
+            # file_incomplete 需要将列表转为字符串
+            if violation_type == "file_incomplete":
+                instruction_kwargs["missing_files"] = ", ".join(
+                    ctx.get("missing_files", [])
+                )
+                instruction_kwargs["all_target_files"] = ", ".join(
+                    ctx.get("all_target_files", [])
+                )
+            # syntax_line_violation 显式列出所有目标文件，避免 LLM 遗漏
+            if violation_type == "syntax_line_violation":
+                target_files = state.get("target_files", [])
+                instruction_kwargs["target_files"] = ", ".join(target_files)
         elif rejection_source == "review":
-            instruction_kwargs["error_type"] = (
-                state.error_locations[0].error_type
-                if state.error_locations and hasattr(state.error_locations[0], 'error_type')
-                else "UnknownError"
-            )
-            instruction_kwargs["file_path"] = (
-                state.error_locations[0].file_path
-                if state.error_locations and hasattr(state.error_locations[0], 'file_path')
-                else "unknown"
-            )
-            instruction_kwargs["line_number"] = str(
-                state.error_locations[0].line_number
-                if state.error_locations and hasattr(state.error_locations[0], 'line_number')
-                else "?"
+            # 优先用当前审查的完整评语，再回退到 state 中已有的评语，兜底用中文提示
+            instruction_kwargs["review_detail"] = (
+                rejection_data.get("review_comments")
+                or state.get("review_comments")
+                or "原始错误未修复"
             )
         elif rejection_source == "test":
             ft = rejection_data.get("failed_tests", state.failed_tests or [])
@@ -172,6 +176,24 @@ class RepairOrchestrator:
             instruction_kwargs["failed_tests"] = ", ".join(ft)
 
         instruction = generate_instruction(reason, **instruction_kwargs)
+
+        # 累计历史强制指令，但超过 500 字符时只保留最新 2 条防止 prompt 膨胀
+        prev = state.get("mandatory_instructions", "")
+        if prev:
+            candidate = prev + "\n\n---\n\n" + instruction
+            if len(candidate) > 500:
+                # 只保留最后 2 条指令：从倒数第二个 "---" 分隔处截取
+                parts = candidate.split("\n\n---\n\n")
+                if len(parts) > 2:
+                    instruction = "\n\n---\n\n".join(parts[-2:])
+                else:
+                    instruction = candidate
+                logger.info(
+                    f"mandatory_instructions 超 500 字符（{len(candidate)}），"
+                    f"裁剪为最后 2 条（{len(instruction)} 字符）"
+                )
+            else:
+                instruction = candidate
 
         attempt = FixAttempt(
             attempt=state.retry_count,
@@ -214,8 +236,8 @@ class RepairOrchestrator:
             if ci_logs:
                 error_locations_raw = parse_python_errors.invoke({"log_content": ci_logs})
                 # 保存到文件
-                os.makedirs("src/logs", exist_ok=True)
-                with open("src/logs/debug_ci_logs.txt", "a", encoding="utf-8") as f:
+                os.makedirs("logs", exist_ok=True)
+                with open("logs/debug_ci_logs.txt", "a", encoding="utf-8") as f:
                     f.write(ci_logs + "\n")
                 logger.info(f"CI日志已保存到 src/logs/debug_ci_logs.txt，长度: {len(ci_logs)}")
 
@@ -260,10 +282,30 @@ class RepairOrchestrator:
                     "error_locations": error_locations,
                 }
 
+            # 提取所有错误文件的确定性文件列表（在整个流程中不变）
+            target_files_errors = classification.get("error_locations", error_locations)
+            target_files = sorted(set(
+                err.file_path for err in target_files_errors
+                if hasattr(err, "file_path") and err.file_path and err.file_path != "<string>"
+            ))
+            logger.info(f"确定性目标文件列表: {target_files}")
+
+            # 提前读取所有目标文件的原始内容，确保 prompt 中始终展示全量文件
+            original_codes = {}
+            for fp in target_files:
+                try:
+                    content = read_file.invoke({"file_path": f"{repo_path}/{fp}"})
+                    if not content.startswith("Error:"):
+                        original_codes[fp] = content
+                except Exception as e:
+                    logger.warning(f"读取目标文件 {fp} 失败: {e}")
+
             return {
                 "ci_logs": classification.get("ci_logs", ci_logs),
                 "repo_path": repo_path,
-                "error_locations": classification.get("error_locations", error_locations),
+                "error_locations": target_files_errors,
+                "target_files": target_files,
+                "original_codes": original_codes,
                 "retry_count": 0,
                 "max_retries": self.max_retries,
                 "review_comments": "",
@@ -319,9 +361,31 @@ class RepairOrchestrator:
                 "chain_consequence": err.get("chain_consequence", ""),
                 "ci_stage": err.get("ci_stage", ""),
             }
+
+            # 对无 file_path 的错误，从 traceback 强制提取文件路径
+            if not fp and err.get("traceback"):
+                tb_match = re.search(r'File "([^"]+\.py)"', err["traceback"])
+                if tb_match:
+                    fp = tb_match.group(1)
+                    base_fields["file_path"] = fp
+                    ln_match = re.search(r'line\s+(\d+)', err["traceback"])
+                    if ln_match:
+                        base_fields["line_number"] = int(ln_match.group(1))
+                    logger.info(f"从 traceback 提取文件路径: {fp}")
+                else:
+                    logger.info(
+                        f"丢弃错误: traceback 中无文件路径, "
+                        f"type={err.get('error_type')}, msg={err.get('error_message')[:80]}"
+                    )
+
             if not fp or fp == "<string>":
                 if err.get("error_type") and err.get("error_message"):
                     valid.append(ErrorLocation(file_path="", **base_fields))
+                else:
+                    logger.info(
+                        f"丢弃错误: 无有效 error_type/error_message, "
+                        f"fp={fp!r}, type={err.get('error_type')}"
+                    )
                 continue
 
             # CI 环境绝对路径 → 剥离前缀后按相对路径处理
@@ -332,6 +396,8 @@ class RepairOrchestrator:
                 if full.startswith(repo_path_abs) and os.path.isfile(full):
                     rel = os.path.relpath(full, repo_path_abs).replace("\\", "/")
                     valid.append(ErrorLocation(file_path=rel, **base_fields))
+                else:
+                    logger.info(f"丢弃错误: CI路径文件不存在 {fp} -> {full}")
                 continue
 
             # 本地绝对路径 → 必须在仓库目录内才是项目文件
@@ -340,6 +406,8 @@ class RepairOrchestrator:
                 if abs_fp.startswith(repo_path_abs) and os.path.isfile(abs_fp):
                     rel = os.path.relpath(abs_fp, repo_path_abs).replace("\\", "/")
                     valid.append(ErrorLocation(file_path=rel, **base_fields))
+                else:
+                    logger.info(f"丢弃错误: 绝对路径不在仓库内或文件不存在 {fp}")
                 continue
 
             # 修复 lstrip 吞掉点号目录的问题（如 ./.github/tt.py → .github/tt.py 而非 github/tt.py）
@@ -350,6 +418,8 @@ class RepairOrchestrator:
             if full.startswith(repo_path_abs) and os.path.isfile(full):
                 rel = os.path.relpath(full, repo_path_abs).replace("\\", "/")
                 valid.append(ErrorLocation(file_path=rel, **base_fields))
+            else:
+                logger.info(f"丢弃错误: 相对路径文件不存在 {fp} -> {full}")
 
         logger.info(f"有效错误: {len(valid)}/{len(error_locations)}")
         return valid
@@ -370,6 +440,21 @@ class RepairOrchestrator:
                 if err.file_path and err.file_path not in syntax_error_files:
                     syntax_error_files.append(err.file_path)
 
+        # 对语法错误的文件做全量检测：迭代注释出错行，收集所有 SyntaxError
+        if syntax_error_files:
+            new_syntax_errors = self._exhaustive_syntax_scan(
+                repo_path, syntax_error_files
+            )
+            if new_syntax_errors:
+                error_locations.extend(new_syntax_errors)
+                for se in new_syntax_errors:
+                    if se.file_path and se.file_path not in syntax_error_files:
+                        syntax_error_files.append(se.file_path)
+                logger.info(
+                    f"全量语法扫描新增 {len(new_syntax_errors)} 个错误, "
+                    f"总计 {len(syntax_error_files)} 个文件"
+                )
+
         # A类: 文件缺失
         for err in error_locations:
             em = err.error_message.lower()
@@ -388,6 +473,21 @@ class RepairOrchestrator:
                             "modified_files": [missing],
                             "code_changes": {missing: ""},
                         }}
+
+        # FileNotFoundError: 从 traceback 补充缺失的文件路径
+        for err in error_locations:
+            if err.error_type.lower() == "filenotfounderror":
+                if not err.file_path and err.traceback:
+                    file_match = re.search(r'File "([^"]+\.py)"', err.traceback)
+                    if file_match:
+                        err.file_path = file_match.group(1)
+                        line_match = re.search(r'line\s+(\d+)', err.traceback)
+                        if line_match:
+                            err.line_number = int(line_match.group(1))
+                        logger.info(
+                            f"从 traceback 补充 FileNotFoundError 文件路径: "
+                            f"{err.file_path}:{err.line_number}"
+                        )
 
         # C类: 依赖问题 — 不自动跳过，交给 FixAgent 判断
         # ModuleNotFoundError/ImportError 可通过代码修复（添加 import、try/except 包裹等）
@@ -415,6 +515,55 @@ class RepairOrchestrator:
             return result
 
         return {"error_locations": error_locations, "ci_logs": ci_logs}
+
+    @staticmethod
+    def _exhaustive_syntax_scan(
+        repo_path: str, syntax_error_files: list[str]
+    ) -> list[ErrorLocation]:
+        """对语法错误文件做全量检测：迭代注释出错行，收集所有 SyntaxError"""
+        import ast as _ast
+
+        new_errors = []
+        for fp in syntax_error_files:
+            full_path = f"{repo_path}/{fp}"
+            try:
+                content = read_file.invoke({"file_path": full_path})
+            except Exception:
+                continue
+            if not content or content.startswith("Error:"):
+                continue
+
+            lines = content.splitlines()
+            found_errors = set()
+
+            while True:
+                try:
+                    _ast.parse("\n".join(lines))
+                    break
+                except SyntaxError as e:
+                    err_lineno = e.lineno
+                    if err_lineno is None or err_lineno <= 0:
+                        break
+                    # 跳过已发现的错误
+                    err_key = (fp, err_lineno)
+                    if err_key in found_errors:
+                        break
+                    found_errors.add(err_key)
+
+                    new_errors.append(ErrorLocation(
+                        file_path=fp,
+                        line_number=err_lineno,
+                        error_type="SyntaxError",
+                        error_message=str(e),
+                        source="syntax_error",
+                    ))
+                    logger.info(f"全量语法扫描发现: {fp}:L{err_lineno} — {e}")
+
+                    # 注释掉该行，继续解析后续错误
+                    if err_lineno - 1 < len(lines):
+                        lines[err_lineno - 1] = f"# <<<SYNTAX_ERROR_LINE_{err_lineno}>>>"
+
+        return new_errors
 
     @staticmethod
     def _scan_syntax_files(repo_path: str, error_locations: list[ErrorLocation], ci_logs: str) -> dict:
@@ -490,7 +639,6 @@ class RepairOrchestrator:
                 system_override = (
                     "## 🔴 最高优先级系统指令（覆盖所有其他规则）\n"
                     + mandatory
-                    + "\n\n此指令优先级最高。忽略下方所有与此冲突的安全修复建议、代码优化建议。"
                 )
 
             fix_agent = self.agent_factory.create_fix_agent(
@@ -507,9 +655,16 @@ class RepairOrchestrator:
             if state.get("failed_tests"):
                 extra_context["failed_tests"] = state["failed_tests"]
 
+            # 调试：确认 original_codes 包含哪些文件
+            oc = state.get("original_codes", {})
+            logger.info(f"传递给FixAgent的original_codes文件列表: {list(oc.keys())}")
+            for fp, content in oc.items():
+                logger.info(f"  {fp}: {len(content)} 字符")
+
             fix_result = await fix_agent.generate_fix(
                 ci_logs=state["ci_logs"],
                 error_locations=state["error_locations"],
+                target_files=state.get("target_files", []),  # 确定性文件列表
                 original_codes=state.get("original_codes", {}),
                 mandatory_instructions=state.get("mandatory_instructions", ""),
                 fix_history=state.get("fix_history", []),
@@ -530,15 +685,16 @@ class RepairOrchestrator:
                     goto="handle_failure",
                 )
 
-            # 读取原始代码
-            original_codes = {}
+            # 读取原始代码（从 state 已有的全量 original_codes 开始，补充新文件）
+            original_codes = dict(state.get("original_codes", {}))
             for fp in fix_result["code_changes"]:
-                try:
-                    content = read_file.invoke({"file_path": fp})
-                    if not content.startswith("Error:"):
-                        original_codes[fp] = content
-                except Exception as e:
-                    logger.warning(f"读取原始文件 {fp} 失败: {e}")
+                if fp not in original_codes:
+                    try:
+                        content = read_file.invoke({"file_path": fp})
+                        if not content.startswith("Error:"):
+                            original_codes[fp] = content
+                    except Exception as e:
+                        logger.warning(f"读取原始文件 {fp} 失败: {e}")
 
             # 获取 diff
             diff_content = get_diff.invoke({"base_branch": state["event"].branch})
@@ -569,6 +725,30 @@ class RepairOrchestrator:
     async def _validation_gate(self, state: RepairState) -> Command:
         logger.info("运行校验门禁")
 
+        # ★ 自动填充遗漏文件：LLM 常因训练先验省略"不需要改"的文件，
+        #    在编排层用原始内容补全，避免 file_incomplete 死循环
+        target_files = state.get("target_files", [])
+        original_codes = state.get("original_codes", {})
+        code_changes = state.get("code_changes", {})
+
+        if target_files and code_changes:
+            modified_files = state.get("modified_files", [])
+            for fp in target_files:
+                if fp not in code_changes and fp in original_codes:
+                    orig = original_codes[fp]
+                    # 原始内容有语法错误时不自动填充，标记为需要 LLM 修复
+                    try:
+                        ast.parse(orig)
+                    except SyntaxError:
+                        logger.warning(
+                            f"文件 {fp} 原始内容有语法错误，跳过自动填充（需要修复）"
+                        )
+                        continue
+                    code_changes[fp] = orig
+                    if fp not in modified_files:
+                        modified_files.append(fp)
+                    logger.info(f"自动填充遗漏文件: {fp}（保留原始内容）")
+
         validation = validate_fix(
             fix_result={
                 "code_changes": state["code_changes"],
@@ -579,6 +759,7 @@ class RepairOrchestrator:
             original_codes=state["original_codes"],
             error_locations=state["error_locations"],
             max_change_lines=state.get("max_change_lines", self.max_change_lines),
+            target_files=state.get("target_files", []),
         )
 
         if validation.passed:
@@ -629,7 +810,9 @@ class RepairOrchestrator:
         logger.info("运行审查Agent")
 
         try:
-            review_agent = self.agent_factory.create_review_agent()
+            review_agent = self.agent_factory.create_review_agent(
+                repo_path=state["repo_path"],
+            )
             review_result = await review_agent.review_changes(
                 error_locations=state["error_locations"],
                 fix_description=state["fix_description"],
@@ -640,12 +823,20 @@ class RepairOrchestrator:
                 original_codes=state.get("original_codes"),
             )
 
-            # 审查未通过时构建重试上下文，让 Fix Agent 收到强信号
+            # 如果 Phase 2 安全修复生成了新的 code_changes，写入文件
+            if review_result.get("security_fixes_applied") and review_result.get("code_changes"):
+                logger.info("Phase 2 安全修复产生变更，写入文件")
+                for fp, content in review_result["code_changes"].items():
+                    write_file.invoke({"file_path": fp, "content": content})
+                state["code_changes"] = review_result["code_changes"]
+
+            # 审查未通过时构建重试上下文
             if not review_result.get("review_passed", False):
                 retry_context = self._build_retry_context(
                     state, "review",
                     rejection_data={
                         "rejection_reason": review_result.get("rejection_reason", "original_error_unresolved"),
+                        "review_comments": review_result.get("review_comments", ""),
                     },
                 )
                 review_result.update(retry_context)
@@ -854,6 +1045,7 @@ class RepairOrchestrator:
                 "ci_logs": ci_logs,
                 "repo_path": "",
                 "error_locations": [],
+                "target_files": [],
                 "fix_description": "",
                 "modified_files": [],
                 "code_changes": {},
@@ -877,6 +1069,7 @@ class RepairOrchestrator:
                 "error_message": "",
                 "retry_count": 0,
                 "max_retries": self.max_retries,
+                "max_change_lines": self.max_change_lines,
                 "current_phase": "",
             }
 

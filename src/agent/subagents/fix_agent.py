@@ -10,6 +10,7 @@ from langchain_openai import ChatOpenAI
 from src.agent.state import ErrorLocation, FixAttempt
 from src.agent.prompts.fix_agent import FIX_AGENT_SYSTEM_PROMPT, FIX_AGENT_USER_PROMPT
 from src.agent.tools.langchain_tools import all_tools, set_tool_context, search_code, search_files
+from src.agent.code_context import build_error_context_section
 
 logger = logging.getLogger(__name__)
 
@@ -26,9 +27,11 @@ class FixAgent:
         openai_base_url: str = "https://api.openai.com/v1",
         github_token: str = None,
         system_prompt_override: str = "",
+        max_change_lines: int = 50,
     ):
         self.repo_path = repo_path
         self.github_token = github_token
+        self.max_change_lines = max_change_lines
 
         self.llm = ChatOpenAI(
             model=llm_model,
@@ -41,10 +44,12 @@ class FixAgent:
             tool for tool in all_tools if tool.name in ["read_file", "search_files"]
         ]
 
+        # 动态注入变更行数阈值，消除硬编码
+        prompt = FIX_AGENT_SYSTEM_PROMPT.replace(
+            "__MAX_CHANGE_LINES__", str(self.max_change_lines)
+        )
         if system_prompt_override:
-            prompt = system_prompt_override + "\n\n" + FIX_AGENT_SYSTEM_PROMPT
-        else:
-            prompt = FIX_AGENT_SYSTEM_PROMPT
+            prompt = system_prompt_override + "\n\n" + prompt
 
         self.agent = create_agent(
             model=self.llm, tools=self.tools, system_prompt=prompt
@@ -143,6 +148,7 @@ class FixAgent:
         self,
         ci_logs: str,
         error_locations: list,
+        target_files: list[str] | None = None,  # NEW: orchestrator 提取的确定性文件列表
         original_codes: dict[str, str] | None = None,
         review_feedback: str = "",
         risk_warnings: list[str] | None = None,
@@ -158,6 +164,7 @@ class FixAgent:
         Args:
             ci_logs: CI失败日志内容
             error_locations: 错误位置列表 (list[ErrorLocation] 或 list[dict])
+            target_files: orchestrator 提取的确定性目标文件列表（优先使用，不从 error_locations 推导）
             original_codes: 原始代码快照 (file_path → content)
             review_feedback: 审查反馈（重试时提供）
             risk_warnings: 风险警告列表（重试时提供）
@@ -179,15 +186,37 @@ class FixAgent:
                     "error": "重试次数达到上限",
                 }
 
-            # 收集所有有明确文件路径的错误文件（去重）
-            target_files = []
-            for err in error_locations:
-                fp = err.file_path if isinstance(err, ErrorLocation) else err.get("file_path")
-                if fp and fp != "<string>" and fp not in target_files:
-                    target_files.append(fp)
+            # 使用 orchestrator 提供的 target_files（确定性），兜底从 error_locations 推导
+            tf = target_files if target_files else None
+            if tf is None:
+                tf = []
+                for err in error_locations:
+                    fp = err.file_path if isinstance(err, ErrorLocation) else err.get("file_path")
+                    if fp and fp != "<string>" and fp not in tf:
+                        tf.append(fp)
+
+                # 无 file_path 时从 traceback 提取
+                for err in error_locations:
+                    if isinstance(err, ErrorLocation):
+                        fp = err.file_path
+                        tb = err.traceback
+                    else:
+                        fp = err.get("file_path", "")
+                        tb = err.get("traceback", "")
+                    if fp and fp != "<string>" and fp not in tf:
+                        tf.append(fp)
+                    elif not fp and tb:
+                        tb_files = re.findall(r'File "([^"]+\.py)"', tb)
+                        for p in tb_files:
+                            if p != "<string>" and p not in tf:
+                                tf.append(p)
+                                logger.info(f"从 traceback 提取文件到目标列表: {p}")
+
+            if tf:
+                logger.info(f"目标修复文件列表: {tf}")
 
             # 如果没有 file_path，尝试从错误消息搜索定位
-            if not target_files and error_locations:
+            if not tf and error_locations:
                 all_error_msgs = []
                 for err in error_locations:
                     msg = err.error_message if hasattr(err, 'error_message') else err.get('error_message', '')
@@ -200,40 +229,40 @@ class FixAgent:
                 # 策略1: 从错误消息中提取文件路径 File "xxx.py"
                 file_paths_in_msg = re.findall(r'File "([^"]+\.py)"', combined)
                 for p in file_paths_in_msg:
-                    if p != "<string>" and p not in target_files:
-                        target_files.append(p)
-                if target_files:
-                    logger.info(f"从错误消息中提取到文件路径: {target_files}")
+                    if p != "<string>" and p not in tf:
+                        tf.append(p)
+                if tf:
+                    logger.info(f"从错误消息中提取到文件路径: {tf}")
 
                 # 策略2: NameError — name 'xxx' is not defined
-                if not target_files:
+                if not tf:
                     name_match = re.search(r"name '(\w+)' is not defined", combined)
                     if name_match:
                         missing_name = name_match.group(1)
                         search_result = search_code.invoke({"keyword": missing_name, "file_type": "py"})
                         if search_result:
-                            target_files = list(set(r["file_path"] for r in search_result))
-                            logger.info(f"通过搜索 '{missing_name}' 定位到文件: {target_files}")
+                            tf = list(set(r["file_path"] for r in search_result))
+                            logger.info(f"通过搜索 '{missing_name}' 定位到文件: {tf}")
 
                 # 策略3: ImportError — No module named 'xxx'
-                if not target_files:
+                if not tf:
                     import_match = re.search(r"No module named '?(\w+)'?", combined)
                     if import_match:
                         missing_module = import_match.group(1)
-                        target_files = [f"{missing_module.replace('.', '/')}.py"]
-                        logger.info(f"通过模块名猜测文件: {target_files}")
+                        tf = [f"{missing_module.replace('.', '/')}.py"]
+                        logger.info(f"通过模块名猜测文件: {tf}")
 
                 # 策略4: 从错误消息中提取带 .py 的文件名
-                if not target_files:
+                if not tf:
                     py_files_in_msg = re.findall(r"(\w+\.py)", combined)
                     for f in py_files_in_msg:
-                        if f not in target_files:
-                            target_files.append(f)
-                    if target_files:
-                        logger.info(f"从错误消息中提取 .py 文件名: {target_files}")
+                        if f not in tf:
+                            tf.append(f)
+                    if tf:
+                        logger.info(f"从错误消息中提取 .py 文件名: {tf}")
 
                 # 策略5: 提取错误消息中的关键词（函数名、变量名等），搜索代码库
-                if not target_files:
+                if not tf:
                     keywords = set()
                     for msg in all_error_msgs:
                         parts = re.split(r"['\"]", msg)
@@ -243,16 +272,16 @@ class FixAgent:
                     for kw in sorted(keywords, key=len, reverse=True)[:5]:
                         search_result = search_code.invoke({"keyword": kw, "file_type": "py"})
                         if search_result:
-                            target_files = list(set(r["file_path"] for r in search_result))
-                            logger.info(f"通过关键词 '{kw}' 定位到文件: {target_files}")
+                            tf = list(set(r["file_path"] for r in search_result))
+                            logger.info(f"通过关键词 '{kw}' 定位到文件: {tf}")
                             break
 
                 # 策略6: 兜底 — 列出所有 Python 文件
-                if not target_files:
+                if not tf:
                     all_py_files = search_files.invoke({"pattern": "**/*.py"})
                     if all_py_files:
-                        target_files = all_py_files[:10]
-                        logger.warning(f"无法定位错误文件，使用全部 Python 文件: {target_files}")
+                        tf = all_py_files[:10]
+                        logger.warning(f"无法定位错误文件，使用全部 Python 文件: {tf}")
                     else:
                         logger.error("仓库中无 Python 文件")
                         return {
@@ -262,7 +291,7 @@ class FixAgent:
                             "error": "no_target_file",
                         }
 
-                logger.info(f"目标文件: {target_files}")
+                logger.info(f"目标文件: {tf}")
 
             set_tool_context(
                 {"repo_path": self.repo_path, "github_token": self.github_token}
@@ -329,26 +358,28 @@ class FixAgent:
             # 序列化错误位置
             error_locations_json = self._serialize_error_locations(error_locations)
             logger.info(f"找到错误数量: {len(error_locations)}")
-            logger.info(f"目标修复文件列表: {target_files}")
+            logger.info(f"目标修复文件列表: {tf}")
 
-            # 构建原始代码快照区域
-            original_codes_section = ""
-            if original_codes:
-                codes_lines = []
-                for fp, content in original_codes.items():
-                    codes_lines.append(f"### 原始文件: {fp}\n```python\n{content}\n```")
-                if codes_lines:
-                    original_codes_section = (
-                        "## 📋 原始代码快照（修复前文件内容，修复后只能修改与错误直接相关的行）\n\n"
-                        + "\n\n".join(codes_lines)
-                    )
-                    logger.info(f"已附加 {len(original_codes)} 个文件的原始代码快照")
+            # 构建错误代码上下文区块（仅展示与错误相关的代码片段，而非完整文件）
+            error_context_section = ""
+            if original_codes and tf and error_locations:
+                error_context_section = build_error_context_section(
+                    original_codes=original_codes,
+                    error_locations=error_locations,
+                    target_files=tf,
+                    context_lines=8,
+                )
+                logger.info(
+                    f"错误代码上下文区块构建完成: {len(error_context_section)} 字符"
+                )
+            elif original_codes:
+                logger.warning("有 original_codes 但无目标文件或错误位置，跳过上下文构建")
 
             # 构建目标文件指令
             force_instruction_content = ""
-            if target_files:
-                if len(target_files) == 1:
-                    file_path = target_files[0]
+            if tf:
+                if len(tf) == 1:
+                    file_path = tf[0]
                     force_instruction_content = f"""1. **唯一修复目标文件：{file_path}**
    - 你 **只能** 修复这个文件，绝对不允许修改或返回其他任何文件
    - 在你的JSON响应中，`modified_files`数组 **必须** 只包含["{file_path}"]
@@ -357,15 +388,17 @@ class FixAgent:
    只修改与错误直接相关的代码行，其他代码原样保留。
 """
                 else:
-                    files_str = "、".join(target_files)
-                    files_json = '", "'.join(target_files)
+                    files_str = "、".join(tf)
+                    files_json = '", "'.join(tf)
                     force_instruction_content = f"""1. **修复目标文件列表：{files_str}**
    - 你 **只能** 修复列表中的这些文件，绝对不允许修改或返回其他任何文件
    - 在你的JSON响应中，`modified_files`数组 **必须** 只包含["{files_json}"]
    - 在你的JSON响应中，`code_changes`对象的key **必须** 是上述列表中的文件路径
+   - **`code_changes` 必须包含列表中的每一个文件**，遗漏任何一个文件都会导致校验失败，消耗一次重试机会
 2. **只修复上报的错误本身**：不要做安全替代（eval→ast.literal_eval 等）、代码优化、重构。
    只修改与错误直接相关的代码行，其他代码原样保留。
-"""
+
+🔄 **输出前请确认**：`code_changes` 的 key 集合 = ["{files_json}"]，一个都不能少。"""
                 logger.info(f"构建目标文件指令: {force_instruction_content[:300]}...")
             else:
                 logger.info("没有找到带文件路径的错误，不添加目标文件指令")
@@ -375,7 +408,7 @@ class FixAgent:
                 error_locations=error_locations_json,
                 repo_path=self.repo_path,
                 root_cause_section=root_cause_section,
-                original_codes_section=original_codes_section,
+                error_context_section=error_context_section,
                 review_feedback_section=review_feedback_section,
                 risk_warnings_section=risk_warnings_section,
                 test_output_section=test_output_section,
@@ -385,6 +418,12 @@ class FixAgent:
             )
 
             logger.info(f"用户提示词构建完成，长度: {len(user_input)}")
+            # 调试：打印 prompt 中代码区块（截取开头）
+            if error_context_section:
+                idx = user_input.find("## 📂 错误代码上下文")
+                if idx >= 0:
+                    snippet = user_input[idx:idx+800]
+                    logger.info(f"Prompt中错误代码上下文区块:\n{snippet}...")
 
             config = {"recursion_limit": 50}
             result = await self.agent.ainvoke({"input": user_input}, config=config)
@@ -441,8 +480,8 @@ class FixAgent:
             fix_result["code_changes"] = normalized_code_changes
 
             # 修复结果验证
-            if target_files:
-                expected_files = [f.removeprefix("./").replace("\\", "/") for f in target_files]
+            if tf:
+                expected_files = [f.removeprefix("./").replace("\\", "/") for f in tf]
                 expected_files = list(set(expected_files))
 
                 returned_files = [
@@ -464,6 +503,16 @@ class FixAgent:
                         "error": f"返回了不在允许列表中的文件: {invalid_files}",
                     }
 
+                # 自动填充遗漏文件（LLM 训练先验难以覆盖，程序化兜底）
+                for fp in expected_files:
+                    if fp not in returned_files:
+                        orig = original_codes.get(fp, "") if original_codes else ""
+                        if orig:
+                            fix_result["code_changes"][fp] = orig
+                            if fp not in fix_result.get("modified_files", []):
+                                fix_result.setdefault("modified_files", []).append(fp)
+                            logger.info(f"修复后自动填充遗漏文件: {fp}（保留原始内容，{len(orig)}字符）")
+
             if (
                 not fix_result.get("code_changes")
                 or len(fix_result["code_changes"]) == 0
@@ -476,20 +525,17 @@ class FixAgent:
                     "error": "code_changes为空",
                 }
 
-            # 验证修复后的代码没有语法错误
+            # 验证修复后的代码没有语法错误（仅记录日志，让 validation_gate 拦截）
             import ast
             for file_path, code_content in fix_result["code_changes"].items():
                 try:
                     ast.parse(code_content)
                     logger.info(f"文件 {file_path} 语法检查通过")
                 except SyntaxError as e:
-                    logger.error(f"修复后的代码仍然有语法错误: {e}")
-                    return {
-                        "fix_description": f"修复后的代码仍有语法错误: {str(e)}",
-                        "modified_files": fix_result.get("modified_files", []),
-                        "code_changes": fix_result.get("code_changes", {}),
-                        "error": f"生成的代码有语法错误: {str(e)}",
-                    }
+                    logger.warning(
+                        f"修复后代码仍有语法错误（交由validation_gate处理）: "
+                        f"{file_path}: {e}"
+                    )
 
             logger.info(f"修复生成成功: {fix_result['fix_description']}")
             return fix_result

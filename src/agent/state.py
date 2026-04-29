@@ -83,6 +83,7 @@ class RepairState(BaseModel):
 
     # --- 上下文层 ---
     error_locations: list[ErrorLocation] = []
+    target_files: list[str] = Field(default_factory=list)  # 由 orchestrator 从 error_locations 提取的确定性文件列表
     original_codes: dict[str, str] = {}
 
     # --- 修复层 ---

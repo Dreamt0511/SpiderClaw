@@ -1,4 +1,4 @@
-"""安全规则单一权威源 — FixAgent/ReviewAgent/TestAgent 全部引用此文件"""
+"""安全规则单一权威源 — ReviewAgent 专用引用，FixAgent 不再包含安全内容"""
 
 from pydantic import BaseModel
 
@@ -266,11 +266,11 @@ def get_patterns_list(rules: list[SecurityRule]) -> list[str]:
     return [r.pattern for r in rules]
 
 
-def get_fix_agent_security_section() -> str:
-    """生成 FixAgent 提示词中的安全操作识别与规避部分"""
+def get_review_agent_security_section() -> str:
+    """生成 ReviewAgent Phase 2 安全修复提示词中的安全操作部分"""
     lines = [
-        "## 安全敏感操作识别与规避",
-        "修复时请注意以下安全敏感模式，在完成主要错误修复后应顺手替换安全风险。",
+        "## 需要修复的安全风险",
+        "以下是 ReviewAgent 静态检查发现的残留安全风险，请使用 write_file 工具修复。",
         "",
         "| 危险模式 | 风险等级 | 安全替代方案 |",
         "|---------|---------|------------|",
@@ -279,8 +279,8 @@ def get_fix_agent_security_section() -> str:
         lines.append(f"| `{rule.pattern}` | {rule.severity} | {rule.safe_alternative} |")
     lines.append("")
     lines.append("### 修复优先级（强制遵守）")
-    lines.append("1. **首要任务**：修复上报的 CI 错误（优先级最高，必须完成）")
-    lines.append("2. **次要任务**：上报错误修复完成后，顺手修复同文件中已有的安全问题")
-    lines.append("3. **禁止因小失大**：不得因修改安全问题而影响对主要错误的修复")
-    lines.append("4. **同一个 diff**：安全修改和错误修复在同一个 diff 中一起返回")
+    lines.append("1. **仅修复安全问题**：只修复 listed_risks 中列出的安全问题，不修改无关代码")
+    lines.append("2. **不得修改 FixAgent 的修复结果**：对已修复的文件，仅在与安全问题重叠的行做修改")
+    lines.append("3. **新文件新增修复**：如果安全问题在未修改的文件中，直接修复")
+    lines.append("4. **行数预算**：总修改行数不得超过 __MAX_CHANGE_LINES__ 行的剩余预算")
     return "\n".join(lines)

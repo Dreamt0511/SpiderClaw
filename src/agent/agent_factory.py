@@ -38,15 +38,18 @@ class AgentFactory:
             openai_base_url=self.config.openai_base_url,
             github_token=self.config.github_token,
             system_prompt_override=system_prompt_override,
+            max_change_lines=self.config.max_change_lines,
         )
 
-    def create_review_agent(self) -> ReviewAgent:
+    def create_review_agent(self, repo_path: str = "") -> ReviewAgent:
         return ReviewAgent(
             llm_model=self.config.llm_model,
             temperature=self.config.review_temperature,
             openai_api_key=self.config.openai_api_key,
             openai_base_url=self.config.openai_base_url,
             max_change_lines=self.config.max_change_lines,
+            repo_path=repo_path,
+            github_token=self.config.github_token,
         )
 
     def create_test_agent(self, repo_path: str) -> TestAgent:

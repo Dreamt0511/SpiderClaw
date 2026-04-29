@@ -14,7 +14,9 @@ INSTRUCTION_TEMPLATES = {
 
     "syntax_line_violation": (
         "🚨 强制性指令：你只能修改第 {error_lines} 行及其上下各3行的范围。"
-        "禁止修改此范围之外的任何代码。再次越界则修复直接失败。"
+        "禁止修改此范围之外的任何代码。再次越界则修复直接失败。\n"
+        "本次必须修复的目标文件列表：{target_files}。"
+        "所有目标文件都必须包含在 code_changes 中（一个都不能少）。"
     ),
 
     "func_body_modified": (
@@ -26,8 +28,10 @@ INSTRUCTION_TEMPLATES = {
     # === ReviewAgent 拒绝 ===
 
     "original_error_unresolved": (
-        "🚨 强制性指令：原始错误 {error_type} 在 {file_path}:L{line_number} 仍未被修复。"
-        "你必须精准定位到该位置处理此错误。不得修改其他无关代码。"
+        "🚨 强制性指令：审查Agent发现以下原始错误仍未被修复：\n"
+        "{review_detail}\n\n"
+        "你必须精准定位到上述问题位置，逐一处理。已修复正确的代码禁止回退或修改。\n"
+        "再次忽略此指令则修复直接失败。"
     ),
 
     "new_bug_introduced": (
@@ -45,6 +49,26 @@ INSTRUCTION_TEMPLATES = {
     "test_failure": (
         "🚨 强制性指令：你的修复导致 {n} 个测试失败：{failed_tests}。"
         "请回退引起新测试失败的修改，仅保留对原始错误的最小修复。"
+    ),
+
+    # === Gate 拒绝：变更行数超限 ===
+    "change_limit_exceeded": (
+        "🚨 强制性指令：上次修复修改了 {actual_changes} 行，超过上限 {max_allowed} 行。\n"
+        "本次必须严格限制修改范围：\n"
+        "1. 只修复 CI 日志中的实际错误，禁止任何安全改进\n"
+        "2. 禁止 eval→ast.literal_eval、os.system→subprocess 等安全替代\n"
+        "3. 禁止硬编码密钥提取等安全优化\n"
+        "4. 总计修改行数不超过 {max_allowed} 行，单个文件修改不超过 10 行\n"
+        "再次越界则修复直接失败。"
+    ),
+
+    "file_incomplete": (
+        "🚨 强制性指令：你遗漏了以下目标文件：{missing_files}。\n"
+        "本次修复的 `code_changes` 必须包含上述所有文件（一个都不能少）。\n"
+        "**被遗漏的文件也必须修复**，不允许仅用原始内容填充。\n"
+        "你必须调用 read_file 读取遗漏文件的当前内容，分析其中的错误并进行修复。\n"
+        "如果再次遗漏则修复直接失败。\n"
+        "全部目标文件列表：{all_target_files}。"
     ),
 
     # === ValidationGate 其他 ===
