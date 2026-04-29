@@ -77,7 +77,6 @@ def read_file(file_path: str) -> str:
 def write_file(file_path: str, content: str) -> str:
     """
     写入内容到指定文件。
-    权限: ORCHESTRATOR_ONLY
 
     只能写入当前工作目录下的文件，不允许访问系统其他目录。
     如果文件已存在会被覆盖。

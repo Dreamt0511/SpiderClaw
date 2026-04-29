@@ -289,6 +289,7 @@ async def send_repair_notification(
     pr_author: str = "未知用户",
     bug_count: int = 0,
     original_pr_url: str = "",
+    change_lines: int = 0,
 ) -> bool:
     """
     发送修复结果通知（使用飞书卡片格式）
@@ -333,7 +334,7 @@ async def send_repair_notification(
                 {
                     "tag": "div",
                     "fields": [
-                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**错误类型**\n{error_type}"}},
+                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**变更行数**\n{change_lines} 行"}},
                         {"is_short": True, "text": {"tag": "lark_md", "content": f"**分支**\n{source_branch}"}}
                     ]
                 },
@@ -382,7 +383,7 @@ async def send_repair_notification(
                 {
                     "tag": "div",
                     "fields": [
-                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**错误类型**\n{error_type}"}},
+                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**变更行数**\n{change_lines} 行"}},
                         {"is_short": True, "text": {"tag": "lark_md", "content": f"**分支**\n{source_branch}"}}
                     ]
                 }

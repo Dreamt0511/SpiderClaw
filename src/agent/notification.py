@@ -23,16 +23,17 @@ class NotificationService:
         self.enabled = enabled
         self.notify_users = notify_users or []
 
-    def send_pr_created(self, state: RepairState, pr_url: str = "") -> None:
+    def send_pr_created(self, state: RepairState, pr_url: str = "", diff_content: str = "") -> None:
         """发送 PR 创建成功通知"""
         if not self.enabled or not self.notify_users:
             return
 
-        error_types = list({
-            e.error_type if hasattr(e, 'error_type') else e.get('error_type', 'Unknown')
-            for e in state.error_locations
-        })
-        error_type_str = ', '.join(error_types)
+        raw_diff = diff_content or state.diff_content or ""
+        change_lines = 0
+        if raw_diff:
+            adds = len([l for l in raw_diff.split('\n') if l.startswith('+') and not l.startswith('+++')])
+            deletes = len([l for l in raw_diff.split('\n') if l.startswith('-') and not l.startswith('---')])
+            change_lines = adds + deletes
 
         event = state.event
         pr_author = (
@@ -72,7 +73,7 @@ class NotificationService:
             asyncio.create_task(
                 send_repair_notification(
                     repair_success=True,
-                    error_type=error_type_str,
+                    error_type="",
                     source_branch=branch,
                     pr_url=pr_url,
                     original_pr_url=original_pr_url,
@@ -81,6 +82,7 @@ class NotificationService:
                     receive_id_type="open_id",
                     pr_author=pr_author,
                     bug_count=bug_count,
+                    change_lines=change_lines,
                 )
             )
 
@@ -89,11 +91,11 @@ class NotificationService:
         if not self.enabled or not self.notify_users:
             return
 
-        error_types = list({
-            e.error_type if hasattr(e, 'error_type') else e.get('error_type', 'Unknown')
-            for e in state.error_locations
-        })
-        error_type_str = ', '.join(error_types) if error_types else 'Unknown'
+        change_lines = 0
+        if state.diff_content:
+            adds = len([l for l in state.diff_content.split('\n') if l.startswith('+') and not l.startswith('+++')])
+            deletes = len([l for l in state.diff_content.split('\n') if l.startswith('-') and not l.startswith('---')])
+            change_lines = adds + deletes
 
         event = state.event
         pr_author = (
@@ -120,7 +122,7 @@ class NotificationService:
             asyncio.create_task(
                 send_repair_notification(
                     repair_success=False,
-                    error_type=error_type_str,
+                    error_type="",
                     source_branch=branch,
                     pr_url="",
                     fix_description=state.fix_description or '修复失败',
@@ -129,11 +131,12 @@ class NotificationService:
                     error_message=state.error_message,
                     pr_author=pr_author,
                     bug_count=bug_count,
+                    change_lines=change_lines,
                 )
             )
 
     @staticmethod
-    def build_pr_body(state: RepairState, branch_name: str) -> str:
+    def build_pr_body(state: RepairState, branch_name: str, diff_content: str = "") -> str:
         """构建 PR 正文"""
         event = state.event
 
@@ -159,10 +162,11 @@ class NotificationService:
         validation_method = state.validation_method
         validation_command = state.validation_command
 
+        raw_diff = diff_content or state.diff_content or ""
         change_lines = 0
-        if state.diff_content:
-            adds = len([l for l in state.diff_content.split('\n') if l.startswith('+') and not l.startswith('+++')])
-            deletes = len([l for l in state.diff_content.split('\n') if l.startswith('-') and not l.startswith('---')])
+        if raw_diff:
+            adds = len([l for l in raw_diff.split('\n') if l.startswith('+') and not l.startswith('+++')])
+            deletes = len([l for l in raw_diff.split('\n') if l.startswith('-') and not l.startswith('---')])
             change_lines = adds + deletes
 
         if validation_status == 'success':
@@ -268,7 +272,7 @@ class NotificationService:
 
 ## 代码Diff
 ```diff
-{state.diff_content}
+{raw_diff}
 ```
 </details>
 

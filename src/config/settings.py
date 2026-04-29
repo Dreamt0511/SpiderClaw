@@ -35,7 +35,7 @@ class AgentConfig(BaseModel):
     """Agent配置"""
     enabled: bool = Field(default=False, description="是否启用自动修复功能")
     max_retries: int = Field(default=3, description="最大修复重试次数")
-    max_change_lines: int = Field(default=20, description="最大允许变更行数")
+    max_change_lines: int = Field(default=50, description="最大允许变更行数")
     auto_create_pr: bool = Field(default=True, description="是否自动创建PR")
     require_human_approval: bool = Field(default=False, description="创建PR前是否需要人工审批")
 

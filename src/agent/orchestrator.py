@@ -912,13 +912,23 @@ class RepairOrchestrator:
             )
             if commit_result.startswith("Error:"):
                 return {"success": False, "error_message": f"提交变更失败: {commit_result}"}
+            if commit_result.startswith("Warning:"):
+                logger.warning(f"按文件列表提交失败，改用 git add -A: {commit_result}")
+                commit_result = commit_changes.invoke(
+                    {"message": commit_message, "files": None}
+                )
+                if commit_result.startswith("Error:"):
+                    return {"success": False, "error_message": f"提交变更失败(A): {commit_result}"}
+
+            # 提交后获取真实 diff（修复前 diff_content 在文件写入前捕获，始终为空）
+            real_diff = get_diff.invoke({"base_branch": event.branch})
 
             set_tool_context({"repo_path": state["repo_path"], "github_token": self.github_token})
 
             if push_branch.invoke({"branch_name": branch_name}) != "Success":
                 return {"success": False, "error_message": "推送分支失败"}
 
-            pr_body = self.notification.build_pr_body(state, branch_name)
+            pr_body = self.notification.build_pr_body(state, branch_name, diff_content=real_diff)
 
             pr_author_title = event.payload.get('sender', {}).get('login', '未知用户')
             pr_title = f"[SpiderClaw: fix]：对 {pr_author_title} 的 PR 进行的修复"
@@ -933,8 +943,8 @@ class RepairOrchestrator:
 
             if not pr_url.startswith("Error:"):
                 pr_number = int(pr_url.split("/")[-1]) if pr_url else 0
-                self.notification.send_pr_created(state, pr_url)
-                return {"pr_url": pr_url, "pr_number": pr_number, "success": True}
+                self.notification.send_pr_created(state, pr_url, diff_content=real_diff)
+                return {"pr_url": pr_url, "pr_number": pr_number, "success": True, "diff_content": real_diff}
             else:
                 return {"success": False, "error_message": pr_url}
 
