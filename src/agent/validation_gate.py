@@ -289,7 +289,8 @@ def _check_func_scope(
 ) -> ValidationResult:
     """函数级错误：修改必须在出错函数 AST 节点内
 
-    例外：NameError 允许在模块级添加 import 语句（这是正确修复方式）
+    用新代码的 AST 判断修改行所属函数，避免插入行后行号偏移误判。
+    例外：NameError 允许在模块级添加 import 语句。
     """
     func_errors = [
         e for e in error_locations
@@ -309,40 +310,59 @@ def _check_func_scope(
             continue
 
         try:
-            orig_ast = ast.parse(orig)
+            new_ast = ast.parse(new_code)
         except SyntaxError:
             continue
+
+        changed_line_nums = _get_changed_line_numbers(orig, new_code)
 
         for e in func_errors:
             if e.get("file_path") != fp or e.get("line_number", 0) <= 0:
                 continue
 
-            func_node = _find_enclosing_function(orig_ast, e["line_number"])
-            if func_node is None:
+            # 在原始 AST 中找到出错函数（只获取函数名，不比较行号）
+            try:
+                orig_ast = ast.parse(orig)
+            except SyntaxError:
                 continue
-
-            changed_line_nums = _get_changed_line_numbers(orig, new_code)
-            func_start = func_node.lineno
-            func_end = _get_func_end(func_node)
+            orig_func = _find_enclosing_function(orig_ast, e["line_number"])
+            if orig_func is None:
+                continue
+            func_name = orig_func.name
 
             for changed_lineno in changed_line_nums:
-                if changed_lineno < func_start or changed_lineno > func_end:
-                    # NameError 允许在模块级添加 import 语句
-                    if is_name_err and changed_lineno < func_start:
-                        new_lines = new_code.splitlines()
-                        if 1 <= changed_lineno <= len(new_lines):
-                            changed_line = new_lines[changed_lineno - 1]
-                            if _is_import_line(changed_line):
-                                continue  # 允许：NameError 需要添加 import
+                # 在新 AST 中找到修改行所属的函数
+                enclosing = _find_enclosing_function(new_ast, changed_lineno)
+
+                if enclosing is None:
+                    # 模块级修改 — 仅 NameError 允许加 import
+                    new_lines = new_code.splitlines()
+                    changed_line = new_lines[changed_lineno - 1] if 1 <= changed_lineno <= len(new_lines) else ""
+                    if is_name_err and _is_import_line(changed_line):
+                        continue
                     logger.warning(
-                        f"函数范围越界: L{changed_lineno} 不在函数 {func_node.name} "
-                        f"范围 ({func_start}-{func_end})"
+                        f"函数范围越界: L{changed_lineno} 不在任何函数内 "
+                        f"（错误位于函数 {func_name}）"
                     )
                     return ValidationResult(
                         passed=False,
                         violation_type="func_body_modified",
-                        details=f"修改 L{changed_lineno} 超出函数 {func_node.name} 范围",
-                        error_context={"func_name": func_node.name},
+                        details=f"修改 L{changed_lineno} 是模块级代码，不在函数 {func_name} 范围内",
+                        error_context={"func_name": func_name},
+                    )
+
+                # 修改行在某个函数内 — 检查函数名是否匹配
+                if enclosing.name != func_name:
+                    logger.warning(
+                        f"函数范围越界: L{changed_lineno} 在函数 {enclosing.name} 中，"
+                        f"但错误位于函数 {func_name}"
+                    )
+                    return ValidationResult(
+                        passed=False,
+                        violation_type="func_body_modified",
+                        details=f"修改 L{changed_lineno} 属于函数 {enclosing.name}，"
+                                f"而非错误所在函数 {func_name}",
+                        error_context={"func_name": func_name},
                     )
 
     return ValidationResult(passed=True)
