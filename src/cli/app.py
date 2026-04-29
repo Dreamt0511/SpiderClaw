@@ -1,8 +1,6 @@
 """CLI主入口"""
 
-import sys
-import time
-import random
+import threading
 from typing import Optional
 from pathlib import Path
 import typer
@@ -20,53 +18,35 @@ console = Console()
 CONFIG_PATH = Path("src/config/agent-config.yaml")
 
 
-def print_banner():
-    """打印启动 Logo"""
-    console.clear()
-
-    # 占位 Logo — 请替换为实际 ASCII art
+def make_banner() -> Text:
+    """生成启动 Logo 与标题（返回 Text 供 Live 内渲染）。"""
     logo_placeholder = r"""
-                    ███      █████                             ████                           
-                   ░░░      ░░███                             ░░███                           
+                    ███      █████                             ████
+                   ░░░      ░░███                             ░░███
   █████  ████████  ████   ███████   ██████  ████████   ██████  ░███   ██████   █████ ███ █████
- ███░░  ░░███░░███░░███  ███░░███  ███░░███░░███░░███ ███░░███ ░███  ░░░░░███ ░░███ ░███░░███ 
-░░█████  ░███ ░███ ░███ ░███ ░███ ░███████  ░███ ░░░ ░███ ░░░  ░███   ███████  ░███ ░███ ░███ 
- ░░░░███ ░███ ░███ ░███ ░███ ░███ ░███░░░   ░███     ░███  ███ ░███  ███░░███  ░░███████████         
- ██████  ░███████  █████░░████████░░██████  █████    ░░██████  █████░░████████  ░░████░████   
-░░░░░░   ░███░░░  ░░░░░  ░░░░░░░░  ░░░░░░  ░░░░░      ░░░░░░  ░░░░░  ░░░░░░░░    ░░░░ ░░░░    
-         ░███                                                                                 
-         █████                                                                                
-        ░░░░░                  
-
+ ███░░  ░░███░░███░░███  ███░░███  ███░░███░░███░░███ ███░░███ ░███  ░░░░░███ ░░███ ░███░░███
+░░█████  ░███ ░███ ░███ ░███ ░███ ░███████  ░███ ░░░ ░███ ░░░  ░███   ███████  ░███ ░███ ░███
+ ░░░░███ ░███ ░███ ░███ ░███ ░███ ░███░░░   ░███     ░███  ███ ░███  ███░░███  ░░███████████
+ ██████  ░███████  █████░░████████░░██████  █████    ░░██████  █████░░████████  ░░████░████
+░░░░░░   ░███░░░  ░░░░░  ░░░░░░░░  ░░░░░░  ░░░░░      ░░░░░░  ░░░░░  ░░░░░░░░    ░░░░ ░░░░
+         ░███
+         █████
+        ░░░░░
     """
 
-    # 配色方案：暗夜蓝 + 冷灰 + 暗金点缀
-    logo_color = "#20d5f0"       # 主色调
-    ice = "#e8eef5"             # 冰白，用于标题文字
-    warm_gold = "#1ed3c1"       # 暗金点缀
-    muted_gray = "#7a8ba0"      # 中等灰，用于副文本
-    dim_gray = "#5a6b7c"        # 暗灰，用于提示
+    logo_color = "#20d5f0"
+    ice = "#e8eef5"
+    warm_gold = "#1ed3c1"
+    dim_gray = "#5a6b7c"
 
-    # Logo 主体用渐变蓝
-    logo = Text(logo_placeholder, style=logo_color)
-
-    # 标题
-    title = Text()
-    title.append("\n Welcome to ", style=ice)
-    title.append("SpiderClaw", style=f"bold {logo_color}")
-    title.append(" !  ", style=ice)
-    #下划线装饰
-    title.append("\n" + "─" * 36, style=warm_gold)
-
-    # 启动提示
-    tip = Text(
-        f"  SpiderClaw 已完成启动。按 Ctrl+C 退出。\n", style=dim_gray
-    )
-
-    console.print(logo)
-    console.print(title)
-    console.print()
-    console.print(tip)
+    banner = Text()
+    banner.append(logo_placeholder, style=logo_color)
+    banner.append("\n Welcome to ", style=ice)
+    banner.append("SpiderClaw", style=f"bold {logo_color}")
+    banner.append(" !  ", style=ice)
+    banner.append("\n" + "─" * 36, style=warm_gold)
+    banner.append("\n  SpiderClaw 已完成启动。按 Ctrl+C 退出。\n", style=dim_gray)
+    return banner
 
 def _setup_feishu():
     """飞书通知配置向导"""
@@ -191,12 +171,33 @@ def main(
     if config:
         CONFIG_PATH = Path(config)
 
-    # 打印启动 Logo 并启动 Webhook 服务（仅无子命令时）
+    # 打印启动 Logo 并启动全部服务（仅无子命令时）
     if ctx.invoked_subcommand is None:
-        print_banner()
+        # 后台启动 Webhook 服务
         from src.monitor.webhook_server import run_webhook_server
 
-        run_webhook_server(host=host, port=port, reload=reload)
+        webhook_thread = threading.Thread(
+            target=run_webhook_server,
+            kwargs={"host": host, "port": port, "reload": reload, "console_output": False},
+            daemon=True,
+        )
+        webhook_thread.start()
+
+        # 前台启动监控面板（banner + dashboard 统一在 Live 内渲染）
+        from src.monitor.dashboard import Dashboard
+        from src.monitor.dashboard.modules.log_module import LogModule
+        from src.monitor.dashboard.modules.node_module import NodeModule
+        from src.monitor.dashboard.modules.tool_module import ToolModule
+        from src.monitor.dashboard.modules.stats_module import StatsModule
+        from src.monitor.dashboard.modules.status_module import StatusModule
+
+        dash = Dashboard("logs/audit.jsonl", banner=make_banner())
+        dash.register(LogModule())
+        dash.register(NodeModule())
+        dash.register(ToolModule())
+        dash.register(StatsModule())
+        dash.register(StatusModule())
+        dash.run()
 
 
 @app.command("setup")
@@ -205,7 +206,7 @@ def setup_wizard():
     _setup_feishu()
 
 
-# 子命令（webhook.py 已做懒加载，模块级无重 imports）
+# 子命令
 from .commands.webhook import webhook_app
 
 app.add_typer(webhook_app, name="webhook", help="GitHub Webhook服务管理")

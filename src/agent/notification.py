@@ -8,6 +8,7 @@ from typing import Any
 
 from src.agent.state import RepairState
 from src.notify.lark_notify import send_repair_notification
+from src.utils.audit import audit_logger
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,8 @@ class NotificationService:
         """发送 PR 创建成功通知"""
         if not self.enabled or not self.notify_users:
             return
+
+        audit_logger.log_event("milestone", node="lark_notify", result="success", pr_url=pr_url)
 
         raw_diff = diff_content or state.diff_content or ""
         change_lines = 0
@@ -90,6 +93,8 @@ class NotificationService:
         """发送修复失败通知"""
         if not self.enabled or not self.notify_users:
             return
+
+        audit_logger.log_event("milestone", node="lark_notify", result="failure", error=state.error_message)
 
         change_lines = 0
         if state.diff_content:

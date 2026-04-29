@@ -3,8 +3,9 @@ import os
 import tempfile
 import subprocess
 import re
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Callable
 from langchain_core.tools import tool
+from langchain_core.runnables import RunnableConfig
 from git import Repo, GitCommandError
 import requests
 from requests.adapters import HTTPAdapter
@@ -1109,6 +1110,52 @@ def execute_python_code(file_path: str, timeout: int = 10) -> str:
             "error_line": 0,
         }, ensure_ascii=False)
 
+
+# ── 审计日志包装 ──
+
+from src.utils.audit import audit_logger
+
+
+def _wrap_tool(t, name=None):
+    """Wrap BaseTool._run with audit logging (tool_call / tool_result).
+
+    `BaseTool.run()` 通过 `_get_runnable_config_param()` 检查 _run 签名中
+    是否有 `config` 参数名来决定是否隐式传递 config。包装器必须显式声明
+    `config: RunnableConfig` 参数以保持检测链完整，然后透传给 orig_run。
+    """
+    tool_name = name or t.name
+    orig_run = t._run
+
+    def _run(*args, config: RunnableConfig, run_manager=None, **kwargs):
+        log_args = {k: v for k, v in kwargs.items()}
+        audit_logger.log_event("tool_call", tool=tool_name, args=log_args)
+        try:
+            result = orig_run(*args, config=config, run_manager=run_manager, **kwargs)
+            audit_logger.log_event("tool_result", tool=tool_name, result_summary=str(result)[:500])
+            return result
+        except Exception as e:
+            audit_logger.log_event("tool_result", tool=tool_name, result_summary=str(e)[:500], is_error=True)
+            raise
+
+    t._run = _run
+    return t
+
+
+# 包装所有工具（在 _run 级别注入审计日志）
+read_file = _wrap_tool(read_file)
+write_file = _wrap_tool(write_file)
+search_files = _wrap_tool(search_files)
+search_code = _wrap_tool(search_code)
+clone_repository = _wrap_tool(clone_repository)
+create_branch = _wrap_tool(create_branch)
+commit_changes = _wrap_tool(commit_changes)
+get_diff = _wrap_tool(get_diff)
+download_ci_logs = _wrap_tool(download_ci_logs)
+parse_python_errors = _wrap_tool(parse_python_errors)
+run_tests = _wrap_tool(run_tests)
+push_branch = _wrap_tool(push_branch)
+create_pull_request = _wrap_tool(create_pull_request)
+execute_python_code = _wrap_tool(execute_python_code)
 
 # 导出所有工具
 all_tools = [

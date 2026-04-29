@@ -15,6 +15,7 @@ from rich.panel import Panel
 from rich.logging import RichHandler
 from .base import BaseMonitor
 from src.bus import GitHubEvent, EventBus
+from src.utils.audit import audit_logger
 
 # 强制启用颜色输出，即使输出到非终端
 console = Console(force_terminal=True, color_system="auto")
@@ -186,6 +187,7 @@ class GitHubWebhookMonitor(BaseMonitor):
                     return {"status": "ignored", "reason": f"pull_request action '{event.action}' does not trigger repair"}
                 # PR事件不需要检查conclusion，保留用于获取PR编号和分支信息
                 logger.info(f"Accepted pull_request event: {event_id}, action: {event.action}, pr_number: {event.pr_number}")
+                audit_logger.log_event("milestone", node="webhook_event", event_type="pull_request", event_id=event_id, pr_number=event.pr_number)
 
             elif event_type == "workflow_run":
                 # workflow_run 事件只处理 failure
@@ -193,6 +195,7 @@ class GitHubWebhookMonitor(BaseMonitor):
                     logger.info(f"Ignoring workflow_run event: {event_id}, conclusion: {event.conclusion}")
                     return {"status": "ignored", "reason": f"workflow_run conclusion '{event.conclusion}' is not failure"}
                 logger.info(f"Accepted workflow_run event: {event_id}, conclusion: {event.conclusion}")
+                audit_logger.log_event("milestone", node="webhook_event", event_type="workflow_run", event_id=event_id)
 
             elif event_type == "check_run":
                 # check_run 事件只处理 failure
@@ -202,6 +205,11 @@ class GitHubWebhookMonitor(BaseMonitor):
                 logger.info(f"Accepted check_run event: {event_id}, conclusion: {event.conclusion}")
 
             # 发布事件到总线
+            audit_logger.log_event(
+                "system_action",
+                action=f"收到 {event_type} 事件: {event.repository}#{event.pr_number}",
+                event_id=event_id,
+            )
             publish_success = await self.publish_event(event)
             if not publish_success:
                 raise HTTPException(status_code=503, detail="Service busy, please retry later")
@@ -345,6 +353,7 @@ def run_webhook_server(
     port: int = 8000,
     reload: bool = False,
     secret: Optional[str] = None,
+    console_output: bool = True,
 ) -> None:
     """同步方式启动Webhook服务（用于CLI直接调用）"""
     from src.config.settings import get_settings
@@ -362,7 +371,7 @@ def run_webhook_server(
     log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)
 
-    # 文件日志
+    # 文件日志（主日志，自动轮转）
     file_handler = TimedRotatingFileHandler(
         os.path.join(log_dir, "spiderclaw.log"),
         when="midnight",
@@ -376,19 +385,44 @@ def run_webhook_server(
             datefmt="%Y-%m-%d %H:%M:%S",
         )
     )
-    file_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(logging.INFO)
 
-    # 控制台日志
-    console_handler = RichHandler(
-        show_time=True, show_level=True, show_path=False, markup=True
+    # 详细日志（保存到 src/logs/detail.log，不与 dashboard 共享）
+    src_log_dir = os.path.join("src", "logs")
+    os.makedirs(src_log_dir, exist_ok=True)
+    detail_handler = TimedRotatingFileHandler(
+        os.path.join(src_log_dir, "detail.log"),
+        when="midnight",
+        interval=1,
+        backupCount=30,
+        encoding="utf-8",
     )
+    detail_handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s:%(lineno)d\n%(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    detail_handler.setLevel(logging.DEBUG)
 
-    logging.basicConfig(
-        level="INFO",
-        format="%(message)s",
-        datefmt="[%X]",
-        handlers=[console_handler, file_handler],
-    )
+    # 控制台日志（dashboard 模式下不输出到终端，避免抢显）
+    if console_output:
+        console_handler = RichHandler(
+            show_time=True, show_level=True, show_path=False, markup=True
+        )
+        console_handler.setLevel(logging.INFO)
+        logging.root.addHandler(console_handler)
+    else:
+        # 抑制 uvicorn 自身的控制台输出
+        for uvi_logger in ("uvicorn", "uvicorn.error", "uvicorn.access", "uvicorn.asgi"):
+            uvi = logging.getLogger(uvi_logger)
+            uvi.handlers.clear()
+            uvi.setLevel(logging.WARNING)
+
+    # 直接添加 handler（比 logging.basicConfig 更可靠，不受线程竞争影响）
+    logging.root.addHandler(file_handler)
+    logging.root.addHandler(detail_handler)
+    logging.root.setLevel(logging.DEBUG)
 
     settings = get_settings()
 
@@ -431,21 +465,22 @@ def run_webhook_server(
         except Exception as e:
             log.warning(f"初始化修复编排器失败: {e}，自动修复功能已禁用")
 
-    # 显示启动面板
-    repair_status = "[green]已启用[/green]" if orchestrator else "[dim]未启用[/dim]"
-    console.print(Panel(
-        f"[bold #ffffff]SpiderClaw 总监控服务已启动[/bold #ffffff]\n\n"
-        f"监听地址: [bold #20d5f0]http://{host}:{port}[/bold #20d5f0]\n"
-        f"Webhook端点: [bold #20d5f0]/webhook/github[/bold #20d5f0]\n"
-        f"健康检查: [bold #20d5f0]/health[/bold #20d5f0]\n"
-        f"允许事件: [bold #20d5f0]{', '.join(settings.webhook.allowed_events)}[/bold #20d5f0]\n"
-        f"自动修复: [bold #20d5f0]{repair_status}[/bold #20d5f0]\n\n"
-        f"[#5a6b7c]备注：开发环境下可以使用 ngrok http 8000 来暴露服务，方便外部访问[#5a6b7c]\n",
-        title="[bold #20d5f0]SpiderClaw 运行中[/bold #20d5f0]",
-        border_style="#20d5f0",
-        padding=(1, 2)
-    ))
-    console.print()
+    # 显示启动面板（dashboard 模式不重复输出）
+    if console_output:
+        repair_status = "[green]已启用[/green]" if orchestrator else "[dim]未启用[/dim]"
+        console.print(Panel(
+            f"[bold #ffffff]SpiderClaw 总监控服务已启动[/bold #ffffff]\n\n"
+            f"监听地址: [bold #20d5f0]http://{host}:{port}[/bold #20d5f0]\n"
+            f"Webhook端点: [bold #20d5f0]/webhook/github[/bold #20d5f0]\n"
+            f"健康检查: [bold #20d5f0]/health[/bold #20d5f0]\n"
+            f"允许事件: [bold #20d5f0]{', '.join(settings.webhook.allowed_events)}[/bold #20d5f0]\n"
+            f"自动修复: [bold #20d5f0]{repair_status}[/bold #20d5f0]\n\n"
+            f"[#5a6b7c]备注：开发环境下可以使用 ngrok http 8000 来暴露服务，方便外部访问[#5a6b7c]\n",
+            title="[bold #20d5f0]SpiderClaw 运行中[/bold #20d5f0]",
+            border_style="#20d5f0",
+            padding=(1, 2)
+        ))
+        console.print()
 
     async def event_consumer():
         """事件消费循环"""
@@ -484,6 +519,7 @@ def run_webhook_server(
         await asyncio.gather(*tasks, return_exceptions=True)
 
     try:
+        audit_logger.log_event("milestone", node="service_start")
         asyncio.run(_run())
     except KeyboardInterrupt:
         log.info("Webhook server stopped by user")

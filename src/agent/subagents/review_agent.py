@@ -20,6 +20,7 @@ from src.agent.security_rules import SecurityRule, CRITICAL_RULES, HIGH_RULES, M
 from src.agent.state import ErrorLocation
 from src.agent.tools import set_tool_context
 from src.agent.tools.langchain_tools import read_file, write_file
+from src.utils.audit import AuditCallbackHandler
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,7 @@ class ReviewAgent:
             temperature=temperature,
             api_key=openai_api_key,
             base_url=openai_base_url,
+            callbacks=[AuditCallbackHandler("审查Agent")],
         )
         self.system_prompt = REVIEW_AGENT_SYSTEM_PROMPT
 

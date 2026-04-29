@@ -11,6 +11,7 @@ from src.agent.state import ErrorLocation, FixAttempt
 from src.agent.prompts.fix_agent import FIX_AGENT_SYSTEM_PROMPT, FIX_AGENT_USER_PROMPT
 from src.agent.tools.langchain_tools import all_tools, set_tool_context, search_code, search_files
 from src.agent.code_context import build_error_context_section
+from src.utils.audit import AuditCallbackHandler
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ class FixAgent:
             temperature=temperature,
             api_key=openai_api_key,
             base_url=openai_base_url,
+            callbacks=[AuditCallbackHandler("修复Agent")],
         )
 
         self.tools = [

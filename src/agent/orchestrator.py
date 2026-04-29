@@ -30,6 +30,7 @@ from src.agent.tools import (
 )
 from src.agent.tools.langchain_tools import read_file, write_file
 from src.bus.schemas import GitHubEvent
+from src.utils.audit import audit_logger
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +211,7 @@ class RepairOrchestrator:
     # ==================== 节点: collect_context ====================
 
     async def _collect_context(self, state: RepairState) -> dict[str, Any]:
+        audit_logger.log_event("node_enter", node="collect_context")
         event: GitHubEvent = state["event"]
         logger.info(f"收集上下文: {event.event_id}, 仓库: {event.repository}")
 
@@ -612,6 +614,7 @@ class RepairOrchestrator:
     # ==================== 节点: fix_agent ====================
 
     async def _run_fix_agent(self, state: RepairState) -> Command:
+        audit_logger.log_event("node_enter", node="fix_agent")
         logger.info("运行修复Agent")
 
         # 依赖/环境错误不需要代码修复，直接结束
@@ -723,6 +726,7 @@ class RepairOrchestrator:
     # ==================== 节点: validation_gate ====================
 
     async def _validation_gate(self, state: RepairState) -> Command:
+        audit_logger.log_event("node_enter", node="validation_gate")
         logger.info("运行校验门禁")
 
         # ★ 自动填充遗漏文件：LLM 常因训练先验省略"不需要改"的文件，
@@ -807,6 +811,7 @@ class RepairOrchestrator:
     # ==================== 节点: review_changes ====================
 
     async def _review_changes(self, state: RepairState) -> dict[str, Any]:
+        audit_logger.log_event("node_enter", node="review_changes")
         logger.info("运行审查Agent")
 
         try:
@@ -856,6 +861,7 @@ class RepairOrchestrator:
     # ==================== 节点: run_tests ====================
 
     async def _run_tests(self, state: RepairState) -> dict[str, Any]:
+        audit_logger.log_event("node_enter", node="run_tests")
         logger.info("运行测试Agent")
 
         try:
@@ -894,6 +900,7 @@ class RepairOrchestrator:
     # ==================== 节点: create_pr ====================
 
     async def _create_pull_request(self, state: RepairState) -> dict[str, Any]:
+        audit_logger.log_event("node_enter", node="create_pr")
         event: GitHubEvent = state["event"]
         logger.info(f"创建PR: {event.repository}")
 
@@ -955,6 +962,7 @@ class RepairOrchestrator:
     # ==================== 节点: handle_failure ====================
 
     async def _handle_failure(self, state: RepairState) -> dict[str, Any]:
+        audit_logger.log_event("node_enter", node="handle_failure")
         error_msg = state.get("error_message", "未知错误")
         logger.error(f"修复流程失败: {error_msg}")
 
@@ -1047,6 +1055,8 @@ class RepairOrchestrator:
 
     async def run(self, event: GitHubEvent, ci_logs: str = "") -> dict[str, Any]:
         """运行修复流程"""
+        audit_logger.log_event("system_action", action="修复流程启动", event_id=event.event_id, model_name=self.agent_factory.config.llm_model)
+        audit_logger.log_event("milestone", node="repair_start", event_id=event.event_id)
         logger.info(f"启动修复流程: {event.event_id}")
 
         try:
@@ -1085,6 +1095,16 @@ class RepairOrchestrator:
 
             final_state = await self.graph.ainvoke(initial_state)
 
+            audit_logger.log_event(
+                "system_action", action="修复流程完成",
+                success=final_state["success"],
+                pr_url=final_state.get("pr_url", ""),
+            )
+            audit_logger.log_event(
+                "milestone", node="repair_complete",
+                success=final_state["success"],
+                pr_url=final_state.get("pr_url", ""),
+            )
             logger.info(f"修复流程完成: 成功={final_state['success']}")
             if final_state.get("pr_url"):
                 logger.info(f"PR地址: {final_state['pr_url']}")
