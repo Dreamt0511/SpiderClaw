@@ -17,6 +17,7 @@ from src.agent.agent_factory import AgentFactory, AgentConfig
 from src.agent.validation_gate import validate_fix
 from src.agent.instruction_templates import generate_instruction
 from src.agent.notification import NotificationService
+from src.notify.lark_base import init_lark_base, report_repair_record, ensure_table_ready
 from src.agent.tools import (
     set_tool_context,
     clone_repository,
@@ -49,6 +50,11 @@ def _all_import_errors(error_locations: list) -> bool:
 class RepairOrchestrator:
     """修复流程编排器"""
 
+    # 事件源 → 多维表表名映射（扩展时加在这里）
+    SOURCE_TABLE_MAP = {
+        "github_webhook": "github-PR修复",
+    }
+
     def __init__(
         self,
         github_token: str,
@@ -59,10 +65,20 @@ class RepairOrchestrator:
         max_change_lines: int = 50,
         lark_notify_enabled: bool = False,
         lark_notify_users: list[str] = None,
+        lark_base_enabled: bool = False,
+        lark_base_token: str = "",
+        lark_base_repair_table_id: str = "",
+        lark_as_bot: bool = False,
+        lark_auto_create_table: bool = True,
+        lark_auto_fix_fields: bool = True,
+        lark_alert_on_failure: bool = True,
+        lark_alert_threshold: int = 3,
+        environment: str = "development",
     ):
         self.github_token = github_token
         self.max_retries = max_retries
         self.max_change_lines = max_change_lines
+        self.environment = environment
 
         # Agent 配置
         agent_config = AgentConfig(
@@ -76,7 +92,24 @@ class RepairOrchestrator:
         self.notification = NotificationService(
             enabled=lark_notify_enabled,
             notify_users=lark_notify_users or [],
+            base_enabled=lark_base_enabled,
+            base_token=lark_base_token,
         )
+
+        # 初始化飞书多维表格客户端
+        if lark_base_enabled and lark_base_token:
+            init_lark_base(
+                base_token=lark_base_token,
+                repair_table_id=lark_base_repair_table_id,
+                as_bot=lark_as_bot,
+                auto_create_table=lark_auto_create_table,
+                auto_fix_fields=lark_auto_fix_fields,
+                alert_on_failure=lark_alert_on_failure,
+                alert_threshold=lark_alert_threshold,
+                notify_users=lark_notify_users,
+                notify_groups=[]  # 告警默认只发送给用户，不发送到群组
+            )
+            logger.info("飞书多维表格上报功能已启用")
 
         self.processed_events: set[str] = set()
         self.lock = asyncio.Lock()
@@ -320,6 +353,8 @@ class RepairOrchestrator:
         except Exception as e:
             logger.error(f"收集上下文失败: {e}", exc_info=True)
             return {"success": False, "error_message": f"收集上下文失败: {str(e)}"}
+        finally:
+            audit_logger.log_event("node_exit", node="collect_context")
 
     @staticmethod
     def _make_event_key(event: GitHubEvent) -> str:
@@ -722,6 +757,8 @@ class RepairOrchestrator:
                 update={"success": False, "error_message": f"修复Agent执行失败: {str(e)}"},
                 goto="handle_failure",
             )
+        finally:
+            audit_logger.log_event("node_exit", node="fix_agent")
 
     # ==================== 节点: validation_gate ====================
 
@@ -772,6 +809,7 @@ class RepairOrchestrator:
                 write_file.invoke({"file_path": fp, "content": content})
 
             logger.info("校验通过，进入审查")
+            audit_logger.log_event("node_exit", node="validation_gate")
             return Command(
                 update={"current_phase": "review"},
                 goto="review_changes",
@@ -790,6 +828,7 @@ class RepairOrchestrator:
         )
 
         if state["retry_count"] < state["max_retries"]:
+            audit_logger.log_event("node_exit", node="validation_gate")
             return Command(
                 update={
                     **retry_context,
@@ -799,6 +838,7 @@ class RepairOrchestrator:
                 goto="fix_agent",
             )
 
+        audit_logger.log_event("node_exit", node="validation_gate")
         return Command(
             update={
                 **retry_context,
@@ -857,6 +897,8 @@ class RepairOrchestrator:
                 "risk_level": "NONE",
                 "rejection_reason": "",
             }
+        finally:
+            audit_logger.log_event("node_exit", node="review_changes")
 
     # ==================== 节点: run_tests ====================
 
@@ -896,6 +938,8 @@ class RepairOrchestrator:
                 "test_output": f"测试执行失败: {str(e)}",
                 "failed_tests": [],
             }
+        finally:
+            audit_logger.log_event("node_exit", node="run_tests")
 
     # ==================== 节点: create_pr ====================
 
@@ -963,7 +1007,73 @@ class RepairOrchestrator:
 
             if not pr_url.startswith("Error:"):
                 pr_number = int(pr_url.split("/")[-1]) if pr_url else 0
-                self.notification.send_pr_created(state, pr_url, diff_content=real_diff)
+                # 根据事件源确定目标表名（先在通知前解析，供通知和上报使用）
+                table_name = self.SOURCE_TABLE_MAP.get(event.source, "修复记录")
+
+                # 提前缓存表ID，确保通知中的链接包含 ?table= 参数
+                await ensure_table_ready(table_name)
+
+                self.notification.send_pr_created(state, pr_url, diff_content=real_diff, table_name=table_name)
+
+                # 上报修复成功记录到多维表格
+                try:
+                    # 计算修复耗时
+                    start_time = state.get("start_time", datetime.datetime.now())
+                    repair_duration = (datetime.datetime.now() - start_time).total_seconds()
+
+                    # 提取错误类型
+                    error_type = "Unknown"
+                    if state.error_locations:
+                        first = state.error_locations[0]
+                        error_type = first.error_type if hasattr(first, 'error_type') else first.get('error_type', 'Unknown')
+
+                    # 计算变更行数
+                    change_lines = 0
+                    if real_diff:
+                        adds = len([l for l in real_diff.split('\n') if l.startswith('+') and not l.startswith('+++')])
+                        deletes = len([l for l in real_diff.split('\n') if l.startswith('-') and not l.startswith('---')])
+                        change_lines = adds + deletes
+
+                    # 修复文件数
+                    file_count = len(state.modified_files) or 0
+
+                    # PR作者
+                    pr_author = event.payload.get('sender', {}).get('login', '未知用户')
+
+                    # 原PR链接
+                    original_pr_url = ""
+                    if event.repository and hasattr(event, 'pr_number') and event.pr_number:
+                        original_pr_url = f"https://github.com/{event.repository}/pull/{event.pr_number}"
+
+                    # 环境映射
+                    env_map = {
+                        "development": "开发",
+                        "testing": "测试",
+                        "production": "生产"
+                    }
+                    environment = env_map.get(self.environment, "开发")
+
+                    await report_repair_record(
+                        error_type=error_type,
+                        repo_name=event.repository,
+                        branch_name=event.branch,
+                        pr_author=pr_author,
+                        original_pr_url=original_pr_url,
+                        fix_pr_url=pr_url,
+                        repair_success=True,
+                        fix_description=state.fix_description,
+                        error_message="",
+                        file_count=file_count,
+                        change_lines=change_lines,
+                        repair_duration=repair_duration,
+                        retry_count=state.get("retry_count", 0),
+                        token_usage=state.get("total_token_usage", 0),
+                        environment=environment,
+                        table_name=table_name,
+                    )
+                except Exception as e:
+                    logger.error(f"上报修复记录失败: {e}", exc_info=True)
+
                 return {"pr_url": pr_url, "pr_number": pr_number, "success": True, "diff_content": real_diff}
             else:
                 return {"success": False, "error_message": pr_url}
@@ -971,6 +1081,8 @@ class RepairOrchestrator:
         except Exception as e:
             logger.error(f"创建PR失败: {e}", exc_info=True)
             return {"success": False, "error_message": f"创建PR失败: {str(e)}"}
+        finally:
+            audit_logger.log_event("node_exit", node="create_pr")
 
     # ==================== 节点: handle_failure ====================
 
@@ -979,7 +1091,94 @@ class RepairOrchestrator:
         error_msg = state.get("error_message", "未知错误")
         logger.error(f"修复流程失败: {error_msg}")
 
-        self.notification.send_failure(state)
+        # 根据事件源确定目标表名（先在通知前解析，供通知和上报使用）
+        event = state.event
+        table_name = self.SOURCE_TABLE_MAP.get(event.source, "修复记录")
+
+        # 提前缓存表ID，确保通知中的链接包含 ?table= 参数
+        await ensure_table_ready(table_name)
+
+        self.notification.send_failure(state, table_name=table_name)
+
+        # 上报修复失败记录到多维表格
+        try:
+            # 计算修复耗时
+            start_time = state.get("start_time", datetime.datetime.now())
+            repair_duration = (datetime.datetime.now() - start_time).total_seconds()
+
+            # 提取错误类型
+            error_type = "Unknown"
+            if state.error_locations:
+                first = state.error_locations[0]
+                error_type = first.error_type if hasattr(first, 'error_type') else first.get('error_type', 'Unknown')
+
+            # 计算变更行数
+            change_lines = 0
+            if state.diff_content:
+                adds = len([l for l in state.diff_content.split('\n') if l.startswith('+') and not l.startswith('+++')])
+                deletes = len([l for l in state.diff_content.split('\n') if l.startswith('-') and not l.startswith('---')])
+                change_lines = adds + deletes
+
+            # 修复文件数
+            file_count = len(state.modified_files) or 0
+
+            # PR作者
+            pr_author = (
+                event.payload.get('sender', {}).get('login', '未知用户')
+                if isinstance(event, object) and hasattr(event, 'payload')
+                else event.get('payload', {}).get('sender', {}).get('login', '未知用户')
+                if isinstance(event, dict)
+                else '未知用户'
+            )
+
+            # 仓库名称和分支
+            repo_name = (
+                event.repository if isinstance(event, object) and hasattr(event, 'repository')
+                else event.get('repository', '') if isinstance(event, dict)
+                else ''
+            )
+            branch_name = (
+                event.branch if isinstance(event, object) and hasattr(event, 'branch')
+                else event.get('branch', '') if isinstance(event, dict)
+                else ''
+            )
+
+            # 原PR链接
+            original_pr_url = ""
+            if repo_name and hasattr(event, 'pr_number') and event.pr_number:
+                original_pr_url = f"https://github.com/{repo_name}/pull/{event.pr_number}"
+
+            # 环境映射
+            env_map = {
+                "development": "开发",
+                "testing": "测试",
+                "production": "生产"
+            }
+            environment = env_map.get(self.environment, "开发")
+
+            await report_repair_record(
+                error_type=error_type,
+                repo_name=repo_name,
+                branch_name=branch_name,
+                pr_author=pr_author,
+                original_pr_url=original_pr_url,
+                fix_pr_url=state.get("pr_url", ""),
+                repair_success=False,
+                fix_description=state.get("fix_description", ""),
+                error_message=error_msg,
+                file_count=file_count,
+                change_lines=change_lines,
+                repair_duration=repair_duration,
+                retry_count=state.get("retry_count", 0),
+                token_usage=state.get("total_token_usage", 0),
+                environment=environment,
+                table_name=table_name,
+            )
+        except Exception as e:
+            logger.error(f"上报失败记录失败: {e}", exc_info=True)
+        finally:
+            audit_logger.log_event("node_exit", node="handle_failure")
+
         return {"success": False, "error_message": error_msg}
 
     # ==================== 路由 ====================
@@ -1068,6 +1267,7 @@ class RepairOrchestrator:
 
     async def run(self, event: GitHubEvent, ci_logs: str = "") -> dict[str, Any]:
         """运行修复流程"""
+        start_time = datetime.datetime.now()
         audit_logger.log_event("system_action", action="修复流程启动", event_id=event.event_id, model_name=self.agent_factory.config.llm_model)
         audit_logger.log_event("milestone", node="repair_start", event_id=event.event_id)
         logger.info(f"启动修复流程: {event.event_id}")
@@ -1097,6 +1297,8 @@ class RepairOrchestrator:
                 "fix_history": [],
                 "mandatory_instructions": "",
                 "pr_url": "",
+                "start_time": start_time,
+                "total_token_usage": 0,  # 总token消耗，后续可在agent调用时累加
                 "pr_number": 0,
                 "success": False,
                 "error_message": "",

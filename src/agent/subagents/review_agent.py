@@ -688,7 +688,7 @@ class ReviewAgent:
                 try:
                     fix_result = json.loads(output)
                 except (json.JSONDecodeError, TypeError):
-                    logger.warning("Phase 2 Agent 未调用 write_file 且输出非 JSON 格式，跳过")
+                    logger.info("Phase 2 Agent 未调用 write_file 且输出非 JSON 格式，跳过")
                     return {"fixes_applied": False}
 
             if not fix_result.get("code_changes"):

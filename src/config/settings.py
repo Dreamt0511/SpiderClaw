@@ -62,6 +62,16 @@ class LarkConfig(BaseModel):
     app_secret: str = Field(default="", description="飞书应用密钥")
     notify_users: list[str] = Field(default_factory=list, description="需要通知的用户open_id列表")
     notify_groups: list[str] = Field(default_factory=list, description="需要通知的群组chat_id列表")
+    # 多维表格配置
+    base_enabled: bool = Field(default=False, description="是否启用飞书多维表格数据上报")
+    base_token: str = Field(default="", description="飞书多维表格token")
+    repair_table_id: str = Field(default="", description="修复记录表ID")
+    auto_create_table: bool = Field(default=True, description="表不存在时是否自动创建修复记录表")
+    auto_fix_fields: bool = Field(default=True, description="字段缺失时是否自动补全字段")
+    as_bot: bool = Field(default=False, description="是否以机器人身份操作（需要将机器人添加到base协作成员）")
+    # 告警配置
+    alert_on_failure: bool = Field(default=True, description="上报失败时是否发送告警通知")
+    alert_threshold: int = Field(default=3, description="连续失败多少次后发送告警")
 
 
 class Settings(BaseSettings):

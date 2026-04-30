@@ -110,10 +110,26 @@ def start(
                 openai_base_url=settings.openai.base_url,
                 llm_model=settings.openai.model_name,
                 max_retries=settings.agent.max_retries,
-                max_change_lines=settings.agent.max_change_lines
+                max_change_lines=settings.agent.max_change_lines,
+                lark_notify_enabled=settings.lark.enabled,
+                lark_notify_users=settings.lark.notify_users,
+                lark_base_enabled=settings.lark.base_enabled,
+                lark_base_token=settings.lark.base_token,
+                lark_base_repair_table_id=settings.lark.repair_table_id,
+                lark_as_bot=settings.lark.as_bot,
+                lark_auto_create_table=settings.lark.auto_create_table,
+                lark_auto_fix_fields=settings.lark.auto_fix_fields,
+                lark_alert_on_failure=settings.lark.alert_on_failure,
+                lark_alert_threshold=settings.lark.alert_threshold,
+                environment=settings.environment
             )
+            logger.info("✅ 修复编排器初始化成功，自动修复功能已启用")
         except Exception as e:
-            console.print(f"[yellow]警告: 初始化修复编排器失败: {e}，自动修复功能已禁用[/yellow]")
+            import traceback
+            error_details = traceback.format_exc()
+            console.print(f"[red]错误: 初始化修复编排器失败: {e}，自动修复功能已禁用[/red]")
+            console.print(f"[yellow]详细错误信息: {error_details}[/yellow]")
+            logger.error(f"初始化修复编排器失败: {e}\n{error_details}")
 
     async def event_consumer():
         """事件消费循环"""

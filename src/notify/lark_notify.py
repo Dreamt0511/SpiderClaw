@@ -4,6 +4,7 @@
 import asyncio
 import json
 import subprocess
+import sys
 from typing import Dict, Any, Optional
 import logging
 
@@ -231,8 +232,9 @@ async def send_markdown_message(
     """
     try:
         # 构建命令参数
+        lark_cmd = "lark-cli.cmd" if sys.platform == "win32" else "lark-cli"
         cmd = [
-            "lark-cli.cmd", "im", "+messages-send",
+            lark_cmd, "im", "+messages-send",
             "--as", "bot" if as_bot else "user",
         ]
         # 根据ID类型选择参数
@@ -290,6 +292,7 @@ async def send_repair_notification(
     bug_count: int = 0,
     original_pr_url: str = "",
     change_lines: int = 0,
+    base_url: str = "",
 ) -> bool:
     """
     发送修复结果通知（使用飞书卡片格式）
@@ -361,6 +364,13 @@ async def send_repair_notification(
                 "url": original_pr_url,
                 "type": "default"
             })
+        if base_url:
+            actions.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "📊 查看数据统计"},
+                "url": base_url,
+                "type": "default"
+            })
         if actions:
             card_content["elements"].append({
                 "tag": "action",
@@ -404,18 +414,33 @@ async def send_repair_notification(
                 "content": f"**❌ 失败原因**\n{error_message}"
             })
 
-        # 添加PR链接（如果有）
+        # 添加操作按钮
+        actions = []
+        if original_pr_url:
+            actions.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "📋 查看原PR"},
+                "url": original_pr_url,
+                "type": "default"
+            })
         if pr_url:
+            actions.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "🔗 查看相关PR"},
+                "url": pr_url,
+                "type": "default"
+            })
+        if base_url:
+            actions.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "📊 查看数据统计"},
+                "url": base_url,
+                "type": "default"
+            })
+        if actions:
             card_content["elements"].append({
                 "tag": "action",
-                "actions": [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "🔗 查看相关PR"},
-                        "url": pr_url,
-                        "type": "default"
-                    }
-                ]
+                "actions": actions
             })
 
     # 添加页脚

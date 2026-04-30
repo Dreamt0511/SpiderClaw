@@ -7,6 +7,7 @@ from .lark_notify import (
     send_repair_notification
 )
 from .lark_register import register_lark_app, register_lark_app_sync
+from .lark_base import LarkBaseClient, init_lark_base, report_repair_record
 
 __all__ = [
     "generate_repair_notification",
@@ -15,5 +16,8 @@ __all__ = [
     "send_markdown_message",
     "send_repair_notification",
     "register_lark_app",
-    "register_lark_app_sync"
+    "register_lark_app_sync",
+    "LarkBaseClient",
+    "init_lark_base",
+    "report_repair_record"
 ]

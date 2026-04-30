@@ -121,3 +121,5 @@ class RepairState(BaseModel):
     max_retries: int = 3
     current_phase: str = ""          # 阶段追踪
     is_env_error: bool = False       # 环境/依赖错误标记，无需代码修复
+    start_time: Any = None           # 修复启动时间（datetime），用于计算修复耗时
+    total_token_usage: int = 0       # 总token消耗

@@ -18,19 +18,19 @@ DIM        = "#5a6b7c"     # 暗灰 — 时间戳、提示
 SUCCESS    = "#00ff88"     # 成功 / 工具结果
 ERROR      = "#ff4444"     # 错误 / 失败
 WARNING    = "#ffaa00"     # 警告 / 工具调用
-INFO       = PRIMARY       # 信息
+INFO       = ACCENT        # 信息（改用青绿色，避免和边框青蓝色撞色）
 DARK_BG    = "#0a0a1a"     # 深色背景
 
 # 事件类型 → 颜色映射
 EVENT_COLORS = {
-    "node_enter":    PRIMARY,
+    "node_enter":    ACCENT,    # 进入节点改用青绿色，和边框区分
     "node_exit":     ICE,
     "tool_call":     WARNING,
     "tool_result":   SUCCESS,
     "llm_call":      INFO,
     "llm_response":  ICE,
     "error":         ERROR,
-    "system_action": ACCENT,
+    "system_action": PRIMARY,   # 系统动作改用主色调青蓝色
     "app_log":       MUTED,
     "milestone":     ACCENT,
 }

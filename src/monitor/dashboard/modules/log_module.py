@@ -10,7 +10,7 @@ from rich.console import Console, RenderableType
 
 from ..base import MonitorModule
 from ..state import DashboardState
-from ..colors import EVENT_COLORS, EVENT_LABELS, DIM, PRIMARY, ERROR, WARNING, SUCCESS, ACCENT, ICE
+from ..colors import EVENT_COLORS, EVENT_LABELS, DIM, PRIMARY, ERROR, WARNING, SUCCESS, ACCENT, ICE, INFO
 
 console = Console()
 # 启动时固定的内容行数（不含边框和脚注），确保 Panel 高度恒定防抖动
@@ -56,7 +56,7 @@ class LogModule(MonitorModule):
                 elif re.search(r'\b(SUCCESS|成功|完成|启动)\b', summary):
                     summary_color = SUCCESS
                 elif re.search(r'\b(INFO|信息)\b', summary):
-                    summary_color = PRIMARY
+                    summary_color = INFO  # INFO现在是青绿色，避免和边框撞色
                 elif re.search(r'\b(DEBUG|调试)\b', summary):
                     summary_color = DIM
                 else:

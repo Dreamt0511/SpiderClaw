@@ -461,6 +461,11 @@ def run_webhook_server(
                 max_change_lines=settings.agent.max_change_lines,
                 lark_notify_enabled=settings.lark.enabled,
                 lark_notify_users=settings.lark.notify_users,
+                lark_base_enabled=settings.lark.base_enabled,
+                lark_base_token=settings.lark.base_token,
+                lark_base_repair_table_id=settings.lark.repair_table_id,
+                lark_as_bot=settings.lark.as_bot,
+                environment=settings.environment
             )
         except Exception as e:
             log.warning(f"初始化修复编排器失败: {e}，自动修复功能已禁用")

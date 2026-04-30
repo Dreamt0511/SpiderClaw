@@ -8,6 +8,7 @@ from typing import Any
 
 from src.agent.state import RepairState
 from src.notify.lark_notify import send_repair_notification
+from src.notify.lark_base import get_table_url
 from src.utils.audit import audit_logger
 
 logger = logging.getLogger(__name__)
@@ -20,11 +21,17 @@ class NotificationService:
         self,
         enabled: bool = False,
         notify_users: list[str] | None = None,
+        base_enabled: bool = False,
+        base_token: str = "",
     ):
         self.enabled = enabled
         self.notify_users = notify_users or []
+        self.base_enabled = base_enabled
+        self.base_token = base_token
+        # 构造多维表格访问链接
+        self.base_url = f"https://my.feishu.cn/base/{base_token}" if base_token else ""
 
-    def send_pr_created(self, state: RepairState, pr_url: str = "", diff_content: str = "") -> None:
+    def send_pr_created(self, state: RepairState, pr_url: str = "", diff_content: str = "", table_name: str = "") -> None:
         """发送 PR 创建成功通知"""
         if not self.enabled or not self.notify_users:
             return
@@ -73,6 +80,8 @@ class NotificationService:
             )
             original_pr_url = f"https://github.com/{repo}/pull/{pr_num}" if repo and pr_num else ""
 
+            base_url = get_table_url(self.base_token, table_name) if self.base_enabled and table_name else (self.base_url if self.base_enabled else "")
+
             asyncio.create_task(
                 send_repair_notification(
                     repair_success=True,
@@ -86,10 +95,11 @@ class NotificationService:
                     pr_author=pr_author,
                     bug_count=bug_count,
                     change_lines=change_lines,
+                    base_url=base_url,
                 )
             )
 
-    def send_failure(self, state: RepairState) -> None:
+    def send_failure(self, state: RepairState, table_name: str = "") -> None:
         """发送修复失败通知"""
         if not self.enabled or not self.notify_users:
             return
@@ -124,12 +134,26 @@ class NotificationService:
         )
 
         for user_id in self.notify_users:
+            # 构造原错误PR链接
+            repo = (
+                event.repository if isinstance(event, object) and hasattr(event, 'repository')
+                else event.get('repository', '') if isinstance(event, dict)
+                else ''
+            )
+            pr_num = (
+                event.pr_number if isinstance(event, object) and hasattr(event, 'pr_number')
+                else event.get('pr_number') if isinstance(event, dict)
+                else None
+            )
+            original_pr_url = f"https://github.com/{repo}/pull/{pr_num}" if repo and pr_num else ""
+
             asyncio.create_task(
                 send_repair_notification(
                     repair_success=False,
                     error_type="",
                     source_branch=branch,
-                    pr_url="",
+                    pr_url=state.get("pr_url", ""),
+                    original_pr_url=original_pr_url,  # 添加原始PR链接
                     fix_description=state.fix_description or '修复失败',
                     receive_id=user_id,
                     receive_id_type="open_id",
@@ -137,6 +161,7 @@ class NotificationService:
                     pr_author=pr_author,
                     bug_count=bug_count,
                     change_lines=change_lines,
+                    base_url=get_table_url(self.base_token, table_name) if self.base_enabled and table_name else (self.base_url if self.base_enabled else ""),
                 )
             )
 
