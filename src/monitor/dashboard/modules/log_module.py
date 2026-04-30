@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import re
+
 from rich.panel import Panel
 from rich.text import Text
 from rich.console import Console, RenderableType
 
 from ..base import MonitorModule
 from ..state import DashboardState
-from ..colors import EVENT_COLORS, EVENT_LABELS, DIM, PRIMARY, ERROR, WARNING, SUCCESS, ACCENT
+from ..colors import EVENT_COLORS, EVENT_LABELS, DIM, PRIMARY, ERROR, WARNING, SUCCESS, ACCENT, ICE
 
 console = Console()
 # 启动时固定的内容行数（不含边框和脚注），确保 Panel 高度恒定防抖动
@@ -41,16 +43,31 @@ class LogModule(MonitorModule):
             color = EVENT_COLORS.get(event, "white")
             label = EVENT_LABELS.get(event, event)
 
-            if event in ("app_log", "milestone"):
+            if event == "milestone":
                 text.append(f" {ts} ", style=DIM)
-                summary_color = color if event == "milestone" else "white"
+                text.append(summary, style=color)
+            elif event == "app_log":
+                text.append(f" {ts} ", style=DIM)
+                # 根据日志级别着色（只匹配大写级别，避免模块名误伤如 uvicorn.error）
+                if re.search(r'\b(ERROR|错误|失败|exception|traceback)\b', summary):
+                    summary_color = ERROR
+                elif re.search(r'\b(WARNING|警告)\b', summary):
+                    summary_color = WARNING
+                elif re.search(r'\b(SUCCESS|成功|完成|启动)\b', summary):
+                    summary_color = SUCCESS
+                elif re.search(r'\b(INFO|信息)\b', summary):
+                    summary_color = PRIMARY
+                elif re.search(r'\b(DEBUG|调试)\b', summary):
+                    summary_color = DIM
+                else:
+                    summary_color = ICE
                 text.append(summary, style=summary_color)
             else:
                 text.append(f" {ts} ", style=DIM)
                 text.append(f"{label:<12}", style=f"bold {color}")
                 if summary:
                     text.append(f" │ ", style=DIM)
-                    text.append(summary, style="white")
+                    text.append(summary, style=color)
             text.append("\n")
 
         # 空行补齐：shown 可能少于 visible，用空行填到 _HEIGHT 行

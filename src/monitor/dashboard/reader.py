@@ -31,6 +31,7 @@ class AuditReader:
         self._running = False
         self._threads: list[threading.Thread] = []
         self._node_enter_time: float | None = None
+        self._current_node_entry: dict | None = None
         self._app_log_path = app_log_path or Path("logs/spiderclaw.log")
 
     def start(self):
@@ -86,23 +87,23 @@ class AuditReader:
         if event == "node_enter":
             node = data.get("node", "")
             now = time.time()
-            duration = None
-            if self._node_enter_time is not None:
-                duration = now - self._node_enter_time
             self._node_enter_time = now
 
             friendly = NODE_ALIAS.get(node, node)
-            self.state.append_node_jump({
-                "ts": ts,
-                "to": friendly,
-                "duration": round(duration * 1000) if duration else None,
-            })
+            node_entry = {"ts": ts, "to": friendly, "duration": None}
+            self.state.append_node_jump(node_entry)
+            self._current_node_entry = node_entry
             self.state.update(current_node=friendly, agent_status="thinking")
             entry["summary"] = f"进入节点: {friendly}"
 
         elif event == "node_exit":
             node = data.get("node", "")
             friendly = NODE_ALIAS.get(node, node)
+            # 在离开节点时记录该节点的实际运行时长
+            if self._current_node_entry is not None and self._node_enter_time is not None:
+                elapsed = time.time() - self._node_enter_time
+                self._current_node_entry["duration"] = round(elapsed * 1000)
+                self._current_node_entry = None
             entry["summary"] = f"离开节点: {friendly}"
 
         elif event == "tool_call":
@@ -179,6 +180,14 @@ class AuditReader:
                 "duration": None,
             })
             entry["summary"] = friendly
+            # 修复流程完结时统计成功/失败次数
+            if node == "repair_complete":
+                if data.get("success"):
+                    with self.state.atomic():
+                        self.state.total_repair_success += 1
+                else:
+                    with self.state.atomic():
+                        self.state.total_repair_failures += 1
 
     # ── spiderclaw.log 应用日志 ──
 

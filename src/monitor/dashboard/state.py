@@ -20,10 +20,12 @@ class DashboardState:
     events:       deque[dict] = field(default_factory=lambda: deque(maxlen=200))
 
     # ── 累计统计 ──
-    total_llm_calls:  int = 0
-    total_tool_calls: int = 0
-    total_errors:     int = 0
-    total_tokens:     int = 0
+    total_llm_calls:      int = 0
+    total_tool_calls:     int = 0
+    total_errors:         int = 0
+    total_tokens:         int = 0
+    total_repair_success: int = 0
+    total_repair_failures: int = 0
     start_time: datetime = field(default_factory=datetime.now)
 
     # ── 当前状态 ──
@@ -84,6 +86,8 @@ class DashboardState:
                 total_tool_calls=self.total_tool_calls,
                 total_errors=self.total_errors,
                 total_tokens=self.total_tokens,
+                total_repair_success=self.total_repair_success,
+                total_repair_failures=self.total_repair_failures,
                 start_time=self.start_time,
                 agent_status=self.agent_status,
                 current_node=self.current_node,

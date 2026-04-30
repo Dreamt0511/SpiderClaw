@@ -937,8 +937,21 @@ class RepairOrchestrator:
 
             pr_body = self.notification.build_pr_body(state, branch_name, diff_content=real_diff)
 
+            # 提取首个 error_type 使 PR 标题有区分度
+            error_locs = state.error_locations
+            if error_locs:
+                first = error_locs[0]
+                primary_error = first.error_type if hasattr(first, 'error_type') else first.get('error_type', 'Unknown')
+            else:
+                primary_error = 'Unknown'
+            # 截断 fix_description 到 40 字
+            raw_desc = state.fix_description or ''
+            short_desc = raw_desc[:40]
+            if len(raw_desc) > 40:
+                short_desc = short_desc[:37] + '...'
+
             pr_author_title = event.payload.get('sender', {}).get('login', '未知用户')
-            pr_title = f"[SpiderClaw: fix]：对 {pr_author_title} 的 PR 进行的修复"
+            pr_title = f"[SpiderClaw: fix] {primary_error} @{pr_author_title}: {short_desc}"
 
             pr_url = create_pull_request.invoke({
                 "repo_full_name": event.repository,
@@ -1113,6 +1126,10 @@ class RepairOrchestrator:
 
         except Exception as e:
             logger.error(f"修复流程异常: {e}", exc_info=True)
+            audit_logger.log_event(
+                "milestone", node="repair_complete",
+                success=False,
+            )
             return {"success": False, "error_message": f"修复流程异常: {str(e)}"}
 
     async def run_repair(self, event: GitHubEvent, ci_logs: str = "") -> dict[str, Any]:
