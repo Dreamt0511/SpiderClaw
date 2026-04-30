@@ -188,27 +188,33 @@ class AuditReader:
         if not self._running:
             return
 
-        with open(self._app_log_path, "r", encoding="utf-8", errors="replace") as f:
-            # 加载最近 5 行让面板启动即有内容
-            lines = f.readlines()
-            for line in lines[-5:]:
+        # 跳到文件末尾，只读取本次运行后的新日志（不持有文件句柄）
+        try:
+            with open(self._app_log_path, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(0, 2)
+                position = f.tell()
+        except OSError:
+            position = 0
+
+        # 轮询读取新行，每次读完释放文件句柄，避免阻塞日志轮转
+        while self._running:
+            try:
+                with open(self._app_log_path, "r", encoding="utf-8", errors="replace") as f:
+                    f.seek(position)
+                    lines = f.readlines()
+                    position = f.tell()
+            except OSError:
+                time.sleep(self.poll_interval)
+                continue
+
+            for line in lines:
                 line = line.rstrip("\n\r")
                 if line:
                     try:
                         self._parse_log_line(line)
                     except Exception:
                         continue
-            while self._running:
-                line = f.readline()
-                if not line:
-                    time.sleep(self.poll_interval)
-                    continue
-                line = line.rstrip("\n\r")
-                if line:
-                    try:
-                        self._parse_log_line(line)
-                    except Exception:
-                        continue
+            time.sleep(self.poll_interval)
 
     def _parse_log_line(self, line: str):
         """解析普通日志行（非 JSON），提取时间戳和消息。"""

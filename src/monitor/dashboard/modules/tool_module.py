@@ -12,50 +12,44 @@ from ..colors import PRIMARY, DIM, SUCCESS, ERROR, WARNING
 
 console = Console()
 
+# 固定内容行数（不含边框），确保 Panel 高度恒定防抖动
+_CONTENT_ROWS = max(4, min(8, (console.height or 30) - 28))
+
 
 class ToolModule(MonitorModule):
     name = "工具调用"
 
     def render(self, state: DashboardState) -> RenderableType:
         calls = list(state.tool_calls)
-        if not calls:
-            return Panel(
-                Table.grid(padding=(0, 1)),
-                title=f"[bold {PRIMARY}]工具调用[/]",
-                border_style=PRIMARY, padding=(0, 1),
-            )
-
-        # 根据终端高度估算可见行数
-        height = console.height or 30
-        visible = max(3, height - 28)
-
-        # 取尾部 visible 条（自动滚动到最新）
-        offset = 0
-        n = len(calls)
-        end = n - offset
-        start = max(0, end - visible)
-        shown = calls[start:end]
+        data_rows = _CONTENT_ROWS - 1  # 减去表头行
 
         table = Table(box=None, padding=(0, 1), expand=True)
         table.add_column("工具", overflow="fold")
         table.add_column("状态", width=8)
 
-        for tc in reversed(shown):
-            tool = tc.get("tool", "?")
-            status = tc.get("status", "")
-            is_pending = status not in ("success", "failed")
+        # 取最新 data_rows 条
+        if calls:
+            end = len(calls)
+            start = max(0, end - data_rows)
+            shown = calls[start:end]
+            for tc in reversed(shown):
+                tool = tc.get("tool", "?")
+                status = tc.get("status", "")
+                if status == "success":
+                    status_str = "✅ 成功"
+                    tool_color = DIM
+                elif status == "failed":
+                    status_str = "❌ 失败"
+                    tool_color = DIM
+                else:
+                    status_str = f"[bold {SUCCESS}]⏳ 执行中[/]"
+                    tool_color = SUCCESS
+                table.add_row(f"[{tool_color}]{tool}[/]", status_str)
 
-            if status == "success":
-                status_str = f"✅ 成功"
-                tool_color = DIM
-            elif status == "failed":
-                status_str = f"❌ 失败"
-                tool_color = DIM
-            else:
-                status_str = f"[bold {SUCCESS}]⏳ 执行中[/]"
-                tool_color = SUCCESS
-
-            table.add_row(f"[{tool_color}]{tool}[/]", status_str)
+        # 空行补齐到固定行数
+        filled = min(len(calls), data_rows) if calls else 0
+        for _ in range(data_rows - filled):
+            table.add_row("", "")
 
         return Panel(
             table,

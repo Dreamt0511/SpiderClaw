@@ -1,4 +1,4 @@
-"""Dashboard 主类 — 事件驱动刷新，带节流"""
+"""Dashboard 主类 — 纯事件驱动 + 节流刷新（手动 Alt Screen，绕过 Rich Live）"""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import List, Optional
 
 from rich.layout import Layout
-from rich.live import Live
 from rich.console import Console, RenderableType
 
 from .base import MonitorModule
@@ -18,9 +17,21 @@ from .reader import AuditReader
 from .colors import PRIMARY
 from src.config.settings import get_settings
 
+
 console = Console(force_terminal=True, color_system="auto")
+# 独立 console 用于 capture 渲染，不经过 Live 的 render hooks
+_render_console = Console(force_terminal=True, color_system="auto")
 BANNER_HEIGHT = 18  # 根据 make_banner() 实际行数调整
-MIN_REFRESH_INTERVAL = 0.25  # 最小刷新间隔 250ms，防抖动
+THROTTLE = 0.05      # 最小刷新间隔（秒）：50ms = 20FPS，兼顾 CPU 与流畅
+HEARTBEAT_INTERVAL = 1.0  # 无事件时的心跳间隔（秒），用于更新时间显示
+
+# 右侧模块固定 Panel 高度（内容行 + 2 边框），用于 Layout minimum_size 防溢出
+_TOOL_HEIGHT = 6        # tool_module: 4 行内容 + 2 边框
+_NODE_HEIGHT = 7        # node_module: 5 行内容 + 2 边框
+_STATS_HEIGHT = 9       # stats_module: 7 行内容 + 2 边框
+_STATUS_HEIGHT = 5      # status_module: 3 行内容 + 2 边框
+_RIGHT_TOP_MIN = max(_TOOL_HEIGHT, _NODE_HEIGHT, 6)     # 至少 10 行
+_RIGHT_BTM_MIN = max(_STATS_HEIGHT, _STATUS_HEIGHT, 4)  # 至少 8 行
 
 if sys.platform == "win32":
     import msvcrt
@@ -91,8 +102,8 @@ class Dashboard:
             Layout(name="right", ratio=2),
         )
         body["right"].split_column(
-            Layout(name="right_top", ratio=2),
-            Layout(name="right_bottom", ratio=1),
+            Layout(name="right_top", ratio=2, minimum_size=_RIGHT_TOP_MIN),
+            Layout(name="right_bottom", ratio=1, minimum_size=_RIGHT_BTM_MIN),
         )
         body["right_top"].split_row(
             Layout(name="tool_module", ratio=1),
@@ -106,25 +117,63 @@ class Dashboard:
 
         module_map = {mod.name: mod for mod in self._modules}
 
+        # 直接进入 Alt Screen，完全绕过 rich.live.Live
+        # Live 在 Windows Git Bash 下因 legacy_windows 检测无法正常使用 Alt Screen，
+        # 回退到 position_cursor() 模式导致每帧闪烁。此处手动输出 ANSI 序列，
+        # 配合 capture 渲染彻底避开 Live 的 render hooks。
+        console.file.write('\x1b[?25l\x1b[?1049h')
+        console.file.flush()
+
+        def _render():
+            """渲染当前布局到字符串（不含任何定位/清屏命令）。"""
+            _render_all(body, module_map, self.state)
+            with _render_console.capture() as capture:
+                _render_console.print(root, end='')
+            return capture.get()
+
         try:
-            with Live(root, refresh_per_second=2, screen=True) as live:
-                _render_all(body, module_map, self.state)
-                last_refresh = time.monotonic()
+            # 首帧
+            frame = _render()
+            sys.stdout.write('\x1b[2J\x1b[H' + frame)
+            sys.stdout.flush()
+            # 清除启动过程中 reader 线程可能已累积的事件信号
+            self.state.clear_refresh()
+            last_refresh = time.monotonic()
 
-                while self._running:
-                    got = self.state.wait_refresh(timeout=1.0)
-                    if got:
-                        self.state.clear_refresh()
+            while self._running:
+                # 动态计算等待时间：节流期内等待节流到期，否则等待事件/心跳
+                elapsed = time.monotonic() - last_refresh
+                if elapsed < THROTTLE:
+                    wait = THROTTLE - elapsed
+                else:
+                    wait = HEARTBEAT_INTERVAL
 
-                    now = time.monotonic()
-                    if got and (now - last_refresh >= MIN_REFRESH_INTERVAL):
-                        last_refresh = now
-                        _render_all(body, module_map, self.state)
-                        live.refresh()
+                got = self.state.wait_refresh(timeout=wait)
+                if got:
+                    self.state.clear_refresh()
+
+                now = time.monotonic()
+                elapsed = now - last_refresh
+
+                if got and elapsed >= THROTTLE:
+                    # 事件驱动刷新（节流）：事件到 + 距上次刷新 >= 节流期
+                    last_refresh = now
+                    frame = _render()
+                    sys.stdout.write('\x1b[2J\x1b[H' + frame)
+                    sys.stdout.flush()
+                elif elapsed >= HEARTBEAT_INTERVAL:
+                    # 心跳刷新：无事件时每 HEARTBEAT_INTERVAL 刷新一次（更新时钟等）
+                    last_refresh = now
+                    frame = _render()
+                    sys.stdout.write('\x1b[2J\x1b[H' + frame)
+                    sys.stdout.flush()
 
         except KeyboardInterrupt:
             self._running = False
             self.reader.stop()
+        finally:
+            console.file.write('\x1b[?25h\x1b[?1049l')
+            console.file.flush()
 
 
 def _render_all(layout: Layout, module_map: dict, state: DashboardState):

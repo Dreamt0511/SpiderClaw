@@ -3,4 +3,4 @@
 > **语言声明：本文档及本项目所有文档、注释、提交信息均使用中文。所有生成的 Wiki 文档必须使用中文输出。**
 >
 > 4月30日实现效果
-> ![alt text](image.png)
+> ![alt text](assets/image.png)
