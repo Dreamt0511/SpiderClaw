@@ -178,6 +178,7 @@ class FixAgent:
         """
         try:
             logger.info(f"使用LangChain Agent生成修复代码，重试次数: {retry_count}")
+            token_usage = 0  # 本次调用总token消耗
 
             if retry_count >= 3:
                 logger.error("重试次数达到上限，放弃修复")
@@ -186,6 +187,7 @@ class FixAgent:
                     "modified_files": [],
                     "code_changes": {},
                     "error": "重试次数达到上限",
+                    "token_usage": token_usage,
                 }
 
             # 使用 orchestrator 提供的 target_files（确定性），兜底从 error_locations 推导
@@ -431,6 +433,16 @@ class FixAgent:
             result = await self.agent.ainvoke({"input": user_input}, config=config)
             logger.info("Agent调用完成")
 
+            # 获取token用量（遍历所有AIMessage累加，agent循环中每次LLM调用都有独立的token_usage）
+            try:
+                from langchain_core.messages import AIMessage as _AIM
+                for msg in result.get("messages", []):
+                    if isinstance(msg, _AIM) and hasattr(msg, "response_metadata") and msg.response_metadata:
+                        usage = msg.response_metadata.get("token_usage", {})
+                        token_usage += usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+            except Exception as e:
+                logger.debug(f"获取token用量失败: {e}")
+
             response_content = result["messages"][-1].content
             logger.info(f"修复Agent原始响应长度: {len(response_content)}")
 
@@ -540,6 +552,7 @@ class FixAgent:
                     )
 
             logger.info(f"修复生成成功: {fix_result['fix_description']}")
+            fix_result["token_usage"] = token_usage
             return fix_result
 
         except Exception as e:
@@ -549,4 +562,5 @@ class FixAgent:
                 "modified_files": [],
                 "code_changes": {},
                 "error": str(e),
+                "token_usage": token_usage,
             }

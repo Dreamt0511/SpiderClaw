@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from rich.panel import Panel
 from rich.text import Text
 from rich.console import Console, RenderableType
@@ -12,8 +14,45 @@ from ..colors import PRIMARY, DIM, SUCCESS
 
 console = Console()
 
-# 固定内容行数（不含边框），确保 Panel 高度恒定防抖动
-_CONTENT_ROWS = max(4, min(8, (console.height or 30) - 28))
+# 固定内容行数（不含边框），根据终端高度动态计算
+_CONTENT_ROWS = max(6, min(20, (console.height or 30) - 20))
+
+# 需要闪光动画的节点名
+_SHIMMER_NODES = {"修复Agent", "审查Agent"}
+# 高亮窗口宽度（字符数）
+_SHIMMER_WIDTH = 4
+# 动画速度（字符/秒）— 更快更流畅
+_SHIMMER_SPEED = 25
+# 高亮色（绿色）
+_SHIMMER_COLOR = "#00ff88"
+# 未被高亮窗口覆盖的字符颜色（暗绿）
+_SHIMMER_DIM = "#2a5a3a"
+# 渐变过渡色（平滑边缘）
+_SHIMMER_FADE = "#00cc66"
+
+
+def _shimmer_text(text: str) -> Text:
+    """生成从左到右循环移动高亮窗口的闪光文本（带渐变边缘）。"""
+    n = len(text)
+    if n == 0:
+        return Text(text)
+
+    # 当前高亮起始位置（循环）
+    t = time.time()
+    pos = (t * _SHIMMER_SPEED) % (n + _SHIMMER_WIDTH * 2) - _SHIMMER_WIDTH
+
+    result = Text()
+    for i, ch in enumerate(text):
+        dist = abs(i - pos - _SHIMMER_WIDTH / 2)
+        if dist < _SHIMMER_WIDTH / 2:
+            # 核心高亮
+            result.append(ch, style=f"bold {_SHIMMER_COLOR}")
+        elif dist < _SHIMMER_WIDTH:
+            # 渐变边缘
+            result.append(ch, style=f"bold {_SHIMMER_FADE}")
+        else:
+            result.append(ch, style=_SHIMMER_DIM)
+    return result
 
 
 class NodeModule(MonitorModule):
@@ -33,18 +72,20 @@ class NodeModule(MonitorModule):
                 is_latest = (start + i) == n - 1
                 to_node = jump.get("to", "")
                 duration = jump.get("duration")
+                is_active_agent = (
+                    is_latest and duration is None and to_node in _SHIMMER_NODES
+                )
 
-                if is_latest:
-                    icon = " ● "
-                    icon_style = f"bold {SUCCESS}"
-                    name_style = f"bold {SUCCESS}"
+                if is_active_agent:
+                    text.append(" ● ", style=f"bold {_SHIMMER_COLOR}")
+                    text.append_text(_shimmer_text(to_node))
+                elif is_latest:
+                    text.append(" ● ", style=f"bold {SUCCESS}")
+                    text.append(to_node, style=f"bold {SUCCESS}")
                 else:
-                    icon = " ● "
-                    icon_style = DIM
-                    name_style = DIM
+                    text.append(" ● ", style=DIM)
+                    text.append(to_node, style=DIM)
 
-                text.append(icon, style=icon_style)
-                text.append(to_node, style=name_style)
                 if duration is not None:
                     if duration < 1000:
                         text.append(f" ({duration}ms)", style=DIM)

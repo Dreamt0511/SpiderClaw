@@ -12,8 +12,8 @@ from ..colors import PRIMARY, DIM, SUCCESS, ERROR, WARNING
 
 console = Console()
 
-# 固定内容行数（不含边框），确保 Panel 高度恒定防抖动
-_CONTENT_ROWS = max(4, min(8, (console.height or 30) - 28))
+# 固定内容行数（不含边框），根据终端高度动态计算
+_CONTENT_ROWS = max(6, min(20, (console.height or 30) - 20))
 
 
 class ToolModule(MonitorModule):

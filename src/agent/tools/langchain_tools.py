@@ -536,6 +536,12 @@ def parse_python_errors(log_content: str) -> List[Dict]:
             re.MULTILINE,
         )
 
+        # Python 非交互模式 SyntaxError（如: SyntaxError: invalid char (file.py, line N)）
+        syntax_inline_pattern = re.compile(
+            r'^([A-Z][a-zA-Z0-9]*Error): (.*?)\(([^)]+\.py),\s*line\s+(\d+)\)\s*$',
+            re.MULTILINE,
+        )
+
         # pytest 失败总结行
         pytest_failure_pattern = re.compile(
             r'^FAILED\s+.*?::.*?\s+-\s+([A-Z][a-zA-Z0-9]*Error):?\s*(.*)$',
@@ -650,6 +656,25 @@ def parse_python_errors(log_content: str) -> List[Dict]:
                         "traceback": f"{error_type}: {error_message}",
                         "ci_stage": ci_stage,
                     })
+
+        # ----- 3d2. Python 非交互模式 SyntaxError（如: SyntaxError: invalid char (file.py, line N)） -----
+        for match in syntax_inline_pattern.finditer(content):
+            error_type = match.group(1)
+            error_message = match.group(2).strip()
+            file_path = _normalize_ci_path(match.group(3))
+            line_number = int(match.group(4))
+            key = _ek(file_path, error_type, line_number)
+            if key not in existing_err_set and not _is_system_path(file_path):
+                existing_err_set.add(key)
+                local_errors.append({
+                    "type": "syntax_inline",
+                    "file_path": file_path,
+                    "line_number": line_number,
+                    "error_type": error_type,
+                    "error_message": error_message,
+                    "traceback": f"{error_type}: {error_message} ({file_path}, line {line_number})",
+                    "ci_stage": ci_stage,
+                })
 
         # ----- 3e. pytest 失败总结行 -----
         for match in pytest_failure_pattern.finditer(content):
@@ -800,8 +825,13 @@ def parse_python_errors(log_content: str) -> List[Dict]:
     # ===================== 5. 兜底解析 =====================
     if not all_errors:
         error_keywords = ["Error", "ERROR", "FAILED", "Traceback"]
+        # 排除 CI 脚本中的变量设置语句（如 HAS_ERROR=0, ##[group]Run HAS_ERROR=0）
+        ci_var_keywords = ["HAS_ERROR=", "HAS_WARNING=", "EXIT_CODE="]
         added_contexts = set()
         for i, line in enumerate(processed_lines):
+            # 跳过 CI 变量赋值行
+            if any(kw in line for kw in ci_var_keywords):
+                continue
             if any(kw in line for kw in error_keywords):
                 start = max(0, i - 3)
                 end = min(len(processed_lines), i + 4)

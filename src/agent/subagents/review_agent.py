@@ -364,6 +364,7 @@ class ReviewAgent:
         """审查代码变更 — Phase 1 审查 + Phase 2 按需安全修复"""
         try:
             logger.info("运行审查Agent Phase 1: 静态检查 + LLM 审查")
+            token_usage = 0  # 本次审查总token消耗
 
             # 1. 静态安全检查
             static_result = self._static_security_check(
@@ -388,16 +389,23 @@ class ReviewAgent:
             # HIGH → 拦截但不终止
             if static_result["has_high_risks"]:
                 logger.warning(f"发现高危风险: {static_result['new_risks']['high']}")
+                # 根据风险类型设置精确的 rejection_reason
+                rejection_reason = ""
+                high_risks = static_result["new_risks"]["high"]
+                for risk in high_risks:
+                    if "函数契约变更" in risk:
+                        rejection_reason = "contract_break"
+                        break
                 return {
                     "review_passed": False,
                     "review_comments": "发现高危风险: "
-                    + "; ".join(static_result["new_risks"]["high"]),
+                    + "; ".join(high_risks),
                     "change_lines": static_result["change_lines"],
                     "risk_warnings": static_result["risk_warnings"],
                     "has_critical_risks": False,
                     "has_high_risks": True,
                     "risk_level": "HIGH",
-                    "rejection_reason": "",
+                    "rejection_reason": rejection_reason,
                 }
 
             if static_result["risk_warnings"]:
@@ -523,6 +531,14 @@ class ReviewAgent:
             ]
             result = await self.llm.ainvoke(messages)
 
+            # 获取token用量
+            try:
+                if hasattr(result, "response_metadata"):
+                    usage = result.response_metadata.get("token_usage", {})
+                    token_usage += usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+            except Exception as e:
+                logger.debug(f"获取审查LLM token用量失败: {e}")
+
             response_content = result.content
             logger.info(f"审查Agent原始响应: {response_content[:500]}")
 
@@ -550,6 +566,7 @@ class ReviewAgent:
             review_result["risk_level"] = static_result["risk_level"]
             review_result["has_critical_risks"] = static_result["has_critical_risks"]
             review_result["has_high_risks"] = static_result["has_high_risks"]
+            review_result["token_usage"] = token_usage
 
             if not llm_passed and not auto_result["all_identical"]:
                 logger.warning(
@@ -569,6 +586,7 @@ class ReviewAgent:
                     code_changes=code_changes,
                     original_codes=original_codes,
                 )
+                token_usage += phase2_result.get("token_usage", 0)
                 if phase2_result.get("fixes_applied"):
                     review_result["code_changes"] = phase2_result["code_changes"]
                     review_result["security_fixes_applied"] = True
@@ -639,6 +657,17 @@ class ReviewAgent:
             )
             result = await fix_agent.ainvoke({"input": prompt})
 
+            # 统计 Phase 2 token用量
+            phase2_token = 0
+            try:
+                from langchain_core.messages import AIMessage as _AIM
+                for msg in result.get("messages", []):
+                    if isinstance(msg, _AIM) and hasattr(msg, "response_metadata") and msg.response_metadata:
+                        usage = msg.response_metadata.get("token_usage", {})
+                        phase2_token += usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+            except Exception:
+                pass
+
             # 策略1: 从 tool_calls 中提取 write_file 的目标文件，从磁盘重新读取
             written_files = set()
             for msg in result.get("messages", []):
@@ -674,10 +703,11 @@ class ReviewAgent:
                         "fixes_applied": True,
                         "code_changes": updated,
                         "risk_warnings": post_risk_warnings,
+                        "token_usage": phase2_token,
                     }
                 else:
                     logger.info("Phase 2 写入了文件但内容与 baseline 相同，视为无变更")
-                    return {"fixes_applied": False}
+                    return {"fixes_applied": False, "token_usage": phase2_token}
 
             # 策略2: 兜底 — 试图从文本输出解析 JSON（兼容无工具调用的情况）
             output = result.get("output", "")
@@ -689,17 +719,17 @@ class ReviewAgent:
                     fix_result = json.loads(output)
                 except (json.JSONDecodeError, TypeError):
                     logger.info("Phase 2 Agent 未调用 write_file 且输出非 JSON 格式，跳过")
-                    return {"fixes_applied": False}
+                    return {"fixes_applied": False, "token_usage": phase2_token}
 
             if not fix_result.get("code_changes"):
                 logger.info("Phase 2 未生成任何代码变更")
-                return {"fixes_applied": False}
+                return {"fixes_applied": False, "token_usage": phase2_token}
 
             updated_changes = self._apply_security_fixes(fix_result, code_changes)
 
             if updated_changes == code_changes:
                 logger.info("Phase 2 生成的变更与现有相同，视为无变更")
-                return {"fixes_applied": False}
+                return {"fixes_applied": False, "token_usage": phase2_token}
 
             # 重跑静态检查
             new_static = self._static_security_check(
@@ -716,8 +746,9 @@ class ReviewAgent:
                 "fixes_applied": True,
                 "code_changes": updated_changes,
                 "risk_warnings": post_risk_warnings,
+                "token_usage": phase2_token,
             }
 
         except Exception as e:
             logger.error(f"Phase 2 补充修复失败: {e}", exc_info=True)
-            return {"fixes_applied": False}
+            return {"fixes_applied": False, "token_usage": 0}

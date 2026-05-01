@@ -70,12 +70,13 @@ class LarkBaseClient:
             }
         },
         {"field_name": "修复描述", "type": 1},  # 单行文本，长文本用type=1
-        {"field_name": "错误信息", "type": 1},  # 单行文本
+        {"field_name": "错误信息（失败时）", "type": 1},  # 单行文本
         {"field_name": "修复文件数", "type": 2},  # 数字
         {"field_name": "变更行数", "type": 2},  # 数字
-        {"field_name": "修复耗时", "type": 2},  # 数字
+        {"field_name": "修复耗时（秒）", "type": 2},  # 数字
         {"field_name": "重试次数", "type": 2},  # 数字
         {"field_name": "Token消耗", "type": 2},  # 数字
+        {"field_name": "相关文件名", "type": 1},  # 单行文本，每行一个文件名
         {
             "field_name": "环境",
             "type": 3,  # 单选
@@ -477,6 +478,7 @@ class LarkBaseClient:
         repair_duration: float = 0,
         retry_count: int = 0,
         token_usage: int = 0,
+        related_files: List[str] = None,
         environment: str = "开发",
         table_name: str = "修复记录",
     ) -> bool:
@@ -498,6 +500,7 @@ class LarkBaseClient:
             repair_duration: 修复耗时（秒）
             retry_count: 重试次数
             token_usage: Token消耗
+            related_files: 修复涉及的文件名列表
             environment: 运行环境
             table_name: 目标表名，不同修复源使用不同表
 
@@ -552,14 +555,18 @@ class LarkBaseClient:
 
         # 错误信息
         if error_message:
-            fields["错误信息"] = error_message[:1000] + ("..." if len(error_message) > 1000 else "")
+            fields["错误信息（失败时）"] = error_message[:1000] + ("..." if len(error_message) > 1000 else "")
 
         # 数字字段
         fields["修复文件数"] = file_count
         fields["变更行数"] = change_lines
-        fields["修复耗时"] = round(repair_duration, 2) if repair_duration else 0
+        fields["修复耗时（秒）"] = round(repair_duration, 2) if repair_duration else 0
         fields["重试次数"] = retry_count
         fields["Token消耗"] = token_usage
+
+        # 相关文件名（每行一个文件名）
+        if related_files:
+            fields["相关文件名"] = "\n".join(related_files)
 
         # 环境
         fields["环境"] = environment

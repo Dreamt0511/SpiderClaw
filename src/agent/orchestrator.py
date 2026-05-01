@@ -141,7 +141,7 @@ class RepairOrchestrator:
         workflow.add_conditional_edges(
             "review_changes",
             self._route_after_review,
-            ["fix_agent", "run_tests", "handle_failure"],
+            ["fix_agent", "run_tests", "create_pr", "handle_failure"],
         )
         workflow.add_conditional_edges(
             "run_tests",
@@ -169,47 +169,41 @@ class RepairOrchestrator:
         """纯规则引擎。根据拒绝来源和结构化数据生成重试上下文。"""
         rejection_data = rejection_data or {}
 
-        # 确定 rejection_reason
+        # Gate 拒绝使用模板指令（有明确的结构化违规类型）
         if rejection_source == "gate":
             reason = violation_type or rejection_data.get("violation_type", "boundary_violation")
-        elif rejection_source == "review":
-            reason = rejection_data.get("rejection_reason", "original_error_unresolved")
-        elif rejection_source == "test":
-            reason = "test_failure"
-        else:
-            reason = "unknown"
-
-        # 提取指令上下文
-        instruction_kwargs = {}
-        if rejection_source == "gate":
+            instruction_kwargs = {}
             ctx = rejection_data.get("error_context", {})
             instruction_kwargs.update(ctx)
             instruction_kwargs["details"] = rejection_data.get("details", "")
-            # file_incomplete 需要将列表转为字符串
             if violation_type == "file_incomplete":
-                instruction_kwargs["missing_files"] = ", ".join(
-                    ctx.get("missing_files", [])
-                )
-                instruction_kwargs["all_target_files"] = ", ".join(
-                    ctx.get("all_target_files", [])
-                )
-            # syntax_line_violation 显式列出所有目标文件，避免 LLM 遗漏
+                instruction_kwargs["missing_files"] = ", ".join(ctx.get("missing_files", []))
+                instruction_kwargs["all_target_files"] = ", ".join(ctx.get("all_target_files", []))
             if violation_type == "syntax_line_violation":
-                target_files = state.get("target_files", [])
-                instruction_kwargs["target_files"] = ", ".join(target_files)
+                instruction_kwargs["target_files"] = ", ".join(state.get("target_files", []))
+            instruction = generate_instruction(reason, **instruction_kwargs)
+            reason_for_history = reason
+
+        # Review/Test 拒绝直接传递原始反馈
         elif rejection_source == "review":
-            # 优先用当前审查的完整评语，再回退到 state 中已有的评语，兜底用中文提示
-            instruction_kwargs["review_detail"] = (
+            review_comments = (
                 rejection_data.get("review_comments")
                 or state.get("review_comments")
-                or "原始错误未修复"
+                or "审查未通过，但无详细反馈"
             )
-        elif rejection_source == "test":
-            ft = rejection_data.get("failed_tests", state.failed_tests or [])
-            instruction_kwargs["n"] = len(ft)
-            instruction_kwargs["failed_tests"] = ", ".join(ft)
+            instruction = f"🚨 审查Agent拒绝了你的修复，以下是审查反馈原文：\n\n{review_comments}\n\n请根据上述反馈修正你的修复，不要重复同样的错误。"
+            reason_for_history = rejection_data.get("rejection_reason", "review_rejected")
 
-        instruction = generate_instruction(reason, **instruction_kwargs)
+        elif rejection_source == "test":
+            test_output = rejection_data.get("test_output", state.get("test_output", ""))
+            failed_tests = rejection_data.get("failed_tests", state.get("failed_tests") or [])
+            failed_str = "\n".join(f"- {t}" for t in failed_tests) if failed_tests else "（无具体失败用例）"
+            instruction = f"🚨 测试Agent拒绝了你的修复，以下是测试失败详情：\n\n失败用例：\n{failed_str}\n\n测试输出：\n{test_output}\n\n请根据上述失败信息修正你的修复。"
+            reason_for_history = "test_failure"
+
+        else:
+            instruction = "请按照最小修改原则修复原始错误，不要修改无关代码。"
+            reason_for_history = "unknown"
 
         # 累计历史强制指令，但超过 500 字符时只保留最新 2 条防止 prompt 膨胀
         prev = state.get("mandatory_instructions", "")
@@ -232,7 +226,7 @@ class RepairOrchestrator:
         attempt = FixAttempt(
             attempt=state.retry_count,
             diff_summary=(state.diff_content or "")[:200],
-            rejection_reason=reason,
+            rejection_reason=reason_for_history,
             rejected_by=rejection_source,
         )
 
@@ -358,12 +352,21 @@ class RepairOrchestrator:
 
     @staticmethod
     def _make_event_key(event: GitHubEvent) -> str:
+        # 提取 commit SHA：pull_request 在 payload.pull_request.head.sha，workflow_run 在 payload.head_sha
+        head_sha = ""
+        if isinstance(event.payload, dict):
+            head_sha = event.payload.get("head_sha", "")
+            if not head_sha:
+                head_sha = event.payload.get("pull_request", {}).get("head", {}).get("sha", "")
+
         if event.pr_number and event.branch:
-            return f"{event.repository}:pr:{event.pr_number}:branch:{event.branch}"
+            base = f"{event.repository}:pr:{event.pr_number}:branch:{event.branch}"
+            return f"{base}:sha:{head_sha}" if head_sha else base
         if event.pr_number:
-            return f"{event.repository}:pr:{event.pr_number}"
-        if isinstance(event.payload, dict) and "head_sha" in event.payload:
-            return f"{event.repository}:sha:{event.payload['head_sha']}"
+            base = f"{event.repository}:pr:{event.pr_number}"
+            return f"{base}:sha:{head_sha}" if head_sha else base
+        if head_sha:
+            return f"{event.repository}:sha:{head_sha}"
         return f"{event.repository}:event:{event.event_id}"
 
     @staticmethod
@@ -401,6 +404,11 @@ class RepairOrchestrator:
 
             # 对无 file_path 的错误，从 traceback 强制提取文件路径
             if not fp and err.get("traceback"):
+                # 跳过 CI 脚本中的变量赋值（如 HAS_ERROR=0）
+                err_msg = err.get("error_message", "")
+                if any(kw in err_msg for kw in ["HAS_ERROR=", "HAS_WARNING=", "EXIT_CODE="]):
+                    logger.info(f"丢弃错误: CI变量赋值, msg={err_msg[:80]}")
+                    continue
                 tb_match = re.search(r'File "([^"]+\.py)"', err["traceback"])
                 if tb_match:
                     fp = tb_match.group(1)
@@ -412,7 +420,7 @@ class RepairOrchestrator:
                 else:
                     logger.info(
                         f"丢弃错误: traceback 中无文件路径, "
-                        f"type={err.get('error_type')}, msg={err.get('error_message')[:80]}"
+                        f"type={err.get('error_type')}, msg={err_msg[:80]}"
                     )
 
             if not fp or fp == "<string>":
@@ -710,16 +718,22 @@ class RepairOrchestrator:
                 **extra_context,
             )
 
+            # 累加token用量
+            token_usage = fix_result.get("token_usage", 0)
+            total_token = state.get("total_token_usage", 0) + token_usage
+            if token_usage > 0:
+                logger.debug(f"修复Agent调用消耗token: {token_usage}，累计: {total_token}")
+
             # 环境错误 → 直接结束
             if fix_result.get("is_env_error", False):
                 return Command(
-                    update={"success": True, "error_message": fix_result["fix_description"]},
+                    update={"success": True, "error_message": fix_result["fix_description"], "total_token_usage": total_token},
                     goto=END,
                 )
 
             if not fix_result.get("code_changes"):
                 return Command(
-                    update={"success": False, "error_message": "修复Agent未能生成有效修复代码"},
+                    update={"success": False, "error_message": "修复Agent未能生成有效修复代码", "total_token_usage": total_token},
                     goto="handle_failure",
                 )
 
@@ -747,6 +761,7 @@ class RepairOrchestrator:
                     "original_codes": original_codes,
                     "retry_count": state.get("retry_count", 0) + 1,
                     "current_phase": "validation",
+                    "total_token_usage": total_token,
                 },
                 goto="validation_gate",
             )
@@ -754,7 +769,7 @@ class RepairOrchestrator:
         except Exception as e:
             logger.error(f"修复Agent执行失败: {e}", exc_info=True)
             return Command(
-                update={"success": False, "error_message": f"修复Agent执行失败: {str(e)}"},
+                update={"success": False, "error_message": f"修复Agent执行失败: {str(e)}", "total_token_usage": state.get("total_token_usage", 0)},
                 goto="handle_failure",
             )
         finally:
@@ -868,6 +883,12 @@ class RepairOrchestrator:
                 original_codes=state.get("original_codes"),
             )
 
+            # 累加审查Agent的token用量
+            review_token = review_result.get("token_usage", 0)
+            total_token = state.get("total_token_usage", 0) + review_token
+            if review_token > 0:
+                logger.debug(f"审查Agent消耗token: {review_token}，累计: {total_token}")
+
             # 如果 Phase 2 安全修复生成了新的 code_changes，写入文件
             if review_result.get("security_fixes_applied") and review_result.get("code_changes"):
                 logger.info("Phase 2 安全修复产生变更，写入文件")
@@ -886,6 +907,7 @@ class RepairOrchestrator:
                 )
                 review_result.update(retry_context)
 
+            review_result["total_token_usage"] = total_token
             return review_result
 
         except Exception as e:
@@ -896,6 +918,7 @@ class RepairOrchestrator:
                 "risk_warnings": [str(e)],
                 "risk_level": "NONE",
                 "rejection_reason": "",
+                "total_token_usage": state.get("total_token_usage", 0),
             }
         finally:
             audit_logger.log_event("node_exit", node="review_changes")
@@ -1068,6 +1091,7 @@ class RepairOrchestrator:
                         repair_duration=repair_duration,
                         retry_count=state.get("retry_count", 0),
                         token_usage=state.get("total_token_usage", 0),
+                        related_files=state.modified_files,
                         environment=environment,
                         table_name=table_name,
                     )
@@ -1171,6 +1195,7 @@ class RepairOrchestrator:
                 repair_duration=repair_duration,
                 retry_count=state.get("retry_count", 0),
                 token_usage=state.get("total_token_usage", 0),
+                related_files=state.modified_files,
                 environment=environment,
                 table_name=table_name,
             )
