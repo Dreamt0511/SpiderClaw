@@ -62,7 +62,7 @@ class GitHubWebhookMonitor(BaseMonitor):
         self._setup_middleware()
 
         # 确保文件日志始终写入（绕过 structlog，直接写入日志文件）
-        log_dir = "logs"
+        log_dir = "src/logs"
         os.makedirs(log_dir, exist_ok=True)
         if not any(
             isinstance(h, logging.handlers.TimedRotatingFileHandler)
@@ -368,7 +368,7 @@ def run_webhook_server(
     for handler in logging.root.handlers[:]:
         logging.root.removeHandler(handler)
 
-    log_dir = "logs"
+    log_dir = "src/logs"
     os.makedirs(log_dir, exist_ok=True)
 
     # 文件日志（主日志，自动轮转）
@@ -387,11 +387,9 @@ def run_webhook_server(
     )
     file_handler.setLevel(logging.INFO)
 
-    # 详细日志（保存到 src/logs/detail.log，不与 dashboard 共享）
-    src_log_dir = os.path.join("src", "logs")
-    os.makedirs(src_log_dir, exist_ok=True)
+    # 详细日志（保存到 detail.log，不与 dashboard 共享）
     detail_handler = TimedRotatingFileHandler(
-        os.path.join(src_log_dir, "detail.log"),
+        os.path.join(log_dir, "detail.log"),
         when="midnight",
         interval=1,
         backupCount=30,

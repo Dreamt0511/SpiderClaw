@@ -32,7 +32,7 @@ class AuditReader:
         self._threads: list[threading.Thread] = []
         self._node_enter_time: float | None = None
         self._current_node_entry: dict | None = None
-        self._app_log_path = app_log_path or Path("logs/spiderclaw.log")
+        self._app_log_path = app_log_path or Path("src/logs/spiderclaw.log")
 
     def start(self):
         self._running = True

@@ -26,7 +26,7 @@ class AuditLogger:
     _instance: AuditLogger | None = None
     _lock = threading.Lock()
 
-    def __new__(cls, log_dir: str = "logs") -> AuditLogger:
+    def __new__(cls, log_dir: str = "src/logs") -> AuditLogger:
         with cls._lock:
             if cls._instance is None:
                 cls._instance = super().__new__(cls)

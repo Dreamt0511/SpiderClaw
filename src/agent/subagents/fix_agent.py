@@ -507,15 +507,9 @@ class FixAgent:
                 ]
 
                 if invalid_files:
-                    logger.error(
-                        f"修复Agent返回了不允许的文件: {invalid_files}"
+                    logger.warning(
+                        f"修复Agent返回了目标列表外的文件（已接受）: {invalid_files}"
                     )
-                    return {
-                        "fix_description": f"修复Agent返回了不允许的文件: {invalid_files}",
-                        "modified_files": fix_result.get("modified_files", []),
-                        "code_changes": fix_result.get("code_changes", {}),
-                        "error": f"返回了不在允许列表中的文件: {invalid_files}",
-                    }
 
                 # 自动填充遗漏文件（LLM 训练先验难以覆盖，程序化兜底）
                 for fp in expected_files:

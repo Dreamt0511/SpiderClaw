@@ -265,8 +265,8 @@ class RepairOrchestrator:
             if ci_logs:
                 error_locations_raw = parse_python_errors.invoke({"log_content": ci_logs})
                 # 保存到文件
-                os.makedirs("logs", exist_ok=True)
-                with open("logs/debug_ci_logs.txt", "a", encoding="utf-8") as f:
+                os.makedirs("src/logs", exist_ok=True)
+                with open("src/logs/debug_ci_logs.txt", "a", encoding="utf-8") as f:
                     f.write(ci_logs + "\n")
                 logger.info(f"CI日志已保存到 src/logs/debug_ci_logs.txt，长度: {len(ci_logs)}")
 

@@ -191,7 +191,7 @@ def main(
         from src.monitor.dashboard.modules.stats_module import StatsModule
         from src.monitor.dashboard.modules.status_module import StatusModule
 
-        dash = Dashboard("logs/audit.jsonl", banner=make_banner())
+        dash = Dashboard("src/logs/audit.jsonl", banner=make_banner())
         dash.register(LogModule())
         dash.register(NodeModule())
         dash.register(ToolModule())
