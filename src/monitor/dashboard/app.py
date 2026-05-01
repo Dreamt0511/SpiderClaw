@@ -22,16 +22,18 @@ console = Console(force_terminal=True, color_system="auto")
 # 独立 console 用于 capture 渲染，不经过 Live 的 render hooks
 _render_console = Console(force_terminal=True, color_system="auto")
 BANNER_HEIGHT = 18  # 根据 make_banner() 实际行数调整
-THROTTLE = 0.05      # 最小刷新间隔（秒）：50ms = 20FPS，兼顾 CPU 与流畅
-HEARTBEAT_INTERVAL = 1.0  # 无事件时的心跳间隔（秒），用于更新时间显示
+THROTTLE = 0.033     # 动画时最小刷新间隔（秒）：33ms ≈ 30FPS
+THROTTLE_IDLE = 0.05 # 无动画时最小刷新间隔（秒）：50ms = 20FPS，节省 CPU
+HEARTBEAT_ANIM = 0.033  # 有动画时的心跳间隔（秒）：保持 30FPS
+HEARTBEAT_IDLE = 1.0    # 无事件无动画时的心跳间隔（秒）
 
 # 右侧模块固定 Panel 高度（内容行 + 2 边框），用于 Layout minimum_size 防溢出
-_TOOL_HEIGHT = 8        # tool_module: 6 行内容 + 2 边框
-_NODE_HEIGHT = 8        # node_module: 6 行内容 + 2 边框
+_TOOL_HEIGHT = 15       # tool_module: 13 行内容 + 2 边框
+_NODE_HEIGHT = 18       # node_module: 16 行内容 + 2 边框
 _STATS_HEIGHT = 9       # stats_module: 7 行内容 + 2 边框
 _STATUS_HEIGHT = 5      # status_module: 3 行内容 + 2 边框
-_RIGHT_TOP_MIN = max(_TOOL_HEIGHT, _NODE_HEIGHT, 6)     # 至少 8 行
-_RIGHT_BTM_MIN = max(_STATS_HEIGHT, _STATUS_HEIGHT, 4)  # 至少 9 行
+_RIGHT_TOP_MIN = max(_TOOL_HEIGHT, _NODE_HEIGHT)        # 18 行
+_RIGHT_BTM_MIN = max(_STATS_HEIGHT, _STATUS_HEIGHT, 4)  # 9 行
 
 if sys.platform == "win32":
     import msvcrt
@@ -141,12 +143,13 @@ class Dashboard:
             last_refresh = time.monotonic()
 
             while self._running:
-                # 动态计算等待时间：节流期内等待节流到期，否则等待事件/心跳
+                # 动画感知：有闪光动画时用高刷新率，否则省 CPU
+                anim = self.state.has_active_animation()
+                throttle = THROTTLE if anim else THROTTLE_IDLE
+                heartbeat = HEARTBEAT_ANIM if anim else HEARTBEAT_IDLE
+
                 elapsed = time.monotonic() - last_refresh
-                if elapsed < THROTTLE:
-                    wait = THROTTLE - elapsed
-                else:
-                    wait = HEARTBEAT_INTERVAL
+                wait = max(0.001, min(throttle - elapsed, heartbeat)) if elapsed < throttle else heartbeat
 
                 got = self.state.wait_refresh(timeout=wait)
                 if got:
@@ -155,14 +158,8 @@ class Dashboard:
                 now = time.monotonic()
                 elapsed = now - last_refresh
 
-                if got and elapsed >= THROTTLE:
-                    # 事件驱动刷新（节流）：事件到 + 距上次刷新 >= 节流期
-                    last_refresh = now
-                    frame = _render()
-                    sys.stdout.write('\x1b[2J\x1b[H' + frame)
-                    sys.stdout.flush()
-                elif elapsed >= HEARTBEAT_INTERVAL:
-                    # 心跳刷新：无事件时每 HEARTBEAT_INTERVAL 刷新一次（更新时钟等）
+                should_render = (got and elapsed >= throttle) or elapsed >= heartbeat
+                if should_render:
                     last_refresh = now
                     frame = _render()
                     sys.stdout.write('\x1b[2J\x1b[H' + frame)

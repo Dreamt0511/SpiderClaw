@@ -74,6 +74,14 @@ class DashboardState:
             self.log_scroll_offset = max(0, self.log_scroll_offset + delta)
         self.signal_refresh()
 
+    def has_active_animation(self) -> bool:
+        """检查是否有正在进行的闪光动画（无需拷贝整个 deque）。"""
+        with self._lock:
+            if not self.node_jumps:
+                return False
+            last = self.node_jumps[-1]
+            return last.get("duration") is None
+
     def snapshot(self) -> DashboardState:
         with self._lock:
             return DashboardState(

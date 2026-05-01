@@ -12,8 +12,8 @@ from ..colors import PRIMARY, DIM, SUCCESS, ERROR, WARNING
 
 console = Console()
 
-# 固定内容行数（不含边框），根据终端高度动态计算
-_CONTENT_ROWS = max(6, min(20, (console.height or 30) - 20))
+# 固定内容行数（不含边框）：工具调用面板应能装满 12 条记录（+1 表头）
+_CONTENT_ROWS = 13  # 12 数据行 + 1 表头
 
 
 class ToolModule(MonitorModule):
