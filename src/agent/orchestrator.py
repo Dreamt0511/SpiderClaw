@@ -30,8 +30,10 @@ from src.agent.tools import (
     create_pull_request,
 )
 from src.agent.tools.langchain_tools import read_file, write_file
-from src.bus.schemas import GitHubEvent
+from src.bus.schemas import GitHubEvent, RuntimeLogEvent
 from src.utils.audit import audit_logger
+from src.utils.path_mapping import apply_path_mapping
+from src.utils.version_manager import ensure_repo_with_version
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +131,18 @@ class RepairOrchestrator:
         workflow.add_node("create_pr", self._create_pull_request)
         workflow.add_node("handle_failure", self._handle_failure)
 
-        workflow.add_edge(START, "collect_context")
+        # 双入口：根据事件类型路由到不同的上下文收集节点
+        workflow.add_node("collect_runtime_context", self._collect_runtime_context)
+        workflow.add_conditional_edges(
+            START,
+            self._route_by_event,
+            ["collect_context", "collect_runtime_context"],
+        )
+        workflow.add_conditional_edges(
+            "collect_runtime_context",
+            self._route_after_context,
+            ["fix_agent", "handle_failure", END],
+        )
         workflow.add_conditional_edges(
             "collect_context",
             self._route_after_context,
@@ -349,6 +362,98 @@ class RepairOrchestrator:
             return {"success": False, "error_message": f"收集上下文失败: {str(e)}"}
         finally:
             audit_logger.log_event("node_exit", node="collect_context")
+
+    async def _collect_runtime_context(self, state: RepairState) -> dict[str, Any]:
+        """收集运行时日志上下文 — 独立于 CI 事件的 collect_context"""
+        audit_logger.log_event("node_enter", node="collect_runtime_context")
+        event: RuntimeLogEvent = state["event"]
+        logger.info(f"收集运行时上下文: service={event.service}, version={event.version}")
+
+        try:
+            # 事件去重
+            event_key = f"runtime:{event.service}:{event.event_id}"
+            async with self.lock:
+                if event_key in self.processed_events:
+                    logger.info(f"事件 {event_key} 已处理过，跳过")
+                    return {"success": False, "error_message": "事件已处理过"}
+                self.processed_events.add(event_key)
+
+            set_tool_context({"github_token": self.github_token})
+
+            # 1. 解析 Traceback
+            error_locations_raw = []
+            if event.log:
+                error_locations_raw = parse_python_errors.invoke({"log_content": event.log})
+                logger.info(f"解析到错误数量: {len(error_locations_raw)}")
+
+            if not error_locations_raw:
+                async with self.lock:
+                    self.processed_events.discard(event_key)
+                return {"success": False, "error_message": "日志中未检测到Python错误"}
+
+            # 2. 路径映射
+            for err in error_locations_raw:
+                fp = err.get("file_path", "")
+                if fp:
+                    err["file_path"] = apply_path_mapping(fp, event.path_mapping)
+
+            # 3. 版本管理（三级降级）
+            repo_path, degraded = await ensure_repo_with_version(
+                repo_url=event.repo_url,
+                local_path=event.repo_local_path,
+                version=event.version,
+                branch=event.branch,
+            )
+            set_tool_context({"github_token": self.github_token, "repo_path": repo_path})
+
+            if degraded:
+                logger.warning(f"版本降级：使用最新 {event.branch} 分支代码")
+
+            # 4. 过滤有效错误
+            error_locations = self._filter_valid_errors(error_locations_raw, repo_path)
+            if not error_locations:
+                async with self.lock:
+                    self.processed_events.discard(event_key)
+                return {"success": False, "error_message": "过滤后没有有效错误"}
+
+            # 5. 提取目标文件 + 读取源码
+            target_files = sorted(set(
+                err.file_path for err in error_locations
+                if hasattr(err, "file_path") and err.file_path and err.file_path != "<string>"
+            ))
+            logger.info(f"目标文件列表: {target_files}")
+
+            original_codes = {}
+            for fp in target_files:
+                try:
+                    content = read_file.invoke({"file_path": f"{repo_path}/{fp}"})
+                    if not content.startswith("Error:"):
+                        original_codes[fp] = content
+                except Exception as e:
+                    logger.warning(f"读取文件 {fp} 失败: {e}")
+
+            return {
+                "ci_logs": event.log,
+                "repo_path": repo_path,
+                "error_locations": error_locations,
+                "target_files": target_files,
+                "original_codes": original_codes,
+                "retry_count": 0,
+                "max_retries": self.max_retries,
+                "review_comments": "",
+                "test_output": "",
+                "risk_warnings": [],
+                "failed_tests": [],
+                "risk_level": "NONE",
+                "degraded_version": degraded,
+                "fix_source": "runtime_log",
+            }
+
+        except Exception as e:
+            logger.error(f"收集运行时上下文失败: {e}", exc_info=True)
+            return {"success": False, "error_message": f"收集运行时上下文失败: {str(e)}"}
+        finally:
+            audit_logger.log_event("node_exit", node="collect_runtime_context")
 
     @staticmethod
     def _make_event_key(event: GitHubEvent) -> str:
@@ -1004,6 +1109,13 @@ class RepairOrchestrator:
 
             pr_body = self.notification.build_pr_body(state, branch_name, diff_content=real_diff)
 
+            # 远程日志降级风险标注
+            if state.get("degraded_version"):
+                pr_body += (
+                    "\n\n> ⚠️ **版本降级提示**：无法精确 checkout 到错误发生时的代码版本，"
+                    "本次修复基于最新代码。修复可能不完全精确，请仔细审查。"
+                )
+
             # 提取首个 error_type 使 PR 标题有区分度
             error_locs = state.error_locations
             if error_locs:
@@ -1017,8 +1129,12 @@ class RepairOrchestrator:
             if len(raw_desc) > 40:
                 short_desc = short_desc[:37] + '...'
 
-            pr_author_title = event.payload.get('sender', {}).get('login', '未知用户')
-            pr_title = f"[SpiderClaw: fix] {primary_error} @{pr_author_title}: {short_desc}"
+            # PR 标题：区分来源
+            if getattr(event, "event_type", "") == "runtime_log":
+                pr_title = f"[SpiderClaw: fix] {primary_error} @{event.service}: {short_desc}"
+            else:
+                pr_author_title = event.payload.get('sender', {}).get('login', '未知用户')
+                pr_title = f"[SpiderClaw: fix] {primary_error} @{pr_author_title}: {short_desc}"
 
             pr_url = create_pull_request.invoke({
                 "repo_full_name": event.repository,
@@ -1208,6 +1324,13 @@ class RepairOrchestrator:
 
     # ==================== 路由 ====================
 
+    def _route_by_event(self, state: RepairState) -> str:
+        """入口路由：根据事件类型分发到不同的上下文收集节点"""
+        event = state.get("event")
+        if getattr(event, "event_type", "") == "runtime_log":
+            return "collect_runtime_context"
+        return "collect_context"
+
     def _route_after_context(self, state: RepairState) -> str:
         """上下文收集后路由：环境错误直接结束，失败去 handle_failure，否则进入修复"""
         if state.get("success") is False and state.get("error_message"):
@@ -1298,9 +1421,15 @@ class RepairOrchestrator:
         logger.info(f"启动修复流程: {event.event_id}")
 
         try:
+            # 根据事件类型决定 ci_logs 来源
+            if getattr(event, "event_type", "") == "runtime_log":
+                initial_ci_logs = event.log
+            else:
+                initial_ci_logs = ci_logs
+
             initial_state = {
                 "event": event,
-                "ci_logs": ci_logs,
+                "ci_logs": initial_ci_logs,
                 "repo_path": "",
                 "error_locations": [],
                 "target_files": [],
