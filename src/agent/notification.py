@@ -7,7 +7,7 @@ import re
 from typing import Any
 
 from src.agent.state import RepairState
-from src.notify.lark_notify import send_repair_notification
+from src.notify.lark_notify import send_repair_notification, send_config_needed_notification
 from src.notify.lark_base import get_table_url
 from src.utils.audit import audit_logger
 
@@ -96,6 +96,7 @@ class NotificationService:
                     bug_count=bug_count,
                     change_lines=change_lines,
                     base_url=base_url,
+                    service_version=state.get("service_version", ""),
                 )
             )
 
@@ -162,6 +163,29 @@ class NotificationService:
                     bug_count=bug_count,
                     change_lines=change_lines,
                     base_url=get_table_url(self.base_token, table_name) if self.base_enabled and table_name else (self.base_url if self.base_enabled else ""),
+                    service_version=state.get("service_version", ""),
+                )
+            )
+
+    def send_config_needed(self, service_name: str, error_summary: str, reason: str = "未注册") -> None:
+        """发送"需要配置"通知 — 服务未注册或版本未配置时触发
+
+        Args:
+            service_name: 服务名称
+            error_summary: 错误摘要
+            reason: 原因（"未注册" 或 "版本未配置"）
+        """
+        if not self.enabled or not self.notify_users:
+            return
+
+        for user_id in self.notify_users:
+            asyncio.create_task(
+                send_config_needed_notification(
+                    service_name=service_name,
+                    error_summary=error_summary,
+                    receive_id=user_id,
+                    receive_id_type="open_id",
+                    reason=reason,
                 )
             )
 
@@ -238,9 +262,10 @@ class NotificationService:
         })
         error_types_str = ', '.join(error_types)
 
+        version_line = f"\n- 跟踪版本: `{state.get('service_version', '')}`" if state.get("service_version") else ""
         pr_body_parts = [f"""## 🎯 修复概览
 - **系统**: SpiderClaw 自动修复系统
-- 原错误分支: `{_ev('branch')}`
+- 原错误分支: `{_ev('branch')}`{version_line}
 - 修复分支: `{branch_name}`
 - 错误类型: {error_types_str}
 - 修改文件: {len(state.modified_files)} 个

@@ -293,6 +293,7 @@ async def send_repair_notification(
     original_pr_url: str = "",
     change_lines: int = 0,
     base_url: str = "",
+    service_version: str = "",
 ) -> bool:
     """
     发送修复结果通知（使用飞书卡片格式）
@@ -338,7 +339,8 @@ async def send_repair_notification(
                     "tag": "div",
                     "fields": [
                         {"is_short": True, "text": {"tag": "lark_md", "content": f"**变更行数**\n{change_lines} 行"}},
-                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**分支**\n{source_branch}"}}
+                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**分支**\n{source_branch}"}},
+                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**跟踪版本**\n`{service_version}`" if service_version else "**跟踪版本**\n未配置"}},
                     ]
                 },
                 {
@@ -394,7 +396,8 @@ async def send_repair_notification(
                     "tag": "div",
                     "fields": [
                         {"is_short": True, "text": {"tag": "lark_md", "content": f"**变更行数**\n{change_lines} 行"}},
-                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**分支**\n{source_branch}"}}
+                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**分支**\n{source_branch}"}},
+                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**跟踪版本**\n`{service_version}`" if service_version else "**跟踪版本**\n未配置"}},
                     ]
                 }
             ]
@@ -458,6 +461,70 @@ async def send_repair_notification(
     content_json = json.dumps(card_content, ensure_ascii=False)
 
     # 发送交互式卡片消息
+    return await send_markdown_message(
+        receive_id=receive_id,
+        markdown_content=content_json,
+        receive_id_type=receive_id_type,
+        is_card=True
+    )
+
+
+async def send_config_needed_notification(
+    service_name: str,
+    error_summary: str,
+    receive_id: str,
+    receive_id_type: str = "open_id",
+    reason: str = "未注册",
+) -> bool:
+    """发送"需要配置"通知 — 服务未注册或版本未配置时触发
+
+    Args:
+        service_name: 服务名称
+        error_summary: 错误摘要
+        receive_id: 接收者ID
+        receive_id_type: 接收者ID类型
+        reason: 原因（"未注册" 或 "版本未配置"）
+    """
+    import json
+
+    card_content = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "⚙️ SpiderClaw 需要配置"},
+            "template": "orange"
+        },
+        "elements": [
+            {
+                "tag": "markdown",
+                "content": f"**无法自动修复错误**\n\n**原因**：服务 `{service_name}` {reason}"
+            },
+            {"tag": "hr"},
+            {
+                "tag": "div",
+                "fields": [
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**服务名**\n`{service_name}`"}},
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**问题**\n{reason}"}},
+                ]
+            },
+            {
+                "tag": "markdown",
+                "content": f"**错误摘要**\n```\n{error_summary[:500]}\n```"
+            },
+            {"tag": "hr"},
+            {
+                "tag": "markdown",
+                "content": "**请配置后重试**\n\n1. 编辑 `src/config/services.yaml`，添加服务的 `version` 字段\n2. 或运行 `spiderclaw sync --name {0} --version <版本号>` 拉取代码".format(service_name)
+            },
+            {
+                "tag": "note",
+                "elements": [
+                    {"tag": "plain_text", "content": "配置完成后，后续同类错误将自动修复"}
+                ]
+            }
+        ]
+    }
+
+    content_json = json.dumps(card_content, ensure_ascii=False)
     return await send_markdown_message(
         receive_id=receive_id,
         markdown_content=content_json,

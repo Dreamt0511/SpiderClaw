@@ -123,3 +123,8 @@ class RepairState(BaseModel):
     is_env_error: bool = False       # 环境/依赖错误标记，无需代码修复
     start_time: Any = None           # 修复启动时间（datetime），用于计算修复耗时
     total_token_usage: int = 0       # 总token消耗
+
+    # --- 远程日志来源信息 ---
+    service_version: str = ""        # 修复所基于的版本号（用于通知展示）
+    fix_source: str = ""             # 修复来源："github" | "runtime_log"
+    degraded_version: bool = False   # 是否降级到最新代码

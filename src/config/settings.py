@@ -79,7 +79,8 @@ class ServiceConfig(BaseModel):
     name: str = Field(description="服务名称，与采集脚本 SERVICE_NAME 对应")
     repo_url: str = Field(description="Git 仓库 URL")
     repo_local_path: str = Field(description="Agent 本地持久化 clone 路径（必填）")
-    git_branch: str = Field(default="main", description="目标分支")
+    version: str = Field(default="", description="当前跟踪的线上稳定版本（commit SHA 或 tag），为空则不自动修复")
+    git_branch: str = Field(default="main", description="目标分支（PR 合入分支）")
     path_mapping: Dict[str, str] = Field(
         default_factory=dict,
         description="运行时路径前缀 → 仓库路径前缀映射，如 {'/app/': 'src/'}"

@@ -34,6 +34,7 @@ from src.bus.schemas import GitHubEvent, RuntimeLogEvent
 from src.utils.audit import audit_logger
 from src.utils.path_mapping import apply_path_mapping
 from src.utils.version_manager import ensure_repo_with_version
+from src.config.service_registry import get_service_registry
 
 logger = logging.getLogger(__name__)
 
@@ -367,7 +368,7 @@ class RepairOrchestrator:
         """收集运行时日志上下文 — 独立于 CI 事件的 collect_context"""
         audit_logger.log_event("node_enter", node="collect_runtime_context")
         event: RuntimeLogEvent = state["event"]
-        logger.info(f"收集运行时上下文: service={event.service}, version={event.version}")
+        logger.info(f"收集运行时上下文: service={event.service}")
 
         try:
             # 事件去重
@@ -378,9 +379,31 @@ class RepairOrchestrator:
                     return {"success": False, "error_message": "事件已处理过"}
                 self.processed_events.add(event_key)
 
+            # 1. 检查服务注册 — 未注册则通知开发者，不修
+            registry = get_service_registry()
+            svc_config = registry.get(event.service)
+            if not svc_config:
+                logger.warning(f"服务 {event.service} 未在 services.yaml 注册")
+                self.notification.send_config_needed(
+                    service_name=event.service,
+                    error_summary=event.log[:300],
+                    reason="未在 services.yaml 中注册",
+                )
+                return {"success": False, "error_message": f"服务 {event.service} 未注册，请先配置 services.yaml"}
+
+            # 2. 检查版本配置 — 未配置则通知开发者，不修
+            if not svc_config.version:
+                logger.warning(f"服务 {event.service} 未配置跟踪版本")
+                self.notification.send_config_needed(
+                    service_name=event.service,
+                    error_summary=event.log[:300],
+                    reason="未配置跟踪版本（version 字段为空）",
+                )
+                return {"success": False, "error_message": f"服务 {event.service} 未配置版本，请在 services.yaml 中设置 version"}
+
             set_tool_context({"github_token": self.github_token})
 
-            # 1. 解析 Traceback
+            # 3. 解析 Traceback
             error_locations_raw = []
             if event.log:
                 error_locations_raw = parse_python_errors.invoke({"log_content": event.log})
@@ -391,32 +414,32 @@ class RepairOrchestrator:
                     self.processed_events.discard(event_key)
                 return {"success": False, "error_message": "日志中未检测到Python错误"}
 
-            # 2. 路径映射
+            # 4. 路径映射
             for err in error_locations_raw:
                 fp = err.get("file_path", "")
                 if fp:
-                    err["file_path"] = apply_path_mapping(fp, event.path_mapping)
+                    err["file_path"] = apply_path_mapping(fp, svc_config.path_mapping)
 
-            # 3. 版本管理（三级降级）
+            # 5. 确保本地仓库可用（使用配置的版本，不猜测）
             repo_path, degraded = await ensure_repo_with_version(
-                repo_url=event.repo_url,
-                local_path=event.repo_local_path,
-                version=event.version,
-                branch=event.branch,
+                repo_url=svc_config.repo_url,
+                local_path=svc_config.repo_local_path,
+                version=svc_config.version,
+                branch=svc_config.git_branch,
             )
             set_tool_context({"github_token": self.github_token, "repo_path": repo_path})
 
             if degraded:
-                logger.warning(f"版本降级：使用最新 {event.branch} 分支代码")
+                logger.warning(f"版本降级：使用最新 {svc_config.git_branch} 分支代码")
 
-            # 4. 过滤有效错误
+            # 6. 过滤有效错误
             error_locations = self._filter_valid_errors(error_locations_raw, repo_path)
             if not error_locations:
                 async with self.lock:
                     self.processed_events.discard(event_key)
                 return {"success": False, "error_message": "过滤后没有有效错误"}
 
-            # 5. 提取目标文件 + 读取源码
+            # 7. 提取目标文件 + 读取源码
             target_files = sorted(set(
                 err.file_path for err in error_locations
                 if hasattr(err, "file_path") and err.file_path and err.file_path != "<string>"
@@ -447,6 +470,7 @@ class RepairOrchestrator:
                 "risk_level": "NONE",
                 "degraded_version": degraded,
                 "fix_source": "runtime_log",
+                "service_version": svc_config.version,
             }
 
         except Exception as e:
@@ -1111,8 +1135,10 @@ class RepairOrchestrator:
 
             # 远程日志降级风险标注
             if state.get("degraded_version"):
+                svc_ver = state.get("service_version", "")
+                ver_info = f"（配置版本: `{svc_ver}`）" if svc_ver else ""
                 pr_body += (
-                    "\n\n> ⚠️ **版本降级提示**：无法精确 checkout 到错误发生时的代码版本，"
+                    f"\n\n> ⚠️ **版本降级提示**{ver_info}：无法精确 checkout 到配置的版本，"
                     "本次修复基于最新代码。修复可能不完全精确，请仔细审查。"
                 )
 

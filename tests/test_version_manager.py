@@ -1,25 +1,30 @@
 """版本管理单元测试"""
 import pytest
-from src.utils.version_manager import VERSION_UNKNOWN, is_version_known
+from unittest.mock import patch, MagicMock
+from src.utils.version_manager import ensure_repo_with_version
 
 
-def test_version_unknown_constants():
-    assert "unknown" in VERSION_UNKNOWN
-    assert "" in VERSION_UNKNOWN
-    assert None in VERSION_UNKNOWN
+@pytest.mark.asyncio
+@patch("src.utils.version_manager._ensure_repo_sync")
+async def test_returns_path_and_not_degraded(mock_sync):
+    mock_sync.return_value = ("/tmp/repo", False)
+    path, degraded = await ensure_repo_with_version(
+        repo_url="https://github.com/test/repo.git",
+        local_path="/tmp/repo",
+        version="abc123",
+    )
+    assert path == "/tmp/repo"
+    assert degraded is False
 
 
-def test_is_version_known_with_sha():
-    assert is_version_known("a1b2c3d4e5f6") is True
-
-
-def test_is_version_known_with_unknown():
-    assert is_version_known("unknown") is False
-
-
-def test_is_version_known_with_empty():
-    assert is_version_known("") is False
-
-
-def test_is_version_known_with_none():
-    assert is_version_known(None) is False
+@pytest.mark.asyncio
+@patch("src.utils.version_manager._ensure_repo_sync")
+async def test_returns_degraded_when_checkout_fails(mock_sync):
+    mock_sync.return_value = ("/tmp/repo", True)
+    path, degraded = await ensure_repo_with_version(
+        repo_url="https://github.com/test/repo.git",
+        local_path="/tmp/repo",
+        version="nonexistent",
+        branch="main",
+    )
+    assert degraded is True

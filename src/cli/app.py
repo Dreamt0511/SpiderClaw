@@ -70,7 +70,7 @@ def _setup_feishu():
     console.clear()
     console.print(
         Panel(
-            "欢迎使用 [bold #20d5f0]SpiderClaw[/bold #20d5f0] 飞书配置向导\n\n[dim]扫码授权后将自动完成应用创建和配置写入。[/dim]",
+            "欢迎使用 [bold #20d5f0]SpiderClaw[/bold #20d5f0] 飞书配置向导\n\n[dim]在跳转链接创建好应用后后台将自动完成配置写入。[/dim]",
             title="[bold white]飞书通知配置[/bold white]",
             border_style="#20d5f0",
         )
@@ -200,10 +200,50 @@ def main(
         dash.run()
 
 
-@app.command("setup")
-def setup_wizard():
-    """系统配置向导（飞书通知等）"""
-    _setup_feishu()
+@app.command("config")
+def config_wizard():
+    """系统配置向导 — 统一入口"""
+    import questionary
+    from rich.panel import Panel
+
+    spider_style = questionary.Style(
+        [
+            ("qmark", "fg:#20d5f0 bold"),
+            ("question", "fg:#20d5f0 bold"),
+            ("answer", "fg:#20d5f0 bold"),
+            ("pointer", "fg:#20d5f0 bold"),
+            ("highlighted", "fg:#20d5f0 bold"),
+            ("selected", "fg:#20d5f0"),
+            ("instruction", "fg:#808080 dim"),
+        ]
+    )
+
+    console.print(
+        Panel(
+            "欢迎使用 [bold #20d5f0]SpiderClaw[/bold #20d5f0] 配置向导\n\n"
+            "[dim]选择要配置的项目：[/dim]",
+            title="[bold white]系统配置[/bold white]",
+            border_style="#20d5f0",
+        )
+    )
+
+    choice = questionary.select(
+        "选择配置项目：",
+        choices=[
+            questionary.Choice("飞书通知 — 创建飞书应用并配置通知", value="feishu"),
+            questionary.Choice("服务注册 — 注册需要监控的远程服务", value="service"),
+        ],
+        style=spider_style,
+    ).ask()
+
+    if not choice:
+        console.print("[dim]>> 配置已取消[/dim]")
+        return
+
+    if choice == "feishu":
+        _setup_feishu()
+    else:
+        _register_service()
 
 
 @app.command("init-sidecar")
@@ -349,6 +389,326 @@ done
         f"2. 修改 agent-mapping.conf 中的 SERVICE_VERSION\n"
         f"3. 启动: nohup bash /opt/agent-sidecar/collector.sh > /dev/null 2>&1 &",
         title="[bold #20d5f0]init-sidecar 完成[/bold #20d5f0]",
+        border_style="#20d5f0",
+    ))
+
+
+def _register_service():
+    """服务注册向导（内部函数，供 config 命令调用）"""
+    import questionary
+    import yaml
+    from rich.panel import Panel
+    from rich.status import Status
+
+    spider_style = questionary.Style(
+        [
+            ("qmark", "fg:#20d5f0 bold"),
+            ("question", "fg:#20d5f0 bold"),
+            ("answer", "fg:#20d5f0 bold"),
+            ("pointer", "fg:#20d5f0 bold"),
+            ("highlighted", "fg:#20d5f0 bold"),
+            ("selected", "fg:#20d5f0"),
+            ("instruction", "fg:#808080 dim"),
+        ]
+    )
+
+    console.print(
+        Panel(
+            "注册后，系统将自动监控该服务的运行时错误并尝试修复。",
+            title="[bold white]服务注册[/bold white]",
+            border_style="#20d5f0",
+        )
+    )
+
+    mode = questionary.select(
+        "选择配置方式：",
+        choices=[
+            questionary.Choice("自动配置 — 根据引导依次输入信息", value="auto"),
+            questionary.Choice("手动配置 — 打印模板，自行编辑 services.yaml", value="manual"),
+        ],
+        style=spider_style,
+    ).ask()
+
+    if not mode:
+        console.print("[dim]>> 配置已取消[/dim]")
+        return
+
+    if mode == "manual":
+        console.print(Panel(
+            "请在 [bold #20d5f0]src/config/services.yaml[/bold #20d5f0] 中添加以下内容：\n\n"
+            "```yaml\n"
+            "services:\n"
+            '  - name: "your-service-name"\n'
+            '    repo_url: "https://github.com/your-org/your-repo.git"\n'
+            '    repo_local_path: "/data/repos/your-service"\n'
+            '    version: ""  # 上线后运行 spiderclaw sync -n <服务名> -v <版本号>\n'
+            '    git_branch: "main"\n'
+            '    path_mapping:\n'
+            '      "/app/": "src/"  # 可选：容器路径 → 仓库路径映射\n'
+            "```\n\n"
+            "配置完成后运行 [bold #20d5f0]spiderclaw sync[/bold #20d5f0] 同步代码。",
+            title="[bold #20d5f0]手动配置指引[/bold #20d5f0]",
+            border_style="#20d5f0",
+        ))
+        return
+
+    # === 自动配置模式 ===
+    console.print()
+
+    # 1. 服务名称
+    name = questionary.text(
+        "服务名称（与采集脚本 SERVICE_NAME 对应）：",
+        style=spider_style,
+    ).ask()
+    if not name:
+        console.print("[dim]>> 配置已取消[/dim]")
+        return
+
+    # 2. 仓库地址
+    repo_url = questionary.text(
+        "Git 仓库地址：",
+        style=spider_style,
+        placeholder="https://github.com/your-org/your-repo.git",
+    ).ask()
+    if not repo_url:
+        console.print("[dim]>> 配置已取消[/dim]")
+        return
+
+    # 3. 本地存储路径
+    default_local = f"/data/repos/{name}"
+    repo_local_path = questionary.text(
+        "本地存储路径（Agent 存放代码的目录）：",
+        default=default_local,
+        style=spider_style,
+    ).ask()
+    if not repo_local_path:
+        console.print("[dim]>> 配置已取消[/dim]")
+        return
+
+    # 4. 目标分支
+    git_branch = questionary.text(
+        "目标分支（PR 合入分支）：",
+        default="main",
+        style=spider_style,
+    ).ask()
+    if not git_branch:
+        git_branch = "main"
+
+    # 5. 路径映射
+    add_mapping = questionary.confirm(
+        "是否需要路径映射？（容器内路径 → 仓库路径）",
+        default=False,
+        style=spider_style,
+    ).ask()
+
+    path_mapping = {}
+    if add_mapping:
+        console.print("[dim]输入映射规则，格式: /app/=src/（输入空行结束）[/dim]")
+        while True:
+            rule = questionary.text(
+                "映射规则：",
+                style=spider_style,
+                placeholder="/app/=src/",
+            ).ask()
+            if not rule:
+                break
+            if "=" in rule:
+                k, v = rule.split("=", 1)
+                path_mapping[k.strip()] = v.strip()
+                console.print(f"  [green]✓[/green] {k.strip()} → {v.strip()}")
+            else:
+                console.print("  [yellow]⚠[/yellow] 格式错误，应为 /app/=src/")
+
+    # 6. 是否立即同步版本
+    sync_now = questionary.confirm(
+        "是否现在同步代码？（需要提供版本号）",
+        default=False,
+        style=spider_style,
+    ).ask()
+
+    version = ""
+    if sync_now:
+        version = questionary.text(
+            "目标版本（commit SHA 或 tag，留空则拉取最新分支）：",
+            style=spider_style,
+            placeholder="abc123 或 v1.0.0",
+        ).ask() or ""
+
+    # 写入 services.yaml
+    config_path = Path("src/config/services.yaml")
+
+    with Status("[bold #20d5f0]正在写入配置...[/bold #20d5f0]", spinner="dots", spinner_style="#20d5f0"):
+        if config_path.exists():
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+        else:
+            data = {}
+
+        services = data.get("services") or []
+
+        # 检查是否已存在
+        existing_idx = -1
+        for i, s in enumerate(services):
+            if s.get("name") == name:
+                existing_idx = i
+                break
+
+        svc_data = {
+            "name": name,
+            "repo_url": repo_url,
+            "repo_local_path": repo_local_path,
+            "version": version,
+            "git_branch": git_branch,
+        }
+        if path_mapping:
+            svc_data["path_mapping"] = path_mapping
+
+        if existing_idx >= 0:
+            services[existing_idx] = svc_data
+        else:
+            services.append(svc_data)
+
+        data["services"] = services
+
+        config_path.parent.mkdir(exist_ok=True)
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+    # 如果指定了版本，执行同步
+    sync_status = ""
+    if version:
+        from git import Repo, GitCommandError
+        import os
+
+        local_abs = os.path.abspath(repo_local_path)
+        degraded = False
+
+        with Status(f"[bold #20d5f0]正在同步代码到 {version}...[/bold #20d5f0]", spinner="dots", spinner_style="#20d5f0"):
+            try:
+                if not os.path.exists(os.path.join(local_abs, ".git")):
+                    os.makedirs(local_abs, exist_ok=True)
+                    Repo.clone_from(repo_url, local_abs)
+
+                repo = Repo(local_abs)
+                repo.git.fetch("origin")
+                repo.git.checkout(version)
+            except GitCommandError:
+                try:
+                    repo = Repo(local_abs)
+                    repo.git.checkout(git_branch)
+                    repo.git.pull("origin", git_branch)
+                    degraded = True
+                except GitCommandError as e:
+                    sync_status = f"\n[yellow]⚠[/yellow] 同步失败: {e}"
+                    degraded = True
+
+        if not sync_status:
+            sync_status = f"\n代码已同步到 {version}" + ("（降级到最新分支）" if degraded else "")
+    else:
+        sync_status = "\n[dim]跳过同步，后续运行 spiderclaw sync -n {0} -v <版本号> 同步代码[/dim]".format(name)
+
+    console.print(
+        Panel(
+            f"服务名: [#20d5f0]{name}[/#20d5f0]\n"
+            f"仓库地址: [#20d5f0]{repo_url}[/#20d5f0]\n"
+            f"本地路径: [#20d5f0]{repo_local_path}[/#20d5f0]\n"
+            f"目标分支: [#20d5f0]{git_branch}[/#20d5f0]\n"
+            f"跟踪版本: [#20d5f0]{version or '未配置'}[/#20d5f0]\n"
+            f"路径映射: [#20d5f0]{path_mapping or '无'}[/#20d5f0]"
+            f"{sync_status}",
+            title="[bold #20d5f0]服务注册完成[/bold #20d5f0]",
+            border_style="#20d5f0",
+        )
+    )
+
+
+@app.command("sync")
+def sync_service(
+    name: str = typer.Option(..., "-n", "--name", help="服务名称（对应 services.yaml 中的 name）"),
+    version: str = typer.Option(..., "-v", "--version", help="目标版本（commit SHA 或 tag）"),
+):
+    """同步服务代码到本地 — 上线新版本时运行此命令
+
+    从 services.yaml 读取服务配置，clone/fetch 仓库并 checkout 到指定版本，
+    同时更新 services.yaml 中的 version 字段。
+    """
+    import yaml
+    from pathlib import Path
+    from rich.panel import Panel
+    from rich.status import Status
+
+    config_path = Path("src/config/services.yaml")
+    if not config_path.exists():
+        console.print("[bold #ff4444]错误：[/bold #ff4444] src/config/services.yaml 不存在")
+        raise typer.Exit(1)
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    services = data.get("services") or []
+    svc = None
+    svc_index = -1
+    for i, s in enumerate(services):
+        if s.get("name") == name:
+            svc = s
+            svc_index = i
+            break
+
+    if not svc:
+        console.print(f"[bold #ff4444]错误：[/bold #ff4444] 服务 '{name}' 未在 services.yaml 中注册")
+        console.print("[dim]请先运行 spiderclaw register 注册服务，或手动编辑 services.yaml[/dim]")
+        raise typer.Exit(1)
+
+    repo_url = svc.get("repo_url", "")
+    local_path = svc.get("repo_local_path", "")
+    branch = svc.get("git_branch", "main")
+
+    if not repo_url or not local_path:
+        console.print(f"[bold #ff4444]错误：[/bold #ff4444] 服务 '{name}' 缺少 repo_url 或 repo_local_path")
+        raise typer.Exit(1)
+
+    # 拉取代码
+    from git import Repo, GitCommandError
+    import os
+
+    local_path = os.path.abspath(local_path)
+    degraded = False
+
+    with Status(f"[bold #20d5f0]正在同步 {name} 到版本 {version}...[/bold #20d5f0]", spinner="dots", spinner_style="#20d5f0"):
+        try:
+            if not os.path.exists(os.path.join(local_path, ".git")):
+                console.print(f"[dim]首次 clone: {repo_url}[/dim]")
+                os.makedirs(local_path, exist_ok=True)
+                Repo.clone_from(repo_url, local_path)
+
+            repo = Repo(local_path)
+            repo.git.fetch("origin")
+            repo.git.checkout(version)
+            console.print(f"[green]✓[/green] checkout 到 {version}")
+        except GitCommandError:
+            console.print(f"[yellow]⚠[/yellow] 无法 checkout 到 {version}，降级到最新 {branch}")
+            try:
+                repo = Repo(local_path)
+                repo.git.checkout(branch)
+                repo.git.pull("origin", branch)
+            except GitCommandError as e:
+                console.print(f"[bold #ff4444]错误：[/bold #ff4444] 降级也失败: {e}")
+                raise typer.Exit(1)
+            degraded = True
+
+    # 更新 services.yaml 中的 version 字段
+    services[svc_index]["version"] = version
+    with open(config_path, "w", encoding="utf-8") as f:
+        yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+    status_text = "（降级到最新分支）" if degraded else ""
+    console.print(Panel(
+        f"服务: [#20d5f0]{name}[/#20d5f0]\n"
+        f"版本: [#20d5f0]{version}[/#20d5f0]\n"
+        f"本地路径: [#20d5f0]{local_path}[/#20d5f0]\n"
+        f"状态: {'⚠️ 降级' if degraded else '✅ 精确匹配'} {status_text}\n\n"
+        f"services.yaml 已更新 version 字段。",
+        title="[bold #20d5f0]sync 完成[/bold #20d5f0]",
         border_style="#20d5f0",
     ))
 
