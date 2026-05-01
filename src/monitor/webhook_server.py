@@ -15,7 +15,10 @@ from rich.panel import Panel
 from rich.logging import RichHandler
 from .base import BaseMonitor
 from src.bus import GitHubEvent, EventBus
+from src.bus.schemas import RuntimeLogEvent
+from src.config.service_registry import get_service_registry
 from src.utils.audit import audit_logger
+from src.utils.rate_limiter import ServiceRateLimiter
 
 # 强制启用颜色输出，即使输出到非终端
 console = Console(force_terminal=True, color_system="auto")
@@ -215,6 +218,60 @@ class GitHubWebhookMonitor(BaseMonitor):
                 raise HTTPException(status_code=503, detail="Service busy, please retry later")
 
             return {"status": "accepted", "event_id": event_id}
+
+        @self.app.post("/webhook/log")
+        async def handle_log_webhook(request: Request):
+            """接收远程运行时日志事件"""
+            try:
+                body = await request.json()
+            except Exception as e:
+                logger.error(f"解析日志请求体失败: {e}")
+                raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+            # 校验必填字段
+            log_content = body.get("log", "")
+            service_name = body.get("service", "")
+            if not log_content or not service_name:
+                raise HTTPException(status_code=400, detail="Missing required fields: 'log' and 'service'")
+
+            # 查找服务配置
+            registry = get_service_registry()
+            svc = registry.get(service_name)
+            if not svc:
+                logger.warning(f"未知服务: {service_name}")
+                return {"status": "unknown_service", "service": service_name}
+
+            # 创建事件
+            import uuid
+            event = RuntimeLogEvent(
+                event_id=str(uuid.uuid4()),
+                source="remote_log",
+                log=log_content,
+                service=service_name,
+                version=body.get("version", ""),
+                hostname=body.get("hostname", ""),
+                repo_url=svc.repo_url,
+                repo_local_path=svc.repo_local_path,
+                branch=svc.git_branch,
+                path_mapping=svc.path_mapping,
+                # 兼容字段
+                repository=service_name,
+                clone_url=svc.repo_url,
+            )
+
+            # 发布到事件总线
+            publish_success = await self.publish_event(event)
+            if not publish_success:
+                raise HTTPException(status_code=503, detail="Service busy, please retry later")
+
+            logger.info(f"接收运行时日志: service={service_name}, version={event.version}")
+            audit_logger.log_event(
+                "system_action",
+                action=f"收到远程日志: {service_name}",
+                event_id=event.event_id,
+            )
+
+            return {"status": "accepted", "event_id": event.event_id}
 
     def _verify_signature(self, body: bytes, signature_header: str) -> bool:
         """
@@ -485,6 +542,12 @@ def run_webhook_server(
         ))
         console.print()
 
+    # 初始化限流器
+    rate_limiter = ServiceRateLimiter(
+        max_per_minute=get_service_registry().rate_limit.max_fixes_per_minute,
+        max_per_hour=get_service_registry().rate_limit.max_fixes_per_hour,
+    )
+
     async def event_consumer():
         """事件消费循环"""
         if not orchestrator:
@@ -493,6 +556,29 @@ def run_webhook_server(
             try:
                 event = await event_bus.subscribe()
 
+                # 远程日志事件处理（限流在图入口之前）
+                if isinstance(event, RuntimeLogEvent):
+                    if not await rate_limiter.check(event.service):
+                        log.warning(f"服务 {event.service} 触发限流，跳过")
+                        if rate_limiter.should_alert(event.service):
+                            log.error(f"服务 {event.service} 持续限流，请人工检查")
+                        event_bus.mark_done()
+                        continue
+                    await rate_limiter.record(event.service)
+
+                    async def process_runtime_and_mark_done(evt=event):
+                        try:
+                            await orchestrator.run(evt)
+                        finally:
+                            event_bus.mark_done()
+
+                    asyncio.create_task(
+                        process_runtime_and_mark_done(),
+                        name=f"runtime_{event.event_id}"
+                    )
+                    continue
+
+                # GitHub CI 事件处理（原有逻辑）
                 if isinstance(event, GitHubEvent) and event.conclusion == "failure":
                     log.info(f"收到CI失败事件: {event.event_id}, 仓库: {event.repository}, 分支: {event.branch}")
 

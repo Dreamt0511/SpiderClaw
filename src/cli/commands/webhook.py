@@ -22,8 +22,11 @@ def start(
     from src.config.settings import get_settings
     from src.utils.logging import setup_logging
     from src.bus import get_event_bus, GitHubEvent
+    from src.bus.schemas import RuntimeLogEvent
+    from src.config.service_registry import get_service_registry
     from src.monitor import GitHubWebhookMonitor
     from src.agent.orchestrator import RepairOrchestrator
+    from src.utils.rate_limiter import ServiceRateLimiter
 
     overrides = {}
 
@@ -131,6 +134,12 @@ def start(
             console.print(f"[yellow]详细错误信息: {error_details}[/yellow]")
             logger.error(f"初始化修复编排器失败: {e}\n{error_details}")
 
+    # 初始化限流器
+    rate_limiter = ServiceRateLimiter(
+        max_per_minute=get_service_registry().rate_limit.max_fixes_per_minute,
+        max_per_hour=get_service_registry().rate_limit.max_fixes_per_hour,
+    )
+
     async def event_consumer():
         """事件消费循环"""
         if not orchestrator:
@@ -141,7 +150,29 @@ def start(
             try:
                 event = await event_bus.subscribe()
 
-                # 仅处理失败的CI事件
+                # 远程日志事件处理（限流在图入口之前）
+                if isinstance(event, RuntimeLogEvent):
+                    if not await rate_limiter.check(event.service):
+                        logger.warning(f"服务 {event.service} 触发限流，跳过")
+                        if rate_limiter.should_alert(event.service):
+                            logger.error(f"服务 {event.service} 持续限流，请人工检查")
+                        event_bus.mark_done()
+                        continue
+                    await rate_limiter.record(event.service)
+
+                    async def process_runtime_and_mark_done(evt=event):
+                        try:
+                            await orchestrator.run(evt)
+                        finally:
+                            event_bus.mark_done()
+
+                    asyncio.create_task(
+                        process_runtime_and_mark_done(),
+                        name=f"runtime_{event.event_id}"
+                    )
+                    continue
+
+                # GitHub CI 事件处理（原有逻辑）
                 if isinstance(event, GitHubEvent) and event.conclusion == "failure":
                     logger.info(f"收到CI失败事件: {event.event_id}, 仓库: {event.repository}, 分支: {event.branch}")
 
