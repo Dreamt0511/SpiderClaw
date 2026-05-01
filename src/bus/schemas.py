@@ -45,3 +45,30 @@ class GitHubEvent(BaseEvent):
             }
         }
     )
+
+
+class RuntimeLogEvent(BaseEvent):
+    """运行时日志事件 — 由 /webhook/log 端点创建
+
+    独立事件类型，不伪装为 GitHubEvent。
+    下游节点通过 event.event_type == "runtime_log" 判断。
+    """
+    event_type: str = "runtime_log"
+
+    # === 运行时日志自有字段 ===
+    log: str = ""
+    service: str = ""
+    version: str = ""
+    hostname: str = ""
+
+    # === 由 Agent 端从 services.yaml 查到后填充 ===
+    repo_url: str = ""
+    repo_local_path: str = ""
+    branch: str = ""
+    path_mapping: Dict[str, str] = Field(default_factory=dict)
+
+    # === 仅供下游节点兼容访问 ===
+    repository: str = ""
+    clone_url: str = ""
+    action: str = ""
+    signature_valid: bool = True
