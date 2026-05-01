@@ -1,0 +1,15 @@
+# 远程服务注册配置
+# 每个服务对应一个线上业务系统，采集脚本通过 service name 关联
+services:
+  # - name: "order-service"
+  #   repo_url: "https://github.com/myteam/order-service.git"
+  #   repo_local_path: "/data/repos/order-service"
+  #   git_branch: "main"
+  #   path_mapping:
+  #     "/app/": "src/"
+
+rate_limit:
+  max_fixes_per_minute: 3
+  max_fixes_per_hour: 20
+  dedup_window_seconds: 300
+  aggregate_window_seconds: 60

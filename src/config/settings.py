@@ -74,6 +74,32 @@ class LarkConfig(BaseModel):
     alert_threshold: int = Field(default=3, description="连续失败多少次后发送告警")
 
 
+class ServiceConfig(BaseModel):
+    """单个远程服务的配置"""
+    name: str = Field(description="服务名称，与采集脚本 SERVICE_NAME 对应")
+    repo_url: str = Field(description="Git 仓库 URL")
+    repo_local_path: str = Field(description="Agent 本地持久化 clone 路径（必填）")
+    git_branch: str = Field(default="main", description="目标分支")
+    path_mapping: Dict[str, str] = Field(
+        default_factory=dict,
+        description="运行时路径前缀 → 仓库路径前缀映射，如 {'/app/': 'src/'}"
+    )
+
+
+class RateLimitConfig(BaseModel):
+    """远程日志修复限流配置"""
+    max_fixes_per_minute: int = Field(default=3, description="每分钟最大修复次数")
+    max_fixes_per_hour: int = Field(default=20, description="每小时最大修复次数")
+    dedup_window_seconds: int = Field(default=300, description="去重窗口（秒）")
+    aggregate_window_seconds: int = Field(default=60, description="聚合窗口（秒）")
+
+
+class ServicesConfig(BaseModel):
+    """远程服务注册配置"""
+    services: list[ServiceConfig] = Field(default_factory=list, description="已注册的服务列表")
+    rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
+
+
 class Settings(BaseSettings):
     """全局配置"""
     model_config = SettingsConfigDict(
@@ -99,6 +125,9 @@ class Settings(BaseSettings):
 
     # 飞书配置
     lark: LarkConfig = Field(default_factory=LarkConfig)
+
+    # 远程服务配置
+    services: ServicesConfig = Field(default_factory=ServicesConfig)
 
     # 环境
     environment: str = Field(default="development", description="运行环境")
@@ -135,6 +164,16 @@ class Settings(BaseSettings):
                     config_data["openai"]["model_name"] = config_data["agent"]["llm_model"]
                 # 移除旧的配置项
                 del config_data["agent"]["llm_model"]
+
+            # 尝试加载 services.yaml（独立配置文件）
+            services_path = config_path.parent / "services.yaml"
+            if services_path.exists():
+                with open(services_path, "r", encoding="utf-8") as sf:
+                    services_data = yaml.safe_load(sf) or {}
+                # YAML 中 services 列表被注释时会解析为 None，需修正为空列表
+                if services_data.get("services") is None:
+                    services_data["services"] = []
+                config_data["services"] = services_data
 
             return cls(**config_data)
         except Exception as e:
