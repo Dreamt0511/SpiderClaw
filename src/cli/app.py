@@ -697,9 +697,21 @@ def sync_service(
             degraded = True
 
     # 更新 services.yaml 中的 version 字段
+    old_version = svc.get("version", "")
     services[svc_index]["version"] = version
     with open(config_path, "w", encoding="utf-8") as f:
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+    # 版本变更时，将旧版本的修复记录标记为 superseded
+    if old_version and old_version != version:
+        try:
+            from src.store.repair_store import get_repair_store
+            store = get_repair_store()
+            count = store.mark_superseded_by_version(name, old_version)
+            if count:
+                console.print(f"[dim]已标记 {count} 条旧版本修复记录为 superseded[/dim]")
+        except Exception as e:
+            console.print(f"[yellow]⚠ 标记 superseded 失败（不影响同步）: {e}[/yellow]")
 
     status_text = "（降级到最新分支）" if degraded else ""
     console.print(Panel(

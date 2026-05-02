@@ -7,7 +7,7 @@ import re
 from typing import Any
 
 from src.agent.state import RepairState
-from src.notify.lark_notify import send_repair_notification, send_config_needed_notification
+from src.notify.lark_notify import send_repair_notification, send_config_needed_notification, send_already_fixing_notification, send_runtime_repair_notification, send_markdown_message
 from src.notify.lark_base import get_table_url
 from src.utils.audit import audit_logger
 
@@ -31,7 +31,7 @@ class NotificationService:
         # 构造多维表格访问链接
         self.base_url = f"https://my.feishu.cn/base/{base_token}" if base_token else ""
 
-    def send_pr_created(self, state: RepairState, pr_url: str = "", diff_content: str = "", table_name: str = "") -> None:
+    def send_pr_created(self, state: RepairState, pr_url: str = "", diff_content: str = "", table_name: str = "", environment: str = "开发") -> None:
         """发送 PR 创建成功通知"""
         if not self.enabled or not self.notify_users:
             return
@@ -97,10 +97,11 @@ class NotificationService:
                     change_lines=change_lines,
                     base_url=base_url,
                     service_version=state.get("service_version", ""),
+                    environment=environment,
                 )
             )
 
-    def send_failure(self, state: RepairState, table_name: str = "") -> None:
+    def send_failure(self, state: RepairState, table_name: str = "", environment: str = "开发") -> None:
         """发送修复失败通知"""
         if not self.enabled or not self.notify_users:
             return
@@ -164,6 +165,72 @@ class NotificationService:
                     change_lines=change_lines,
                     base_url=get_table_url(self.base_token, table_name) if self.base_enabled and table_name else (self.base_url if self.base_enabled else ""),
                     service_version=state.get("service_version", ""),
+                    environment=environment,
+                )
+            )
+
+    def send_runtime_pr_created(
+        self,
+        service: str,
+        error_type: str,
+        error_location: str,
+        fix_description: str,
+        file_count: int = 0,
+        change_lines: int = 0,
+        pr_url: str = "",
+        table_name: str = "",
+    ) -> None:
+        """发送 Web 服务运行时错误修复成功通知"""
+        if not self.enabled or not self.notify_users:
+            return
+
+        base_url = get_table_url(self.base_token, table_name) if self.base_enabled and table_name else (self.base_url if self.base_enabled else "")
+
+        for user_id in self.notify_users:
+            asyncio.create_task(
+                send_runtime_repair_notification(
+                    repair_success=True,
+                    service=service,
+                    error_type=error_type,
+                    error_location=error_location,
+                    fix_description=fix_description,
+                    receive_id=user_id,
+                    receive_id_type="open_id",
+                    file_count=file_count,
+                    change_lines=change_lines,
+                    pr_url=pr_url,
+                    base_url=base_url,
+                )
+            )
+
+    def send_runtime_failure(
+        self,
+        service: str,
+        error_type: str,
+        error_location: str,
+        error_message: str = "",
+        table_name: str = "",
+        duplicate_info: dict | None = None,
+    ) -> None:
+        """发送 Web 服务运行时错误修复失败通知"""
+        if not self.enabled or not self.notify_users:
+            return
+
+        base_url = get_table_url(self.base_token, table_name) if self.base_enabled and table_name else (self.base_url if self.base_enabled else "")
+
+        for user_id in self.notify_users:
+            asyncio.create_task(
+                send_runtime_repair_notification(
+                    repair_success=False,
+                    service=service,
+                    error_type=error_type,
+                    error_location=error_location,
+                    fix_description="",
+                    receive_id=user_id,
+                    receive_id_type="open_id",
+                    error_message=error_message,
+                    base_url=base_url,
+                    duplicate_info=duplicate_info,
                 )
             )
 
@@ -186,6 +253,22 @@ class NotificationService:
                     receive_id=user_id,
                     receive_id_type="open_id",
                     reason=reason,
+                )
+            )
+
+    def send_already_fixing(self, fingerprint: str, pr_url: str, service: str) -> None:
+        """通知：相同错误已有修复在等待部署"""
+        if not self.enabled or not self.notify_users:
+            return
+
+        for user_id in self.notify_users:
+            asyncio.create_task(
+                send_already_fixing_notification(
+                    fingerprint=fingerprint,
+                    pr_url=pr_url,
+                    service=service,
+                    receive_id=user_id,
+                    receive_id_type="open_id",
                 )
             )
 

@@ -20,9 +20,9 @@ _CONTENT_ROWS = 16
 # 需要闪光动画的节点名
 _SHIMMER_NODES = {"修复Agent", "审查Agent", "收集上下文", "提交PR"}
 # 高亮窗口宽度（字符数）
-_SHIMMER_WIDTH = 4
+_SHIMMER_WIDTH = 2
 # 动画速度（字符/秒）— 30fps 下每帧移动 ~0.83 字符
-_SHIMMER_SPEED = 20
+_SHIMMER_SPEED = 10
 # 高亮色（绿色）
 _SHIMMER_COLOR = "#00ff88"
 # 未被高亮窗口覆盖的字符颜色（暗绿）

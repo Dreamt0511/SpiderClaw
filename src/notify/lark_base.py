@@ -228,11 +228,18 @@ class LarkBaseClient:
 
             logger.debug(f"执行lark-cli命令: {' '.join(full_cmd)}")
 
-            proc = await asyncio.create_subprocess_exec(
-                *full_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *full_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+            except FileNotFoundError:
+                proc = await asyncio.create_subprocess_shell(
+                    " ".join(full_cmd),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
             stdout, stderr = await proc.communicate()
 
             if proc.returncode == 0:
@@ -245,6 +252,13 @@ class LarkBaseClient:
                     return None
             else:
                 error_msg = stderr.decode('utf-8', errors='ignore')
+                # 800070003: "no operation produced" — 字段已是目标状态，视为成功
+                if "800070003" in error_msg:
+                    logger.debug(f"字段已是目标状态，无需修改: {error_msg}")
+                    try:
+                        return json.loads(error_msg)
+                    except json.JSONDecodeError:
+                        return {"ok": True, "noop": True}
                 logger.error(f"命令执行失败, code={proc.returncode}, error={error_msg}")
                 return None
 
@@ -299,6 +313,8 @@ class LarkBaseClient:
             self.repair_table_id = table_id
             logger.info(f"表创建成功，名称: {table_name}, ID: {table_id}")
             await self._init_fields()
+            # 更新日期时间字段格式（+table-create 不支持 style 属性）
+            await self._fix_datetime_field_format()
             return table_id
         else:
             logger.error(f"表创建失败: {table_name}")
@@ -319,6 +335,45 @@ class LarkBaseClient:
             fields = result.get("data", {}).get("fields", [])
             self._field_cache = {field["name"]: field["id"] for field in fields}
             logger.debug(f"字段缓存初始化完成: {self._field_cache}")
+
+    async def _fix_datetime_field_format(self) -> None:
+        """修复日期时间字段的格式，确保显示时分秒"""
+        if not self.repair_table_id:
+            return
+
+        # 找到日期时间字段定义
+        datetime_fields = [f for f in self.REPAIR_TABLE_FIELDS if f["type"] == 5]
+        if not datetime_fields:
+            return
+
+        for field_def in datetime_fields:
+            field_name = field_def["field_name"]
+            field_id = self._field_cache.get(field_name)
+            if not field_id:
+                continue
+
+            # 获取期望的格式
+            expected_format = field_def.get("property", {}).get("date_format", "yyyy-MM-dd HH:mm")
+
+            # 更新字段格式
+            field_json = {
+                "name": field_name,
+                "type": "datetime",
+                "style": {"format": expected_format}
+            }
+
+            cmd = [
+                "+field-update",
+                "--table-id", self.repair_table_id,
+                "--field-id", field_id,
+                "--json", json.dumps(field_json, ensure_ascii=False),
+            ]
+
+            result = await self._run_command(cmd)
+            if result and result.get("ok"):
+                logger.info(f"✅ 日期时间字段格式已更新: {field_name} -> {expected_format}")
+            else:
+                logger.warning(f"⚠️ 更新日期时间字段格式失败: {field_name}")
 
     async def validate_and_migrate_fields(self, auto_fix: bool = True) -> bool:
         """
@@ -342,6 +397,8 @@ class LarkBaseClient:
 
         if not missing_fields:
             logger.info("✅ 多维表格字段校验通过，所有字段都存在")
+            # 确保日期时间字段格式正确
+            await self._fix_datetime_field_format()
             return True
 
         logger.warning(f"⚠️ 发现缺失字段: {', '.join(missing_fields)}")

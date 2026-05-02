@@ -135,6 +135,9 @@ Thumbs.db
 # Configuration files (keep examples)
 src/config/agent-config.yaml
 
+# SQLite repair records
+data/
+
 # Logs
 logs/
 *.log

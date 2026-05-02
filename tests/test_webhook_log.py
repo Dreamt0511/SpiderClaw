@@ -119,7 +119,7 @@ def test_receive_log_empty_fields(client, mock_service_registry):
 
 
 def test_receive_log_unknown_service(client, mock_event_bus):
-    """未知服务 → 200 + unknown_service"""
+    """未知服务 → 200 + accepted（由编排器处理未知服务通知）"""
     mock_registry = MagicMock()
     mock_registry.get.return_value = None
 
@@ -134,11 +134,11 @@ def test_receive_log_unknown_service(client, mock_event_bus):
 
     assert response.status_code == 200
     data = response.json()
-    assert data["status"] == "unknown_service"
-    assert data["service"] == "nonexistent"
+    assert data["status"] == "accepted"
+    assert "event_id" in data
 
-    # 未知服务不应发布事件
-    mock_event_bus.publish.assert_not_awaited()
+    # 未知服务也会发布事件，由编排器决定发送通知
+    mock_event_bus.publish.assert_awaited_once()
 
 
 def test_receive_log_with_optional_fields(client, mock_event_bus, mock_service_registry):

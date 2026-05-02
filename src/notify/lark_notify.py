@@ -187,12 +187,19 @@ async def send_message(
 
         logger.info(f"发送飞书消息: {' '.join(cmd[:-2])}...")  # 不打印敏感内容
 
-        # 执行命令
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
+        # 执行命令 — Windows 下 .cmd 文件需要通过 shell 执行
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+        except FileNotFoundError:
+            proc = await asyncio.create_subprocess_shell(
+                " ".join(cmd),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
         stdout, stderr = await proc.communicate()
 
         if proc.returncode == 0:
@@ -258,12 +265,19 @@ async def send_markdown_message(
 
         logger.info(f"发送飞书markdown消息到: {receive_id}")
 
-        # 执行命令
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
+        # 执行命令 — Windows 下 .cmd 文件需要通过 shell 执行
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+        except FileNotFoundError:
+            proc = await asyncio.create_subprocess_shell(
+                " ".join(cmd),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
         stdout, stderr = await proc.communicate()
 
         if proc.returncode == 0:
@@ -294,6 +308,7 @@ async def send_repair_notification(
     change_lines: int = 0,
     base_url: str = "",
     service_version: str = "",
+    environment: str = "开发",
 ) -> bool:
     """
     发送修复结果通知（使用飞书卡片格式）
@@ -341,6 +356,7 @@ async def send_repair_notification(
                         {"is_short": True, "text": {"tag": "lark_md", "content": f"**变更行数**\n{change_lines} 行"}},
                         {"is_short": True, "text": {"tag": "lark_md", "content": f"**分支**\n{source_branch}"}},
                         {"is_short": True, "text": {"tag": "lark_md", "content": f"**跟踪版本**\n`{service_version}`" if service_version else "**跟踪版本**\n未配置"}},
+                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**环境**\n{environment}"}},
                     ]
                 },
                 {
@@ -398,6 +414,7 @@ async def send_repair_notification(
                         {"is_short": True, "text": {"tag": "lark_md", "content": f"**变更行数**\n{change_lines} 行"}},
                         {"is_short": True, "text": {"tag": "lark_md", "content": f"**分支**\n{source_branch}"}},
                         {"is_short": True, "text": {"tag": "lark_md", "content": f"**跟踪版本**\n`{service_version}`" if service_version else "**跟踪版本**\n未配置"}},
+                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**环境**\n{environment}"}},
                     ]
                 }
             ]
@@ -523,6 +540,175 @@ async def send_config_needed_notification(
             }
         ]
     }
+
+    content_json = json.dumps(card_content, ensure_ascii=False)
+    return await send_markdown_message(
+        receive_id=receive_id,
+        markdown_content=content_json,
+        receive_id_type=receive_id_type,
+        is_card=True
+    )
+
+
+async def send_already_fixing_notification(
+    fingerprint: str,
+    pr_url: str,
+    service: str,
+    receive_id: str,
+    receive_id_type: str = "open_id",
+) -> bool:
+    """发送"跳过重复修复"卡片通知"""
+    import json
+
+    pr_line = f"**修复 PR**：{pr_url}" if pr_url else ""
+    card_content = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "⏭️ SpiderClaw 跳过重复修复"},
+            "template": "blue"
+        },
+        "elements": [
+            {"tag": "markdown", "content": "**相同错误已有修复在等待部署，跳过本次修复**"},
+            {"tag": "hr"},
+            {"tag": "div", "fields": [
+                {"is_short": True, "text": {"tag": "lark_md", "content": f"**服务名**\n{service}"}},
+                {"is_short": True, "text": {"tag": "lark_md", "content": f"**错误指纹**\n`{fingerprint}`"}},
+            ]},
+            *([{"tag": "markdown", "content": pr_line}] if pr_line else []),
+            {"tag": "hr"},
+            {"tag": "note", "elements": [{"tag": "plain_text", "content": "部署修复后，相同错误将不再触发"}]}
+        ]
+    }
+    content_json = json.dumps(card_content, ensure_ascii=False)
+    return await send_markdown_message(
+        receive_id=receive_id,
+        markdown_content=content_json,
+        receive_id_type=receive_id_type,
+        is_card=True
+    )
+
+
+async def send_runtime_repair_notification(
+    repair_success: bool,
+    service: str,
+    error_type: str,
+    error_location: str,
+    fix_description: str,
+    receive_id: str,
+    receive_id_type: str = "open_id",
+    error_message: str = "",
+    file_count: int = 0,
+    change_lines: int = 0,
+    pr_url: str = "",
+    base_url: str = "",
+    duplicate_info: dict | None = None,
+) -> bool:
+    """
+    发送运行时错误修复通知（Web 服务专用卡片格式）
+
+    Args:
+        repair_success: 修复是否成功
+        service: 服务名称
+        error_type: 错误类型
+        error_location: 错误位置（如 /app/main.py:10）
+        fix_description: 修复描述
+        receive_id: 接收者ID
+        receive_id_type: 接收者ID类型
+        error_message: 失败时的错误信息
+        file_count: 修复文件数
+        change_lines: 变更行数
+        pr_url: 修复PR链接
+        base_url: 数据统计链接
+    """
+    import re as _re
+    import json
+
+    _desc = _re.sub(r'(?<!\n)\n(?=[-*] )', r'\n\n', fix_description) if fix_description else ""
+
+    if repair_success:
+        card_content = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": "🤖 SpiderClaw 生产环境修复通知"},
+                "template": "green"
+            },
+            "elements": [
+                {"tag": "markdown", "content": f"**✅ 服务 {service} 的运行时错误已自动修复**"},
+                {"tag": "hr"},
+                {"tag": "div", "fields": [
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**错误类型**\n{error_type}"}},
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**错误位置**\n`{error_location}`"}},
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**环境**\n生产"}},
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**修复文件**\n{file_count} 个"}},
+                    {"is_short": True, "text": {"tag": "lark_md", "content": f"**变更行数**\n{change_lines} 行"}},
+                ]},
+                {"tag": "markdown", "content": f"**📝 修复说明**\n{_desc}"},
+            ]
+        }
+
+        actions = []
+        if pr_url:
+            actions.append({"tag": "button", "text": {"tag": "plain_text", "content": "🔗 查看修复PR"}, "url": pr_url, "type": "primary"})
+        if base_url:
+            actions.append({"tag": "button", "text": {"tag": "plain_text", "content": "📊 查看数据统计"}, "url": base_url, "type": "default"})
+        if actions:
+            card_content["elements"].append({"tag": "action", "actions": actions})
+    else:
+        if duplicate_info:
+            # 重复修复：合并为一条通知，展示已有修复信息
+            fp = duplicate_info.get("fingerprint", "")
+            existing_pr = duplicate_info.get("pr_url", "")
+            card_content = {
+                "config": {"wide_screen_mode": True},
+                "header": {
+                    "title": {"tag": "plain_text", "content": "⏭️ SpiderClaw 跳过重复修复"},
+                    "template": "blue"
+                },
+                "elements": [
+                    {"tag": "markdown", "content": f"**⏭️ 服务 {service} 的相同错误已有修复在等待部署，跳过本次修复**"},
+                    {"tag": "hr"},
+                    {"tag": "div", "fields": [
+                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**错误类型**\n{error_type}"}},
+                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**错误位置**\n`{error_location}`"}},
+                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**环境**\n生产"}},
+                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**错误指纹**\n`{fp}`"}},
+                    ]},
+                ]
+            }
+            if existing_pr:
+                card_content["elements"].append({"tag": "markdown", "content": f"**修复 PR**：{existing_pr}"})
+            card_content["elements"].append({"tag": "note", "elements": [{"tag": "plain_text", "content": "部署修复后，相同错误将不再触发"}]})
+        else:
+            card_content = {
+                "config": {"wide_screen_mode": True},
+                "header": {
+                    "title": {"tag": "plain_text", "content": "🤖 SpiderClaw 生产环境修复通知"},
+                    "template": "red"
+                },
+                "elements": [
+                    {"tag": "markdown", "content": f"**❌ 服务 {service} 的运行时错误修复失败**"},
+                    {"tag": "hr"},
+                    {"tag": "div", "fields": [
+                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**错误类型**\n{error_type}"}},
+                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**错误位置**\n`{error_location}`"}},
+                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**环境**\n生产"}},
+                    ]},
+                ]
+            }
+
+            if error_message:
+                card_content["elements"].append({"tag": "markdown", "content": f"**❌ 失败原因**\n{error_message}"})
+
+        actions = []
+        if base_url:
+            actions.append({"tag": "button", "text": {"tag": "plain_text", "content": "📊 查看数据统计"}, "url": base_url, "type": "default"})
+        if actions:
+            card_content["elements"].append({"tag": "action", "actions": actions})
+
+    card_content["elements"].extend([
+        {"tag": "hr"},
+        {"tag": "note", "elements": [{"tag": "plain_text", "content": "此通知由 SpiderClaw 自动修复系统生成"}]}
+    ])
 
     content_json = json.dumps(card_content, ensure_ascii=False)
     return await send_markdown_message(

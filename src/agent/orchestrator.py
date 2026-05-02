@@ -18,6 +18,7 @@ from src.agent.validation_gate import validate_fix
 from src.agent.instruction_templates import generate_instruction
 from src.agent.notification import NotificationService
 from src.notify.lark_base import init_lark_base, report_repair_record, ensure_table_ready
+from src.store.repair_store import get_repair_store, compute_traceback_fingerprint, RepairLifecycleStatus
 from src.agent.tools import (
     set_tool_context,
     clone_repository,
@@ -290,6 +291,38 @@ class RepairOrchestrator:
                     self.processed_events.discard(event_key)
                 return {"success": False, "error_message": "日志中未检测到Python错误"}
 
+            # === 状态机查重: 基于 traceback 指纹 ===
+            fingerprint = ""
+            repair_record_id = 0
+            try:
+                store = get_repair_store()
+                fingerprint = compute_traceback_fingerprint(ci_logs or "")
+                if fingerprint:
+                    existing = store.query_by_fingerprint(fingerprint)
+                    if existing:
+                        status = existing.get("status", "")
+                        record_id = existing.get("id", 0)
+                        if status == RepairLifecycleStatus.PENDING_DEPLOY:
+                            logger.info(f"指纹 {fingerprint} 已有 pending_deploy 记录，跳过")
+                            return {"success": False, "error_message": f"相同错误已有修复PR等待部署 (指纹: {fingerprint})"}
+                        elif status == RepairLifecycleStatus.DEPLOYED:
+                            logger.info(f"指纹 {fingerprint} 已部署，忽略")
+                            return {"success": False, "error_message": f"相同错误已修复并部署 (指纹: {fingerprint})"}
+                        elif status == RepairLifecycleStatus.ABANDONED:
+                            logger.info(f"指纹 {fingerprint} 已放弃，忽略")
+                            return {"success": False, "error_message": f"相同错误已放弃修复 (指纹: {fingerprint})"}
+                        elif status == RepairLifecycleStatus.FAILED:
+                            if not store.should_retry(fingerprint):
+                                logger.info(f"指纹 {fingerprint} 失败退避中，暂不重试")
+                                return {"success": False, "error_message": f"相同错误修复失败，退避中 (指纹: {fingerprint})"}
+                            logger.info(f"指纹 {fingerprint} 退避结束，允许重试")
+                            repair_record_id = record_id
+                        elif status == RepairLifecycleStatus.SUPERSEDED:
+                            logger.info(f"指纹 {fingerprint} 已过期，继续修复")
+                            repair_record_id = record_id
+            except Exception as e:
+                logger.warning(f"状态机查重失败（降级为直接修复）: {e}")
+
             # 3. 克隆仓库
             if not event.clone_url or not event.branch:
                 async with self.lock:
@@ -356,6 +389,8 @@ class RepairOrchestrator:
                 "risk_warnings": [],
                 "failed_tests": [],
                 "risk_level": "NONE",
+                "traceback_fingerprint": fingerprint,
+                "repair_record_id": repair_record_id,
             }
 
         except Exception as e:
@@ -414,6 +449,51 @@ class RepairOrchestrator:
                     self.processed_events.discard(event_key)
                 return {"success": False, "error_message": "日志中未检测到Python错误"}
 
+            # === 状态机查重: 基于 traceback 指纹 ===
+            fingerprint = ""
+            repair_record_id = 0
+            try:
+                store = get_repair_store()
+
+                # 仓库目录不存在 → 清除该服务的旧记录，避免残留指纹阻塞修复
+                repo_dir = svc_config.repo_local_path
+                if not os.path.isdir(os.path.join(repo_dir, ".git")):
+                    store.delete_by_service(event.service)
+
+                fingerprint = compute_traceback_fingerprint(event.log or "")
+                if fingerprint:
+                    existing = store.query_by_fingerprint(fingerprint)
+                    if existing:
+                        status = existing.get("status", "")
+                        record_id = existing.get("id", 0)
+                        if status == RepairLifecycleStatus.PENDING_DEPLOY:
+                            logger.info(f"指纹 {fingerprint} 已有 pending_deploy 记录，跳过")
+                            return {
+                                "success": False,
+                                "error_message": f"相同错误已有修复PR等待部署 (指纹: {fingerprint})",
+                                "duplicate_info": {
+                                    "fingerprint": fingerprint,
+                                    "pr_url": existing.get("fix_pr_url", ""),
+                                },
+                            }
+                        elif status == RepairLifecycleStatus.DEPLOYED:
+                            logger.info(f"指纹 {fingerprint} 已部署，忽略")
+                            return {"success": False, "error_message": f"相同错误已修复并部署 (指纹: {fingerprint})"}
+                        elif status == RepairLifecycleStatus.ABANDONED:
+                            logger.info(f"指纹 {fingerprint} 已放弃，忽略")
+                            return {"success": False, "error_message": f"相同错误已放弃修复 (指纹: {fingerprint})"}
+                        elif status == RepairLifecycleStatus.FAILED:
+                            if not store.should_retry(fingerprint):
+                                logger.info(f"指纹 {fingerprint} 失败退避中，暂不重试")
+                                return {"success": False, "error_message": f"相同错误修复失败，退避中 (指纹: {fingerprint})"}
+                            logger.info(f"指纹 {fingerprint} 退避结束，允许重试")
+                            repair_record_id = record_id
+                        elif status == RepairLifecycleStatus.SUPERSEDED:
+                            logger.info(f"指纹 {fingerprint} 已过期，继续修复")
+                            repair_record_id = record_id
+            except Exception as e:
+                logger.warning(f"状态机查重失败（降级为直接修复）: {e}")
+
             # 4. 路径映射
             for err in error_locations_raw:
                 fp = err.get("file_path", "")
@@ -427,7 +507,8 @@ class RepairOrchestrator:
                 version=svc_config.version,
                 branch=svc_config.git_branch,
             )
-            set_tool_context({"github_token": self.github_token, "repo_path": repo_path})
+            repo = Repo(repo_path)
+            set_tool_context({"github_token": self.github_token, "repo_path": repo_path, "repo": repo})
 
             if degraded:
                 logger.warning(f"版本降级：使用最新 {svc_config.git_branch} 分支代码")
@@ -471,6 +552,8 @@ class RepairOrchestrator:
                 "degraded_version": degraded,
                 "fix_source": "runtime_log",
                 "service_version": svc_config.version,
+                "traceback_fingerprint": fingerprint,
+                "repair_record_id": repair_record_id,
             }
 
         except Exception as e:
@@ -1102,6 +1185,7 @@ class RepairOrchestrator:
 
         try:
             repo = Repo(state["repo_path"])
+            set_tool_context({"repo": repo, "repo_path": state["repo_path"], "github_token": self.github_token})
 
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             branch_name = f"autofix/{event.event_type}_{timestamp}"
@@ -1155,12 +1239,12 @@ class RepairOrchestrator:
             if len(raw_desc) > 40:
                 short_desc = short_desc[:37] + '...'
 
-            # PR 标题：区分来源
+            # PR 标题：区分来源和环境（runtime_log=生产，CI=开发）
             if getattr(event, "event_type", "") == "runtime_log":
-                pr_title = f"[SpiderClaw: fix] {primary_error} @{event.service}: {short_desc}"
+                pr_title = f"[SpiderClaw: fix][生产] {primary_error} @{event.service}: {short_desc}"
             else:
                 pr_author_title = event.payload.get('sender', {}).get('login', '未知用户')
-                pr_title = f"[SpiderClaw: fix] {primary_error} @{pr_author_title}: {short_desc}"
+                pr_title = f"[SpiderClaw: fix][开发] {primary_error} @{pr_author_title}: {short_desc}"
 
             pr_url = create_pull_request.invoke({
                 "repo_full_name": event.repository,
@@ -1173,12 +1257,42 @@ class RepairOrchestrator:
             if not pr_url.startswith("Error:"):
                 pr_number = int(pr_url.split("/")[-1]) if pr_url else 0
                 # 根据事件源确定目标表名（先在通知前解析，供通知和上报使用）
-                table_name = self.SOURCE_TABLE_MAP.get(event.source, "修复记录")
+                table_name = self.SOURCE_TABLE_MAP.get(event.source, f"{event.service}-修复表")
 
                 # 提前缓存表ID，确保通知中的链接包含 ?table= 参数
                 await ensure_table_ready(table_name)
 
-                self.notification.send_pr_created(state, pr_url, diff_content=real_diff, table_name=table_name)
+                # 根据事件类型发送不同格式的通知
+                if getattr(event, "event_type", "") == "runtime_log":
+                    # Web 服务运行时错误 - 使用专用通知格式
+                    error_type = "Unknown"
+                    error_location = ""
+                    if state.error_locations:
+                        first = state.error_locations[0]
+                        error_type = first.error_type if hasattr(first, 'error_type') else first.get('error_type', 'Unknown')
+                        fp = first.file_path if hasattr(first, 'file_path') else first.get('file_path', '')
+                        ln = first.line_number if hasattr(first, 'line_number') else first.get('line_number', 0)
+                        error_location = f"{fp}:{ln}" if fp else ""
+
+                    change_lines = 0
+                    if real_diff:
+                        adds = len([l for l in real_diff.split('\n') if l.startswith('+') and not l.startswith('+++')])
+                        deletes = len([l for l in real_diff.split('\n') if l.startswith('-') and not l.startswith('---')])
+                        change_lines = adds + deletes
+
+                    self.notification.send_runtime_pr_created(
+                        service=event.service,
+                        error_type=error_type,
+                        error_location=error_location,
+                        fix_description=state.fix_description,
+                        file_count=len(state.modified_files) or 0,
+                        change_lines=change_lines,
+                        pr_url=pr_url,
+                        table_name=table_name,
+                    )
+                else:
+                    # CI 测试事件 - 使用原有格式
+                    self.notification.send_pr_created(state, pr_url, diff_content=real_diff, table_name=table_name, environment="开发")
 
                 # 上报修复成功记录到多维表格
                 try:
@@ -1210,13 +1324,16 @@ class RepairOrchestrator:
                     if event.repository and hasattr(event, 'pr_number') and event.pr_number:
                         original_pr_url = f"https://github.com/{event.repository}/pull/{event.pr_number}"
 
-                    # 环境映射
-                    env_map = {
-                        "development": "开发",
-                        "testing": "测试",
-                        "production": "生产"
-                    }
-                    environment = env_map.get(self.environment, "开发")
+                    # 环境映射：runtime_log 事件为生产环境，其他根据配置
+                    if getattr(event, "event_type", "") == "runtime_log":
+                        environment = "生产"
+                    else:
+                        env_map = {
+                            "development": "开发",
+                            "testing": "测试",
+                            "production": "生产"
+                        }
+                        environment = env_map.get(self.environment, "开发")
 
                     await report_repair_record(
                         error_type=error_type,
@@ -1240,6 +1357,26 @@ class RepairOrchestrator:
                 except Exception as e:
                     logger.error(f"上报修复记录失败: {e}", exc_info=True)
 
+                # === 状态机: 写入 pending_deploy 记录 ===
+                try:
+                    fp = state.get("traceback_fingerprint", "")
+                    if fp:
+                        store = get_repair_store()
+                        store.upsert(
+                            fp,
+                            RepairLifecycleStatus.PENDING_DEPLOY.value,
+                            service=getattr(event, "service", "") or event.repository,
+                            error_type=error_type,
+                            fix_pr_url=pr_url,
+                            fix_pr_number=str(pr_number),
+                            fix_description=state.fix_description,
+                            service_version=state.get("service_version", ""),
+                            repo_name=event.repository,
+                            branch_name=event.branch,
+                        )
+                except Exception as e:
+                    logger.error(f"状态机 pending_deploy 写入失败: {e}")
+
                 return {"pr_url": pr_url, "pr_number": pr_number, "success": True, "diff_content": real_diff}
             else:
                 return {"success": False, "error_message": pr_url}
@@ -1259,12 +1396,34 @@ class RepairOrchestrator:
 
         # 根据事件源确定目标表名（先在通知前解析，供通知和上报使用）
         event = state.event
-        table_name = self.SOURCE_TABLE_MAP.get(event.source, "修复记录")
+        table_name = self.SOURCE_TABLE_MAP.get(event.source, f"{event.service}-修复表")
 
         # 提前缓存表ID，确保通知中的链接包含 ?table= 参数
         await ensure_table_ready(table_name)
 
-        self.notification.send_failure(state, table_name=table_name)
+        # 根据事件类型发送不同格式的通知
+        if getattr(event, "event_type", "") == "runtime_log":
+            # Web 服务运行时错误 - 使用专用通知格式
+            error_type = "Unknown"
+            error_location = ""
+            if state.error_locations:
+                first = state.error_locations[0]
+                error_type = first.error_type if hasattr(first, 'error_type') else first.get('error_type', 'Unknown')
+                fp = first.file_path if hasattr(first, 'file_path') else first.get('file_path', '')
+                ln = first.line_number if hasattr(first, 'line_number') else first.get('line_number', 0)
+                error_location = f"{fp}:{ln}" if fp else ""
+
+            self.notification.send_runtime_failure(
+                service=event.service,
+                error_type=error_type,
+                error_location=error_location,
+                error_message=state.error_message,
+                table_name=table_name,
+                duplicate_info=state.get("duplicate_info"),
+            )
+        else:
+            # CI 测试事件 - 使用原有格式
+            self.notification.send_failure(state, table_name=table_name, environment="开发")
 
         # 上报修复失败记录到多维表格
         try:
@@ -1314,13 +1473,16 @@ class RepairOrchestrator:
             if repo_name and hasattr(event, 'pr_number') and event.pr_number:
                 original_pr_url = f"https://github.com/{repo_name}/pull/{event.pr_number}"
 
-            # 环境映射
-            env_map = {
-                "development": "开发",
-                "testing": "测试",
-                "production": "生产"
-            }
-            environment = env_map.get(self.environment, "开发")
+            # 环境映射：runtime_log 事件为生产环境，其他根据配置
+            if getattr(event, "event_type", "") == "runtime_log":
+                environment = "生产"
+            else:
+                env_map = {
+                    "development": "开发",
+                    "testing": "测试",
+                    "production": "生产"
+                }
+                environment = env_map.get(self.environment, "开发")
 
             await report_repair_record(
                 error_type=error_type,
@@ -1343,6 +1505,34 @@ class RepairOrchestrator:
             )
         except Exception as e:
             logger.error(f"上报失败记录失败: {e}", exc_info=True)
+
+        # === 状态机: 记录修复失败 ===
+        try:
+            fp = state.get("traceback_fingerprint", "")
+            if fp:
+                store = get_repair_store()
+                record = store.query_by_fingerprint(fp)
+                new_fail_count = (record.get("fail_count", 0) + 1) if record else 1
+                new_status = (
+                    RepairLifecycleStatus.ABANDONED.value
+                    if new_fail_count >= 3
+                    else RepairLifecycleStatus.FAILED.value
+                )
+                store.upsert(
+                    fp,
+                    new_status,
+                    service=getattr(event, "service", "") or event.repository,
+                    error_type=error_type,
+                    service_version=state.get("service_version", ""),
+                    repo_name=repo_name,
+                    branch_name=branch_name,
+                    increment_fail=True,
+                )
+                if new_fail_count >= 3:
+                    logger.warning(f"指纹 {fp} 已失败 {new_fail_count} 次，标记为 abandoned")
+        except Exception as e:
+            logger.error(f"状态机 failed 写入失败: {e}")
+
         finally:
             audit_logger.log_event("node_exit", node="handle_failure")
 

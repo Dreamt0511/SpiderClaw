@@ -207,6 +207,11 @@ class GitHubWebhookMonitor(BaseMonitor):
                     return {"status": "ignored", "reason": f"check_run conclusion '{event.conclusion}' is not failure"}
                 logger.info(f"Accepted check_run event: {event_id}, conclusion: {event.conclusion}")
 
+            # 过滤 SpiderClaw 自动修复 PR 的 CI 事件，避免循环修复
+            if event.branch and event.branch.startswith("autofix/"):
+                logger.info(f"Ignoring SpiderClaw's own PR event: {event_id}, branch: {event.branch}")
+                return {"status": "ignored", "reason": "SpiderClaw autofix branch, skip to avoid loop"}
+
             # 发布事件到总线
             audit_logger.log_event(
                 "system_action",
@@ -237,12 +242,21 @@ class GitHubWebhookMonitor(BaseMonitor):
             # 查找服务配置
             registry = get_service_registry()
             svc = registry.get(service_name)
-            if not svc:
-                logger.warning(f"未知服务: {service_name}")
-                return {"status": "unknown_service", "service": service_name}
 
-            # 创建事件
+            # 创建事件（未注册的服务也发布，由编排器决定发通知）
             import uuid
+            import re
+
+            # 从 repo_url 提取仓库全名（如 "Dreamt0511/AutoFix_Test_rep"）
+            def _extract_repo_full_name(url: str) -> str:
+                if not url:
+                    return ""
+                # https://github.com/owner/repo.git → owner/repo
+                m = re.search(r'github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$', url)
+                return m.group(1) if m else ""
+
+            repo_full_name = _extract_repo_full_name(svc.repo_url) if svc else ""
+
             event = RuntimeLogEvent(
                 event_id=str(uuid.uuid4()),
                 source="remote_log",
@@ -250,14 +264,17 @@ class GitHubWebhookMonitor(BaseMonitor):
                 service=service_name,
                 version=body.get("version", ""),
                 hostname=body.get("hostname", ""),
-                repo_url=svc.repo_url,
-                repo_local_path=svc.repo_local_path,
-                branch=svc.git_branch,
-                path_mapping=svc.path_mapping,
+                repo_url=svc.repo_url if svc else "",
+                repo_local_path=svc.repo_local_path if svc else "",
+                branch=svc.git_branch if svc else "main",
+                path_mapping=svc.path_mapping if svc else {},
                 # 兼容字段
-                repository=service_name,
-                clone_url=svc.repo_url,
+                repository=repo_full_name,
+                clone_url=svc.repo_url if svc else "",
             )
+
+            if not svc:
+                logger.warning(f"未知服务: {service_name}")
 
             # 发布到事件总线
             publish_success = await self.publish_event(event)

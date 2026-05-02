@@ -128,3 +128,7 @@ class RepairState(BaseModel):
     service_version: str = ""        # 修复所基于的版本号（用于通知展示）
     fix_source: str = ""             # 修复来源："github" | "runtime_log"
     degraded_version: bool = False   # 是否降级到最新代码
+
+    # --- 状态机字段 ---
+    traceback_fingerprint: str = ""  # traceback 指纹，12位hex
+    repair_record_id: int = 0        # SQLite 中的记录ID（用于后续更新）

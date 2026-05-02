@@ -430,21 +430,14 @@ def _is_system_path(file_path: str) -> bool:
     if not file_path:
         return False
 
-    # 已知的项目工作目录前缀（CI 环境下）
-    PROJECT_PREFIXES = ("/github/workspace/", "./", "/home/runner/work/")
     # 系统/Python 安装路径特征
     SYSTEM_INDICATORS = ("/lib/python", "\\lib\\python", "/site-packages/", "\\site-packages\\")
 
     lower = file_path.lower()
 
-    # 绝对路径且不在项目前缀中 → 系统文件
-    if file_path.startswith("/"):
-        if any(file_path.startswith(p) for p in PROJECT_PREFIXES):
-            return False
-        # 包含 Python 标准库路径特征
-        if any(indicator in lower for indicator in SYSTEM_INDICATORS):
-            return True
-        return True  # 其他绝对路径均视为系统路径
+    # 包含 Python 标准库路径特征 → 系统文件
+    if any(indicator in lower for indicator in SYSTEM_INDICATORS):
+        return True
 
     return False
 

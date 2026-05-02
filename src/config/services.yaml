@@ -1,22 +1,11 @@
-# 远程服务注册配置
-# 每个服务对应一个线上业务系统，采集脚本通过 service name 关联
-#
-# 配置方式：
-#   1. 手动编辑此文件，或
-#   2. 使用 spiderclaw sync --name <服务名> --version <版本号> 自动拉取代码
-#
-# version 字段：当前线上稳定版本（commit SHA 或 tag）
-#   - 为空时，该服务的错误不会自动修复，仅发飞书通知提醒配置
-#   - 服务更新版本后，运行 spiderclaw sync 更新此字段和本地代码
 services:
-  # - name: "order-service"
-  #   repo_url: "https://github.com/myteam/order-service.git"
-  #   repo_local_path: "/data/repos/order-service"
-  #   version: ""  # 必填！commit SHA 或 tag，为空则不自动修复
-  #   git_branch: "main"
-  #   path_mapping:
-  #     "/app/": "src/"
-
+- name: order-service
+  repo_url: https://github.com/Dreamt0511/AutoFix_Test_rep
+  repo_local_path: D:/U 盘/SpiderClaw/data/repos/order-service
+  version: main
+  git_branch: main
+  path_mapping:
+    /app/: src/
 rate_limit:
   max_fixes_per_minute: 3
   max_fixes_per_hour: 20
