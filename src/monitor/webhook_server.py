@@ -22,6 +22,21 @@ from src.store.repair_store import get_pending_event_store
 from src.utils.audit import audit_logger
 from src.utils.rate_limiter import ServiceRateLimiter
 
+class SafeRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
+    """文件被删除后自动重建的日志 Handler。"""
+
+    def emit(self, record):
+        try:
+            if self.stream and self.stream.closed:
+                self.stream = self._open()
+            elif self.stream and not os.path.exists(self.baseFilename):
+                self.stream.close()
+                self.stream = self._open()
+        except Exception:
+            self.stream = self._open()
+        super().emit(record)
+
+
 # 强制启用颜色输出，即使输出到非终端
 console = Console(force_terminal=True, color_system="auto")
 logger = logging.getLogger(__name__)
@@ -70,11 +85,11 @@ class GitHubWebhookMonitor(BaseMonitor):
         log_dir = "src/logs"
         os.makedirs(log_dir, exist_ok=True)
         if not any(
-            isinstance(h, logging.handlers.TimedRotatingFileHandler)
+            isinstance(h, (SafeRotatingFileHandler, logging.handlers.TimedRotatingFileHandler))
             and h.baseFilename.endswith("spiderclaw.log")
             for h in logging.root.handlers
         ):
-            file_handler = logging.handlers.TimedRotatingFileHandler(
+            file_handler = SafeRotatingFileHandler(
                 os.path.join(log_dir, "spiderclaw.log"),
                 when="midnight",
                 interval=1,
@@ -312,6 +327,7 @@ class GitHubWebhookMonitor(BaseMonitor):
 
             return {"status": "accepted", "event_id": event.event_id}
 
+
     def _verify_signature(self, body: bytes, signature_header: str) -> bool:
         """
         验证GitHub Webhook签名
@@ -450,13 +466,32 @@ def run_webhook_server(
     reload: bool = False,
     secret: Optional[str] = None,
     console_output: bool = True,
+    config_path: Optional[str] = None,
+    log_level: Optional[str] = None,
 ) -> None:
-    """同步方式启动Webhook服务（用于CLI直接调用）"""
+    """同步方式启动Webhook服务（用于CLI直接调用）
+
+    Args:
+        host: 监听主机地址
+        port: 监听端口
+        reload: 是否启用热重载
+        secret: GitHub Webhook密钥
+        console_output: 是否输出到控制台（dashboard模式下为False）
+        config_path: 配置文件路径（None则使用默认路径）
+        log_level: 日志级别覆盖（None则使用配置文件中的值）
+    """
     from src.config.settings import get_settings
     from src.utils.logging import get_logger
     from src.bus import get_event_bus, GitHubEvent
+    from src.bus.schemas import RuntimeLogEvent
     from src.agent.orchestrator import RepairOrchestrator
-    from logging.handlers import TimedRotatingFileHandler
+
+    # 构建配置覆盖
+    overrides = {}
+    if log_level is not None:
+        overrides["logging"] = {"level": log_level}
+
+    settings = get_settings(config_path=config_path, overrides=overrides)
 
     log = get_logger(__name__)
 
@@ -464,15 +499,15 @@ def run_webhook_server(
     for handler in logging.root.handlers[:]:
         logging.root.removeHandler(handler)
 
-    log_dir = "src/logs"
+    log_dir = settings.logging.dir
     os.makedirs(log_dir, exist_ok=True)
 
     # 文件日志（主日志，自动轮转）
-    file_handler = TimedRotatingFileHandler(
+    file_handler = SafeRotatingFileHandler(
         os.path.join(log_dir, "spiderclaw.log"),
         when="midnight",
         interval=1,
-        backupCount=30,
+        backupCount=settings.logging.retention_days,
         encoding="utf-8",
     )
     file_handler.setFormatter(
@@ -484,11 +519,11 @@ def run_webhook_server(
     file_handler.setLevel(logging.INFO)
 
     # 详细日志（保存到 detail.log，不与 dashboard 共享）
-    detail_handler = TimedRotatingFileHandler(
+    detail_handler = SafeRotatingFileHandler(
         os.path.join(log_dir, "detail.log"),
         when="midnight",
         interval=1,
-        backupCount=30,
+        backupCount=settings.logging.retention_days,
         encoding="utf-8",
     )
     detail_handler.setFormatter(
@@ -516,9 +551,8 @@ def run_webhook_server(
     # 直接添加 handler（比 logging.basicConfig 更可靠，不受线程竞争影响）
     logging.root.addHandler(file_handler)
     logging.root.addHandler(detail_handler)
-    logging.root.setLevel(logging.DEBUG)
-
-    settings = get_settings()
+    log_level_int = getattr(logging, settings.logging.level.upper(), logging.DEBUG)
+    logging.root.setLevel(log_level_int)
 
     # 设置SSL验证环境变量（CI日志下载等HTTP客户端会读取）
     os.environ["SSL_VERIFY"] = str(settings.webhook.ssl_verify).lower()
@@ -559,6 +593,10 @@ def run_webhook_server(
                 lark_base_token=settings.lark.base_token,
                 lark_base_repair_table_id=settings.lark.repair_table_id,
                 lark_as_bot=settings.lark.as_bot,
+                lark_auto_create_table=settings.lark.auto_create_table,
+                lark_auto_fix_fields=settings.lark.auto_fix_fields,
+                lark_alert_on_failure=settings.lark.alert_on_failure,
+                lark_alert_threshold=settings.lark.alert_threshold,
                 environment=settings.environment
             )
         except Exception as e:
@@ -621,19 +659,46 @@ def run_webhook_server(
         else:
             log.warning(f"待处理事件数量 ({count}) 超过阈值 ({threshold})，需人工确认")
             try:
-                from src.notify.lark_notify import send_pending_events_notification
-                event_summaries = [
-                    {
-                        "event_id": r["event_id"],
-                        "event_type": r["event_type"],
-                        "source": r["source"],
-                        "created_at": r["created_at"],
-                    }
-                    for r in pending_events
-                ]
-                await send_pending_events_notification(
-                    event_summaries, count, settings.lark.notify_users,
+                from src.notify.lark_notify import (
+                    ensure_approval_definition,
+                    subscribe_approval_events,
+                    send_pending_events_notification,
                 )
+                from src.store.repair_store import get_pending_approval_store
+
+                # 自动确保审批定义存在
+                approver = settings.lark.notify_users[0] if settings.lark.notify_users else ""
+                approval_code, widget_id = await ensure_approval_definition(
+                    config_approval_code=settings.lark.approval_code,
+                    approver_open_id=approver,
+                )
+
+                if approval_code and widget_id:
+                    # 订阅审批事件（幂等，重复调用无副作用）
+                    await subscribe_approval_events(approval_code)
+
+                    event_summaries = [
+                        {
+                            "event_id": r["event_id"],
+                            "event_type": r["event_type"],
+                            "source": r["source"],
+                            "created_at": r["created_at"],
+                        }
+                        for r in pending_events
+                    ]
+                    instance_code = await send_pending_events_notification(
+                        event_summaries, count, settings.lark.notify_users,
+                        approval_code=approval_code,
+                        widget_id=widget_id,
+                    )
+                    if instance_code:
+                        approval_store = get_pending_approval_store()
+                        approval_store.insert(instance_code, count)
+                        log.info(f"审批实例已创建: {instance_code}")
+                    else:
+                        log.error("创建审批实例失败")
+                else:
+                    log.error("审批定义创建失败，跳过通知")
             except Exception as e:
                 log.error(f"发送待处理事件通知失败: {e}")
 
@@ -662,14 +727,9 @@ def run_webhook_server(
 
                     async def process_runtime_and_mark_done(evt=event):
                         try:
-                            result = await orchestrator.run(evt)
-                            if result.get("success"):
-                                pending_store.delete(evt.event_id)
-                            else:
-                                pending_store.mark_pending(evt.event_id)
-                        except Exception:
-                            pending_store.mark_pending(evt.event_id)
+                            await orchestrator.run(evt)
                         finally:
+                            pending_store.delete(evt.event_id)
                             event_bus.mark_done()
 
                     asyncio.create_task(
@@ -684,14 +744,9 @@ def run_webhook_server(
 
                     async def process_and_mark_done(evt=event):
                         try:
-                            result = await orchestrator.run(evt)
-                            if result.get("success"):
-                                pending_store.delete(evt.event_id)
-                            else:
-                                pending_store.mark_pending(evt.event_id)
-                        except Exception:
-                            pending_store.mark_pending(evt.event_id)
+                            await orchestrator.run(evt)
                         finally:
+                            pending_store.delete(evt.event_id)
                             event_bus.mark_done()
 
                     asyncio.create_task(
@@ -708,13 +763,93 @@ def run_webhook_server(
                 log.error(f"事件消费出错: {e}", exc_info=True)
                 await asyncio.sleep(1)
 
+    async def approval_event_listener():
+        """通过飞书长连接监听审批状态变更事件，处理待处理事件的确认/拒绝"""
+        import sys as _sys
+
+        log.info(">>> approval_event_listener 函数开始执行")
+        lark_cmd = "lark-cli.cmd" if _sys.platform == "win32" else "lark-cli"
+        cmd_str = f"{lark_cmd} event +subscribe --as bot --event-types approval_instance --force"
+
+        log.info("启动飞书审批事件监听 (WebSocket 长连接)")
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd_str, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        except Exception as e:
+            log.error(f"启动审批事件监听失败: {e}", exc_info=True)
+            return
+
+        pending_store = get_pending_event_store()
+        from src.store.repair_store import get_pending_approval_store
+        approval_store = get_pending_approval_store()
+
+        try:
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                try:
+                    data = json.loads(line.decode("utf-8").strip())
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+
+                # 提取审批事件信息
+                event = data.get("event", data)
+                instance_code = event.get("instance_code", "")
+                status = event.get("status", "")
+
+                if not instance_code:
+                    continue
+
+                # 查找对应的审批记录
+                approval = approval_store.get_by_instance_code(instance_code)
+                if not approval or approval["status"] != "PENDING":
+                    continue
+
+                log.info(f"收到审批事件: {instance_code}, 状态: {status}")
+
+                if status == "APPROVED":
+                    # 恢复处理待处理事件
+                    pending_events = pending_store.get_all_pending()
+                    count = 0
+                    for record in pending_events:
+                        try:
+                            payload = json.loads(record["payload"])
+                            if record["event_type"] == "runtime_log":
+                                event_obj = RuntimeLogEvent(**payload)
+                            else:
+                                event_obj = GitHubEvent(**payload)
+                            await event_bus.publish(event_obj)
+                            count += 1
+                        except Exception as e:
+                            log.error(f"恢复事件 {record['event_id']} 失败: {e}")
+                            pending_store.delete(record["event_id"])
+                    log.info(f"审批通过：已恢复 {count} 个待处理事件")
+                    approval_store.update_status(instance_code, "APPROVED")
+
+                elif status in ("REJECTED", "CANCELED", "DELETED"):
+                    # 丢弃待处理事件
+                    count = pending_store.delete_all_pending()
+                    log.info(f"审批拒绝/取消：已丢弃 {count} 个待处理事件")
+                    approval_store.update_status(instance_code, status)
+
+        except asyncio.CancelledError:
+            pass
+        finally:
+            proc.terminate()
+
     async def _run():
         # 启动时恢复上次中断的未处理事件
         await recover_pending_events()
         tasks = [asyncio.create_task(monitor.start())]
         if orchestrator:
             tasks.append(asyncio.create_task(event_consumer()))
-        await asyncio.gather(*tasks, return_exceptions=True)
+        approval_task = asyncio.create_task(approval_event_listener())
+        tasks.append(approval_task)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                log.error(f"任务 {i} 异常退出: {result}", exc_info=result)
 
     try:
         audit_logger.log_event("milestone", node="service_start")

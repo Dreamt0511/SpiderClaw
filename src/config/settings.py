@@ -73,6 +73,9 @@ class LarkConfig(BaseModel):
     # 告警配置
     alert_on_failure: bool = Field(default=True, description="上报失败时是否发送告警通知")
     alert_threshold: int = Field(default=3, description="连续失败多少次后发送告警")
+    # 审批配置
+    approval_code: str = Field(default="", description="飞书审批定义 code")
+    approval_widget_id: str = Field(default="", description="审批表单中事件摘要控件的 widget_id")
 
 
 class ServiceConfig(BaseModel):

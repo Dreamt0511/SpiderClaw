@@ -495,3 +495,111 @@ def get_pending_event_store(db_path: str = "data/repair_records.db") -> PendingE
     if _pending_event_store is None:
         _pending_event_store = PendingEventStore(db_path)
     return _pending_event_store
+
+
+class PendingApprovalStore:
+    """审批实例跟踪存储 — 记录活跃的审批实例，等待事件回调处理"""
+
+    def __init__(self, db_path: str = "data/repair_records.db"):
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+        self._init_table()
+
+    def _init_table(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS pending_approvals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    instance_code TEXT UNIQUE NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'PENDING',
+                    event_count INTEGER NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_approval_instance
+                ON pending_approvals(instance_code)
+            """)
+            conn.commit()
+
+    def insert(self, instance_code: str, event_count: int) -> bool:
+        """记录审批实例"""
+        now = time.time()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    """INSERT OR IGNORE INTO pending_approvals
+                       (instance_code, event_count, status, created_at, updated_at)
+                       VALUES (?, ?, 'PENDING', ?, ?)""",
+                    (instance_code, event_count, now, now),
+                )
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"记录审批实例失败: {e}")
+            return False
+
+    def get_active(self) -> list[dict]:
+        """获取所有 PENDING 状态的审批"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(
+                    "SELECT * FROM pending_approvals WHERE status = 'PENDING' ORDER BY created_at"
+                )
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"查询活跃审批失败: {e}")
+            return []
+
+    def get_by_instance_code(self, instance_code: str) -> dict | None:
+        """根据 instance_code 查找审批"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(
+                    "SELECT * FROM pending_approvals WHERE instance_code = ?",
+                    (instance_code,),
+                )
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"查找审批实例失败: {e}")
+            return None
+
+    def update_status(self, instance_code: str, status: str) -> bool:
+        """更新审批状态"""
+        now = time.time()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    """UPDATE pending_approvals
+                       SET status = ?, updated_at = ?
+                       WHERE instance_code = ?""",
+                    (status, now, instance_code),
+                )
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"更新审批状态失败: {e}")
+            return False
+
+    def delete(self, instance_code: str) -> bool:
+        """删除已处理的审批"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "DELETE FROM pending_approvals WHERE instance_code = ?",
+                    (instance_code,),
+                )
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"删除审批实例失败: {e}")
+            return False
+
+
+def get_pending_approval_store(db_path: str = "data/repair_records.db") -> PendingApprovalStore:
+    """获取审批跟踪存储单例"""
+    return PendingApprovalStore(db_path)

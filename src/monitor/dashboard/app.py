@@ -84,6 +84,11 @@ class Dashboard:
         t.start()
 
     def run(self):
+        # Windows 控制台默认 GBK 编码，无法渲染 Unicode box-drawing 字符
+        if sys.platform == "win32":
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
         self.reader.start()
         self._running = True
         self._start_keyboard_listener()

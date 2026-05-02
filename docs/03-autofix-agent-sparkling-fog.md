@@ -6,8 +6,8 @@
   # 1. 在 Agent 端注册服务
   vim src/config/services.yaml  # 添加服务配置
 
-  # 2. 启动 Webhook 服务
-  spiderclaw webhook start --secret <secret> --port 8000
+  # 2. 启动服务
+  spiderclaw --no-dashboard --secret <secret> --port 8000
 
   # 3. 生成采集脚本并部署到业务服务器
   spiderclaw init-sidecar -o ./sidecar -n "order-service" --agent-url http://agent-host:8000/webhook/log

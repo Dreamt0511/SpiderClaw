@@ -62,14 +62,11 @@ cp src/config/agent-config.example.yaml src/config/agent-config.yaml
 
 ### 3. 启动服务
 ```bash
-# 启动Webhook服务
-spiderclaw webhook start --secret <your-webhook-secret> --port 8000
-
-# 或直接运行
-python main.py webhook start --secret <your-webhook-secret> --port 8000
-
-#简化CLI命令(默认启动Webhook服务)
+# 启动完整服务（Webhook + 仪表盘）
 spiderclaw
+
+# 仅启动Webhook服务（无仪表盘，适合容器/服务器环境）
+spiderclaw --no-dashboard --secret <your-webhook-secret> --port 8000
 ```
 
 
@@ -130,6 +127,73 @@ lark:
 - 修复成功率
 - 平均修复时长
 - Token消耗统计
+
+## ✅ 飞书审批功能配置
+
+### 功能说明
+当服务重启后发现未处理的事件时，系统会通过飞书审批流程请求人工确认是否恢复处理。这可以防止自动处理可能已过期的事件。
+
+### 配置步骤
+
+#### 1. 配置审批人（必须）
+在配置文件中设置 `notify_users`，**必须是用户的 `open_id`**（以 `ou_` 开头）：
+
+```yaml
+lark:
+  enabled: true
+  app_id: "cli_xxxxxx"
+  app_secret: "your-app-secret"
+  notify_users: ["ou_xxxxxx"]  # 必须是用户 open_id，不能是群组 chat_id
+```
+
+**重要**：
+- `notify_users` 必须是用户的 `open_id`（以 `ou_` 开头），不能是群组的 `chat_id`（以 `oc_` 开头）
+- 如果配置错误，会出现错误码 `1390001 - user id not found`
+
+#### 2. 获取用户 open_id
+有几种方式可以获取用户的 `open_id`：
+
+**方式一：通过飞书管理后台**
+1. 登录 [飞书管理后台](https://open.feishu.cn/app)
+2. 进入"通讯录" → 找到目标用户 → 查看"open_id"
+
+**方式二：通过飞书开放平台 API**
+```bash
+# 使用 lark-cli 查询用户信息
+lark-cli contact +users-batch-get-id --emails "user@example.com"
+```
+
+**方式三：通过飞书机器人接收消息**
+当用户向机器人发送消息时，消息中会包含用户的 `open_id`
+
+#### 3. 审批配置（可选）
+系统支持自动创建审批定义，也可以手动配置：
+
+```yaml
+lark:
+  # ... 其他配置 ...
+  approval_code: ""  # 可选，为空时系统自动创建
+  approval_widget_id: ""  # 可选，审批表单控件ID
+```
+
+- 如果 `approval_code` 为空，系统会自动创建审批定义并保存到 `data/approval_config.json`
+- 审批定义创建后，后续重启会复用已有的定义
+
+### 工作流程
+1. 服务重启 → 检测到未处理事件
+2. 如果事件数量 ≤ `pending_event_auto_threshold`（默认5个），自动恢复处理
+3. 如果事件数量 > 阈值，创建飞书审批实例请求人工确认
+4. 用户在飞书审批中心点击"同意"或"拒绝"
+5. 系统根据审批结果决定是否恢复处理事件
+
+### 常见问题
+
+**错误码 1390001 - user id not found**
+- 原因：`notify_users` 中配置的不是用户 `open_id`，而是群组 `chat_id` 或其他无效 ID
+- 解决：确保配置的是以 `ou_` 开头的用户 `open_id`
+
+**审批事件订阅失败（错误码 1390007）**
+- 这是正常现象，表示审批事件已订阅，可以忽略
 
 ## 🔧 技术栈
 | 层级       | 技术选型                | 说明                     |

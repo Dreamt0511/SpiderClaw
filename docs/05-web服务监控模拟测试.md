@@ -10,7 +10,7 @@ pytest tests/ -v
 
 ```bash
 # 终端 1：启动 webhook
-spiderclaw webhook start --port 8000
+spiderclaw --no-dashboard --port 8000
 
 # 终端 2：模拟采集脚本发送错误，测试的version可以设置为main
 curl -X POST http://localhost:8000/webhook/log \
@@ -42,7 +42,7 @@ spiderclaw config  # 选"服务注册"，填入一个真实仓库
 spiderclaw sync -n order-service -v <真实commit>
 
 # 3) 启动服务
-spiderclaw webhook start --port 8000
+spiderclaw --no-dashboard --port 8000
 
 # 4) 模拟错误
 curl -X POST http://localhost:8000/webhook/log \

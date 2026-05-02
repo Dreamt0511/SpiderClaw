@@ -161,11 +161,13 @@ def main(
     port: int = typer.Option(8000, "--port", "-p", help="Webhook监听端口"),
     host: str = typer.Option("0.0.0.0", "--host", "-h", help="Webhook监听地址"),
     reload: bool = typer.Option(False, "--reload", help="热重载"),
+    no_dashboard: bool = typer.Option(False, "--no-dashboard", help="仅启动Webhook服务，不启动仪表盘"),
 ):
     """
     SpiderClaw 事件驱动的自动诊断与修复系统
 
-    不带参数直接运行将启动Webhook总监控服务
+    不带参数直接运行将启动Webhook总监控服务（含仪表盘）
+    加 --no-dashboard 仅启动Webhook服务（适合容器/服务器环境）
     """
     global CONFIG_PATH
     if config:
@@ -173,31 +175,41 @@ def main(
 
     # 打印启动 Logo 并启动全部服务（仅无子命令时）
     if ctx.invoked_subcommand is None:
-        # 后台启动 Webhook 服务
         from src.monitor.webhook_server import run_webhook_server
 
-        webhook_thread = threading.Thread(
-            target=run_webhook_server,
-            kwargs={"host": host, "port": port, "reload": reload, "console_output": False},
-            daemon=True,
-        )
-        webhook_thread.start()
+        webhook_kwargs = {
+            "host": host,
+            "port": port,
+            "reload": reload,
+            "config_path": config,
+        }
 
-        # 前台启动监控面板（banner + dashboard 统一在 Live 内渲染）
-        from src.monitor.dashboard import Dashboard
-        from src.monitor.dashboard.modules.log_module import LogModule
-        from src.monitor.dashboard.modules.node_module import NodeModule
-        from src.monitor.dashboard.modules.tool_module import ToolModule
-        from src.monitor.dashboard.modules.stats_module import StatsModule
-        from src.monitor.dashboard.modules.status_module import StatusModule
+        if no_dashboard:
+            # 无仪表盘模式：直接在主线程运行 Webhook 服务
+            run_webhook_server(console_output=True, **webhook_kwargs)
+        else:
+            # 带仪表盘模式：Webhook 在后台线程，前台运行 TUI 面板
+            webhook_thread = threading.Thread(
+                target=run_webhook_server,
+                kwargs={"console_output": False, **webhook_kwargs},
+                daemon=True,
+            )
+            webhook_thread.start()
 
-        dash = Dashboard("src/logs/audit.jsonl", banner=make_banner())
-        dash.register(LogModule())
-        dash.register(NodeModule())
-        dash.register(ToolModule())
-        dash.register(StatsModule())
-        dash.register(StatusModule())
-        dash.run()
+            from src.monitor.dashboard import Dashboard
+            from src.monitor.dashboard.modules.log_module import LogModule
+            from src.monitor.dashboard.modules.node_module import NodeModule
+            from src.monitor.dashboard.modules.tool_module import ToolModule
+            from src.monitor.dashboard.modules.stats_module import StatsModule
+            from src.monitor.dashboard.modules.status_module import StatusModule
+
+            dash = Dashboard("src/logs/audit.jsonl", banner=make_banner())
+            dash.register(LogModule())
+            dash.register(NodeModule())
+            dash.register(ToolModule())
+            dash.register(StatsModule())
+            dash.register(StatusModule())
+            dash.run()
 
 
 @app.command("config")

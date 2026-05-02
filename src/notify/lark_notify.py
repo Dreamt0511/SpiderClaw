@@ -588,72 +588,271 @@ async def send_already_fixing_notification(
     )
 
 
+APPROVAL_WIDGET_ID = "event_summary"
+_APPROVAL_CONFIG_PATH = "data/approval_config.json"
+
+
+def _load_approval_code() -> str:
+    """从本地文件读取已保存的 approval_code"""
+    import os
+    try:
+        if os.path.exists(_APPROVAL_CONFIG_PATH):
+            with open(_APPROVAL_CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data.get("approval_code", "")
+    except Exception as e:
+        logger.warning(f"读取审批配置失败: {e}")
+    return ""
+
+
+def _save_approval_code(approval_code: str):
+    """保存 approval_code 到本地文件"""
+    import os
+    os.makedirs(os.path.dirname(_APPROVAL_CONFIG_PATH), exist_ok=True)
+    with open(_APPROVAL_CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump({"approval_code": approval_code}, f, ensure_ascii=False, indent=2)
+    logger.info(f"审批配置已保存: {_APPROVAL_CONFIG_PATH}")
+
+
+async def ensure_approval_definition(
+    config_approval_code: str = "",
+    approver_open_id: str = "",
+) -> tuple[str, str]:
+    """确保审批定义存在，返回 (approval_code, widget_id)
+
+    优先使用配置中的 approval_code，否则自动创建并保存。
+    """
+    # 1. 优先用配置值
+    if config_approval_code:
+        return config_approval_code, APPROVAL_WIDGET_ID
+
+    # 2. 检查本地缓存
+    saved = _load_approval_code()
+    if saved:
+        return saved, APPROVAL_WIDGET_ID
+
+    # 3. 自动创建审批定义
+    if not approver_open_id:
+        logger.error("无法创建审批定义：缺少审批人 open_id（请配置 notify_users）")
+        return "", ""
+
+    import sys as _sys
+    lark_cmd = "lark-cli.cmd" if _sys.platform == "win32" else "lark-cli"
+
+    node_id = "approval_node_1"
+    form_content = json.dumps([{
+        "id": APPROVAL_WIDGET_ID,
+        "name": "@i18n@event_summary",
+        "required": False,
+        "type": "textarea",
+    }], ensure_ascii=False)
+
+    request_body = {
+        "approval_name": "@i18n@approval_name",
+        "viewers": [{"viewer_type": "TENANT"}],
+        "form": {"form_content": form_content},
+        "node_list": [
+            {"id": "START"},
+            {
+                "id": node_id,
+                "name": "@i18n@approve_node",
+                "node_type": "OR",
+                "approver": [{"type": "Personal", "user_id": approver_open_id}],
+            },
+            {"id": "END"},
+        ],
+        "i18n_resources": [{
+            "locale": "zh-CN",
+            "is_default": True,
+            "texts": [
+                {"key": "@i18n@approval_name", "value": "SpiderClaw 待处理事件确认"},
+                {"key": "@i18n@event_summary", "value": "事件摘要"},
+                {"key": "@i18n@approve_node", "value": "审批"},
+            ],
+        }],
+        "icon": 1,
+    }
+
+    cmd = [
+        lark_cmd, "api", "POST",
+        "/open-apis/approval/v4/approvals",
+        "--as", "bot",
+        "--data", json.dumps(request_body, ensure_ascii=False),
+    ]
+
+    logger.info("自动创建飞书审批定义...")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, stderr = await proc.communicate()
+
+        if proc.returncode != 0:
+            error_msg = stderr.decode("utf-8", errors="ignore")
+            logger.error(f"创建审批定义失败: {error_msg}")
+            return "", ""
+
+        output = stdout.decode("utf-8", errors="ignore")
+        logger.info(f"创建审批定义响应: {output}")
+
+        import re
+        match = re.search(r'"approval_code"\s*:\s*"([^"]+)"', output)
+        if match:
+            new_code = match.group(1)
+            _save_approval_code(new_code)
+            logger.info(f"审批定义创建成功: {new_code}")
+            return new_code, APPROVAL_WIDGET_ID
+
+        logger.error("未能从响应中提取 approval_code")
+        return "", ""
+
+    except Exception as e:
+        logger.error(f"创建审批定义异常: {e}", exc_info=True)
+        return "", ""
+
+
+async def subscribe_approval_events(approval_code: str) -> bool:
+    """订阅审批事件（只需调用一次，重复调用返回 1390007 可忽略）
+
+    调用: lark-cli api POST /open-apis/approval/v4/approvals/{approval_code}/subscribe --as bot
+    """
+    import sys as _sys
+    lark_cmd = "lark-cli.cmd" if _sys.platform == "win32" else "lark-cli"
+    cmd = [lark_cmd, "api", "POST",
+           f"/open-apis/approval/v4/approvals/{approval_code}/subscribe",
+           "--as", "bot"]
+
+    logger.info(f"订阅审批事件: {approval_code}")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, stderr = await proc.communicate()
+        output = stdout.decode("utf-8", errors="ignore")
+        error_output = stderr.decode("utf-8", errors="ignore")
+        # 1390007 = 已订阅，也算成功
+        if proc.returncode == 0 or "1390007" in output or "1390007" in error_output:
+            logger.info("审批事件订阅成功（或已订阅）")
+            return True
+        logger.error(f"审批事件订阅失败: {error_output}")
+        return False
+    except Exception as e:
+        logger.error(f"订阅审批事件异常: {e}", exc_info=True)
+        return False
+
+
+async def create_pending_events_approval(
+    event_summaries: list[dict],
+    total_count: int,
+    approval_code: str,
+    widget_id: str,
+    open_id: str = "",
+) -> str:
+    """创建飞书审批实例，返回 instance_code（失败返回空字符串）
+
+    调用: lark-cli api POST /open-apis/approval/v4/instances --as bot
+    """
+    from datetime import datetime
+    import uuid as _uuid
+
+    # 构造事件列表文本
+    event_lines = []
+    for i, evt in enumerate(event_summaries[:10], 1):
+        try:
+            created = datetime.fromtimestamp(evt["created_at"]).strftime("%m-%d %H:%M")
+            type_label = "CI事件" if evt["event_type"] == "github" else "运行时日志"
+            event_lines.append(f"{i}. {evt['source']} ({type_label}, {created})")
+        except Exception as e:
+            logger.warning(f"解析事件 {i} 失败: {e}")
+    if total_count > 10:
+        event_lines.append(f"... 还有 {total_count - 10} 个事件")
+
+    description = (
+        f"服务重启后发现 {total_count} 个未处理的事件，请确认是否恢复处理：\n\n"
+        + "\n".join(event_lines)
+    )
+
+    # 构造表单数据
+    form_data = json.dumps([{
+        "id": widget_id,
+        "type": "textarea",
+        "value": description,
+    }], ensure_ascii=False)
+
+    # 构造请求体
+    request_body_dict = {
+        "approval_code": approval_code,
+        "form": form_data,
+        "uuid": str(_uuid.uuid4()),
+    }
+    # 审批发起人 open_id（必填，与 user_id 二选一）
+    if open_id:
+        request_body_dict["open_id"] = open_id
+    request_body = json.dumps(request_body_dict, ensure_ascii=False)
+
+    import sys as _sys
+    lark_cmd = "lark-cli.cmd" if _sys.platform == "win32" else "lark-cli"
+    cmd = [
+        lark_cmd, "api", "POST",
+        "/open-apis/approval/v4/instances",
+        "--as", "bot",
+        "--data", request_body,
+    ]
+
+    logger.info(f"创建审批实例: {total_count} 个待处理事件")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, stderr = await proc.communicate()
+
+        if proc.returncode != 0:
+            error_msg = stderr.decode("utf-8", errors="ignore")
+            logger.error(f"创建审批实例失败: {error_msg}")
+            return ""
+
+        output = stdout.decode("utf-8", errors="ignore")
+        logger.info(f"审批实例创建响应: {output}")
+
+        # 提取 instance_code
+        import re
+        match = re.search(r'"instance_code"\s*:\s*"([^"]+)"', output)
+        if match:
+            instance_code = match.group(1)
+            logger.info(f"审批实例创建成功: {instance_code}")
+            return instance_code
+
+        logger.error("未能从响应中提取 instance_code")
+        return ""
+
+    except Exception as e:
+        logger.error(f"创建审批实例异常: {e}", exc_info=True)
+        return ""
+
+
 async def send_pending_events_notification(
     event_summaries: list[dict],
     total_count: int,
     notify_users: list[str],
-) -> bool:
-    """发送待处理事件恢复通知（醒目红色卡片）
+    approval_code: str = "",
+    widget_id: str = "",
+) -> str:
+    """发送待处理事件恢复通知（通过飞书审批）
 
-    Args:
-        event_summaries: 事件摘要列表，每项包含 event_id, event_type, source, created_at
-        total_count: 待处理事件总数
-        notify_users: 接收者 open_id 列表
+    创建飞书审批实例，用户在审批中心确认或拒绝。
 
     Returns:
-        是否至少发送成功一次
+        创建成功返回 instance_code，失败返回空字符串
     """
-    from datetime import datetime
+    if not approval_code or not widget_id:
+        logger.error("审批配置不完整（approval_code 或 widget_id 为空）")
+        return ""
 
-    # 构造事件列表文本
-    lines = []
-    for i, evt in enumerate(event_summaries[:10], 1):  # 最多显示 10 条
-        created = datetime.fromtimestamp(evt["created_at"]).strftime("%m-%d %H:%M")
-        type_label = "CI事件" if evt["event_type"] == "github" else "运行时日志"
-        lines.append(f"{i}. `{evt['source']}` — {type_label} ({created})")
-    if total_count > 10:
-        lines.append(f"... 还有 {total_count - 10} 个事件")
-    event_list = "\n".join(lines)
+    # 获取审批发起人的 open_id（使用第一个 notify_user）
+    open_id = notify_users[0] if notify_users else ""
 
-    card_content = {
-        "config": {"wide_screen_mode": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": f"⚠️ SpiderClaw 服务恢复通知 — {total_count} 个事件待处理"},
-            "template": "red",
-        },
-        "elements": [
-            {
-                "tag": "markdown",
-                "content": f"**服务重启后发现 {total_count} 个未处理的事件**\n\n以下事件在上次服务中断时未完成处理，请确认是否恢复：",
-            },
-            {"tag": "hr"},
-            {
-                "tag": "markdown",
-                "content": event_list,
-            },
-            {"tag": "hr"},
-            {
-                "tag": "note",
-                "elements": [
-                    {"tag": "plain_text", "content": "服务每次重启都会发送此通知，直到事件被处理或放弃"}
-                ],
-            },
-        ],
-    }
-
-    content_json = json.dumps(card_content, ensure_ascii=False)
-
-    success = False
-    for user_id in notify_users:
-        result = await send_markdown_message(
-            receive_id=user_id,
-            markdown_content=content_json,
-            is_card=True,
-        )
-        if result:
-            success = True
-
-    return success
+    instance_code = await create_pending_events_approval(
+        event_summaries, total_count, approval_code, widget_id, open_id,
+    )
+    return instance_code
 
 
 async def send_runtime_repair_notification(

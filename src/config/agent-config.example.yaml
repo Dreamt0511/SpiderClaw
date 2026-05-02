@@ -53,11 +53,14 @@ lark:
   # 告警配置
   alert_on_failure: true                       # 上报失败时是否发送告警通知
   alert_threshold: 3                           # 连续失败多少次后发送告警
+  # 审批配置（用于待处理事件人工确认）
+  approval_code: ""                            # 审批定义 code（飞书后台获取）
+  approval_widget_id: ""                       # 审批表单中事件摘要控件的 widget_id
 
 # 日志配置
 logging:
   level: "INFO"                               # 日志级别：DEBUG/INFO/WARNING/ERROR
-  dir: "logs"                                  # 日志目录
+  dir: "src/logs"                              # 日志目录
   retention_days: 30                           # 日志保留天数
   json_format: true                            # 是否使用JSON格式输出
 
