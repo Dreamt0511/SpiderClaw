@@ -29,9 +29,9 @@ class StatsModule(MonitorModule):
         table.add_column(overflow="fold")
 
         table.add_row("运行时长", f"{hours:02d}:{minutes:02d}:{seconds:02d}")
+        table.add_row("token消耗", f"[bold {SUCCESS}]{state.total_tokens:,}[/]")
         table.add_row("LLM 调用", f"[bold {ACCENT}]{state.total_llm_calls} 次[/]")
         table.add_row("工具调用", f"[bold {WARNING}]{state.total_tool_calls} 次[/]")
-        table.add_row("token消耗", f"[bold {SUCCESS}]{state.total_tokens:,}[/]")
         table.add_row("成功修复", f"[bold {SUCCESS}]{state.total_repair_success} 次[/]")
         table.add_row("失败修复", f"[bold {ERROR}]{state.total_repair_failures} 次[/]")
         table.add_row("异常次数", f"[bold {ERROR}]{state.total_errors} 次[/]")

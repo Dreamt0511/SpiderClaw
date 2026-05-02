@@ -315,8 +315,170 @@ class RepairStore:
             return False
 
 
+class PendingEventStore:
+    """待处理事件持久化存储 — 防止服务中断导致事件丢失"""
+
+    def __init__(self, db_path: str = "data/repair_records.db"):
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+        self._init_table()
+
+    def _init_table(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS pending_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT UNIQUE NOT NULL,
+                    event_type TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    source TEXT DEFAULT '',
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    started_at REAL DEFAULT 0,
+                    retry_count INTEGER DEFAULT 0
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_pending_status
+                ON pending_events(status)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_pending_event_id
+                ON pending_events(event_id)
+            """)
+            conn.commit()
+
+    def insert(self, event_id: str, event_type: str, payload: str, source: str = "") -> bool:
+        """持久化事件，INSERT OR IGNORE 防重复"""
+        now = time.time()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute(
+                    """INSERT OR IGNORE INTO pending_events
+                       (event_id, event_type, payload, source, status, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
+                    (event_id, event_type, payload, source, now, now),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"持久化事件失败: {e}")
+            return False
+
+    def mark_processing(self, event_id: str) -> bool:
+        """标记事件为处理中"""
+        now = time.time()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    """UPDATE pending_events
+                       SET status = 'processing', started_at = ?, updated_at = ?
+                       WHERE event_id = ? AND status = 'pending'""",
+                    (now, now, event_id),
+                )
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"标记 processing 失败: {e}")
+            return False
+
+    def delete(self, event_id: str) -> bool:
+        """处理完成后删除事件"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "DELETE FROM pending_events WHERE event_id = ?",
+                    (event_id,),
+                )
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"删除事件失败: {e}")
+            return False
+
+    def mark_pending(self, event_id: str) -> bool:
+        """处理失败后回退为 pending"""
+        now = time.time()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    """UPDATE pending_events
+                       SET status = 'pending', updated_at = ?, retry_count = retry_count + 1
+                       WHERE event_id = ?""",
+                    (now, event_id),
+                )
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"回退 pending 失败: {e}")
+            return False
+
+    def get_all_pending(self) -> list[dict]:
+        """获取所有待处理事件（pending + processing）"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """SELECT * FROM pending_events
+                       WHERE status IN ('pending', 'processing')
+                       ORDER BY created_at ASC"""
+                ).fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"查询待处理事件失败: {e}")
+            return []
+
+    def reset_processing_to_pending(self) -> int:
+        """重置所有 processing 状态为 pending（服务重启时调用）"""
+        now = time.time()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute(
+                    """UPDATE pending_events
+                       SET status = 'pending', updated_at = ?
+                       WHERE status = 'processing'""",
+                    (now,),
+                )
+                conn.commit()
+                count = cursor.rowcount
+                if count:
+                    logger.info(f"重置 {count} 个卡住的 processing 事件为 pending")
+                return count
+        except Exception as e:
+            logger.error(f"重置 processing 事件失败: {e}")
+            return 0
+
+    def delete_all_pending(self) -> int:
+        """删除所有待处理事件（放弃恢复时调用）"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute(
+                    "DELETE FROM pending_events WHERE status IN ('pending', 'processing')"
+                )
+                conn.commit()
+                return cursor.rowcount
+        except Exception as e:
+            logger.error(f"删除待处理事件失败: {e}")
+            return 0
+
+    def count_pending(self) -> int:
+        """统计待处理事件数量"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    """SELECT COUNT(*) FROM pending_events
+                       WHERE status IN ('pending', 'processing')"""
+                ).fetchone()
+                return row[0] if row else 0
+        except Exception as e:
+            logger.error(f"统计待处理事件失败: {e}")
+            return 0
+
+
 # 全局单例
 _repair_store: Optional[RepairStore] = None
+_pending_event_store: Optional[PendingEventStore] = None
 
 
 def get_repair_store(db_path: str = "data/repair_records.db") -> RepairStore:
@@ -325,3 +487,11 @@ def get_repair_store(db_path: str = "data/repair_records.db") -> RepairStore:
     if _repair_store is None:
         _repair_store = RepairStore(db_path)
     return _repair_store
+
+
+def get_pending_event_store(db_path: str = "data/repair_records.db") -> PendingEventStore:
+    """获取全局待处理事件存储实例"""
+    global _pending_event_store
+    if _pending_event_store is None:
+        _pending_event_store = PendingEventStore(db_path)
+    return _pending_event_store

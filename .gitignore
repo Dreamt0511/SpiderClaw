@@ -139,7 +139,7 @@ src/config/agent-config.yaml
 data/
 
 # Logs
-logs/
+src/logs/
 *.log
 
 # Temporary files

@@ -66,7 +66,8 @@ STATUS_COLORS = {
 
 # 节点名 → 友好中文名
 NODE_ALIAS = {
-    "collect_context":  "收集上下文",
+    "collect_context":  "收集上下文中",
+    "collect_runtime_context": "收集上下文中",
     "fix_agent":        "修复Agent",
     "validation_gate":  "验证门禁",
     "review_changes":   "审查Agent",

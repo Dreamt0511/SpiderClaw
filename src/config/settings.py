@@ -38,6 +38,7 @@ class AgentConfig(BaseModel):
     max_change_lines: int = Field(default=50, description="最大允许变更行数")
     auto_create_pr: bool = Field(default=True, description="是否自动创建PR")
     require_human_approval: bool = Field(default=False, description="创建PR前是否需要人工审批")
+    pending_event_auto_threshold: int = Field(default=5, description="自动恢复待处理事件的数量阈值，超过此数量需人工确认")
 
 
 class GitHubConfig(BaseModel):

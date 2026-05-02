@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import logging.handlers
 import os
@@ -17,6 +18,7 @@ from .base import BaseMonitor
 from src.bus import GitHubEvent, EventBus
 from src.bus.schemas import RuntimeLogEvent
 from src.config.service_registry import get_service_registry
+from src.store.repair_store import get_pending_event_store
 from src.utils.audit import audit_logger
 from src.utils.rate_limiter import ServiceRateLimiter
 
@@ -212,6 +214,16 @@ class GitHubWebhookMonitor(BaseMonitor):
                 logger.info(f"Ignoring SpiderClaw's own PR event: {event_id}, branch: {event.branch}")
                 return {"status": "ignored", "reason": "SpiderClaw autofix branch, skip to avoid loop"}
 
+            # 落盘：持久化事件到 SQLite，防止服务中断丢失
+            pending_store = get_pending_event_store()
+            event_payload = event.model_dump_json()
+            pending_store.insert(
+                event_id=event_id,
+                event_type="github",
+                payload=event_payload,
+                source=event.repository,
+            )
+
             # 发布事件到总线
             audit_logger.log_event(
                 "system_action",
@@ -275,6 +287,16 @@ class GitHubWebhookMonitor(BaseMonitor):
 
             if not svc:
                 logger.warning(f"未知服务: {service_name}")
+
+            # 落盘：持久化事件到 SQLite，防止服务中断丢失
+            pending_store = get_pending_event_store()
+            event_payload = event.model_dump_json()
+            pending_store.insert(
+                event_id=event.event_id,
+                event_type="runtime_log",
+                payload=event_payload,
+                source=service_name,
+            )
 
             # 发布到事件总线
             publish_success = await self.publish_event(event)
@@ -565,13 +587,67 @@ def run_webhook_server(
         max_per_hour=get_service_registry().rate_limit.max_fixes_per_hour,
     )
 
+    async def recover_pending_events():
+        """启动时恢复上次中断的未处理事件"""
+        if not orchestrator:
+            return
+        pending_store = get_pending_event_store()
+
+        # 1. 重置卡住的 processing 事件为 pending
+        pending_store.reset_processing_to_pending()
+
+        # 2. 统计待处理事件数量
+        pending_events = pending_store.get_all_pending()
+        count = len(pending_events)
+        if count == 0:
+            return
+
+        # 3. 根据数量决定自动恢复或通知开发者
+        threshold = settings.agent.pending_event_auto_threshold
+        if count <= threshold:
+            log.info(f"自动恢复 {count} 个待处理事件")
+            for record in pending_events:
+                try:
+                    payload = json.loads(record["payload"])
+                    if record["event_type"] == "runtime_log":
+                        event_obj = RuntimeLogEvent(**payload)
+                    else:
+                        event_obj = GitHubEvent(**payload)
+                    await event_bus.publish(event_obj)
+                    log.info(f"已恢复事件: {record['event_id']} ({record['source']})")
+                except Exception as e:
+                    log.error(f"恢复事件 {record['event_id']} 失败: {e}")
+                    pending_store.delete(record["event_id"])
+        else:
+            log.warning(f"待处理事件数量 ({count}) 超过阈值 ({threshold})，需人工确认")
+            try:
+                from src.notify.lark_notify import send_pending_events_notification
+                event_summaries = [
+                    {
+                        "event_id": r["event_id"],
+                        "event_type": r["event_type"],
+                        "source": r["source"],
+                        "created_at": r["created_at"],
+                    }
+                    for r in pending_events
+                ]
+                await send_pending_events_notification(
+                    event_summaries, count, settings.lark.notify_users,
+                )
+            except Exception as e:
+                log.error(f"发送待处理事件通知失败: {e}")
+
     async def event_consumer():
         """事件消费循环"""
         if not orchestrator:
             return
+        pending_store = get_pending_event_store()
         while True:
             try:
                 event = await event_bus.subscribe()
+
+                # 标记事件为处理中
+                pending_store.mark_processing(event.event_id)
 
                 # 远程日志事件处理（限流在图入口之前）
                 if isinstance(event, RuntimeLogEvent):
@@ -579,13 +655,20 @@ def run_webhook_server(
                         log.warning(f"服务 {event.service} 触发限流，跳过")
                         if rate_limiter.should_alert(event.service):
                             log.error(f"服务 {event.service} 持续限流，请人工检查")
+                        pending_store.delete(event.event_id)
                         event_bus.mark_done()
                         continue
                     await rate_limiter.record(event.service)
 
                     async def process_runtime_and_mark_done(evt=event):
                         try:
-                            await orchestrator.run(evt)
+                            result = await orchestrator.run(evt)
+                            if result.get("success"):
+                                pending_store.delete(evt.event_id)
+                            else:
+                                pending_store.mark_pending(evt.event_id)
+                        except Exception:
+                            pending_store.mark_pending(evt.event_id)
                         finally:
                             event_bus.mark_done()
 
@@ -599,9 +682,15 @@ def run_webhook_server(
                 if isinstance(event, GitHubEvent) and event.conclusion == "failure":
                     log.info(f"收到CI失败事件: {event.event_id}, 仓库: {event.repository}, 分支: {event.branch}")
 
-                    async def process_and_mark_done():
+                    async def process_and_mark_done(evt=event):
                         try:
-                            await orchestrator.run(event)
+                            result = await orchestrator.run(evt)
+                            if result.get("success"):
+                                pending_store.delete(evt.event_id)
+                            else:
+                                pending_store.mark_pending(evt.event_id)
+                        except Exception:
+                            pending_store.mark_pending(evt.event_id)
                         finally:
                             event_bus.mark_done()
 
@@ -610,6 +699,7 @@ def run_webhook_server(
                         name=f"repair_{event.event_id}"
                     )
                 else:
+                    pending_store.delete(event.event_id)
                     event_bus.mark_done()
 
             except asyncio.CancelledError:
@@ -619,6 +709,8 @@ def run_webhook_server(
                 await asyncio.sleep(1)
 
     async def _run():
+        # 启动时恢复上次中断的未处理事件
+        await recover_pending_events()
         tasks = [asyncio.create_task(monitor.start())]
         if orchestrator:
             tasks.append(asyncio.create_task(event_consumer()))

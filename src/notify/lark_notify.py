@@ -588,6 +588,74 @@ async def send_already_fixing_notification(
     )
 
 
+async def send_pending_events_notification(
+    event_summaries: list[dict],
+    total_count: int,
+    notify_users: list[str],
+) -> bool:
+    """发送待处理事件恢复通知（醒目红色卡片）
+
+    Args:
+        event_summaries: 事件摘要列表，每项包含 event_id, event_type, source, created_at
+        total_count: 待处理事件总数
+        notify_users: 接收者 open_id 列表
+
+    Returns:
+        是否至少发送成功一次
+    """
+    from datetime import datetime
+
+    # 构造事件列表文本
+    lines = []
+    for i, evt in enumerate(event_summaries[:10], 1):  # 最多显示 10 条
+        created = datetime.fromtimestamp(evt["created_at"]).strftime("%m-%d %H:%M")
+        type_label = "CI事件" if evt["event_type"] == "github" else "运行时日志"
+        lines.append(f"{i}. `{evt['source']}` — {type_label} ({created})")
+    if total_count > 10:
+        lines.append(f"... 还有 {total_count - 10} 个事件")
+    event_list = "\n".join(lines)
+
+    card_content = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": f"⚠️ SpiderClaw 服务恢复通知 — {total_count} 个事件待处理"},
+            "template": "red",
+        },
+        "elements": [
+            {
+                "tag": "markdown",
+                "content": f"**服务重启后发现 {total_count} 个未处理的事件**\n\n以下事件在上次服务中断时未完成处理，请确认是否恢复：",
+            },
+            {"tag": "hr"},
+            {
+                "tag": "markdown",
+                "content": event_list,
+            },
+            {"tag": "hr"},
+            {
+                "tag": "note",
+                "elements": [
+                    {"tag": "plain_text", "content": "服务每次重启都会发送此通知，直到事件被处理或放弃"}
+                ],
+            },
+        ],
+    }
+
+    content_json = json.dumps(card_content, ensure_ascii=False)
+
+    success = False
+    for user_id in notify_users:
+        result = await send_markdown_message(
+            receive_id=user_id,
+            markdown_content=content_json,
+            is_card=True,
+        )
+        if result:
+            success = True
+
+    return success
+
+
 async def send_runtime_repair_notification(
     repair_success: bool,
     service: str,
