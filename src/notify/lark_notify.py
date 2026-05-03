@@ -766,7 +766,7 @@ async def create_pending_events_approval(
         event_lines.append(f"... 还有 {total_count - 10} 个事件")
 
     description = (
-        f"服务重启后发现 {total_count} 个未处理的事件，请确认是否恢复处理：\n\n"
+        f"服务重启后发现 {total_count} 个未处理的事件（由于服务崩溃或异常导致的待修复的bug），请确认是否恢复处理：\n\n"
         + "\n".join(event_lines)
     )
 

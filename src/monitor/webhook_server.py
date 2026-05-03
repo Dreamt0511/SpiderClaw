@@ -460,7 +460,7 @@ class GitHubWebhookMonitor(BaseMonitor):
         logger.info("GitHub Webhook server stopped gracefully")
 
 
-def _start_lark_ws_thread(app_id, app_secret, event_queue):
+def _start_lark_ws_thread(app_id, app_secret, event_queue, connected_event=None):
     """线程方式启动 lark SDK WebSocket 客户端（Windows 下子进程回调不触发，必须用线程）"""
     from lark_oapi import ws as lark_ws, LogLevel as LarkLogLevel
     from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
@@ -486,6 +486,17 @@ def _start_lark_ws_thread(app_id, app_secret, event_queue):
         log_level=LarkLogLevel.DEBUG,
         auto_reconnect=True,
     )
+
+    # monkey-patch _connect：连接建立后通知主线程
+    if connected_event is not None:
+        _original_connect = client._connect
+
+        async def _patched_connect():
+            await _original_connect()
+            connected_event.set()
+
+        client._connect = _patched_connect
+
     print("[approval-ws] 启动 WebSocket 客户端", flush=True)
     client.start()
 
@@ -655,6 +666,8 @@ def run_webhook_server(
         max_per_hour=get_service_registry().rate_limit.max_fixes_per_hour,
     )
 
+    approval_ws_ready = asyncio.Event()
+
     async def recover_pending_events():
         """启动时恢复上次中断的未处理事件"""
         if not orchestrator:
@@ -688,6 +701,10 @@ def run_webhook_server(
                     pending_store.delete(record["event_id"])
         else:
             log.warning(f"待处理事件数量 ({count}) 超过阈值 ({threshold})，需人工确认")
+            # 等待飞书 WebSocket 长连接就绪后再发送审批，避免审批回调丢失
+            log.info("[approval] 等待飞书长连接就绪...")
+            await approval_ws_ready.wait()
+            log.info("[approval] 长连接已就绪，开始创建审批")
             try:
                 from src.notify.lark_notify import (
                     ensure_approval_definition,
@@ -805,28 +822,38 @@ def run_webhook_server(
         from src.store.repair_store import get_pending_approval_store
         approval_store = get_pending_approval_store()
 
-        # 确保审批事件已订阅（异步调用，不阻塞事件循环）
+        # 1. 先启动 WebSocket 长连接
+        import queue as thread_queue
+        import threading
+
+        event_queue = thread_queue.Queue()
+        ws_connected = threading.Event()
+
+        ws_thread = threading.Thread(
+            target=_start_lark_ws_thread,
+            args=(settings.lark.app_id, settings.lark.app_secret, event_queue, ws_connected),
+            daemon=True, name="lark-ws",
+        )
+        ws_thread.start()
+        log.info("[approval] 飞书 WebSocket 线程已启动，等待连接建立...")
+
+        # 2. 等待 WebSocket 连接真正建立
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, ws_connected.wait)
+        log.info("[approval] 飞书 WebSocket 已连接")
+
+        # 3. 连接建立后再订阅审批事件
         from src.notify.lark_notify import _load_approval_code, subscribe_approval_events
         approval_code = settings.lark.approval_code or _load_approval_code()
         if approval_code:
             log.info(f"[approval] 订阅审批事件: {approval_code}")
             await subscribe_approval_events(approval_code)
 
-        # 线程方式运行 lark SDK（Windows 下子进程回调不触发）
-        import queue as thread_queue
-        import threading
+        # 4. 通知就绪，recover_pending_events 可以创建审批了
+        approval_ws_ready.set()
+        log.info("[approval] 审批监听就绪")
 
-        event_queue = thread_queue.Queue()
-        ws_thread = threading.Thread(
-            target=_start_lark_ws_thread,
-            args=(settings.lark.app_id, settings.lark.app_secret, event_queue),
-            daemon=True, name="lark-ws",
-        )
-        ws_thread.start()
-        log.info("[approval] 飞书 WebSocket 线程已启动")
-
-        # 主循环：从线程 Queue 中读取事件并处理（run_in_executor 不阻塞事件循环）
-        loop = asyncio.get_running_loop()
+        # 主循环：从线程 Queue 中读取事件并处理
         while True:
             try:
                 instance_code, status = await asyncio.wait_for(
@@ -879,12 +906,15 @@ def run_webhook_server(
                 if not ws_thread.is_alive():
                     log.warning("[approval] 飞书 WebSocket 线程已退出，正在重启...")
                     event_queue = thread_queue.Queue()
+                    ws_connected = threading.Event()
                     ws_thread = threading.Thread(
                         target=_start_lark_ws_thread,
-                        args=(settings.lark.app_id, settings.lark.app_secret, event_queue),
+                        args=(settings.lark.app_id, settings.lark.app_secret, event_queue, ws_connected),
                         daemon=True, name="lark-ws",
                     )
                     ws_thread.start()
+                    await loop.run_in_executor(None, ws_connected.wait)
+                    log.info("[approval] 飞书 WebSocket 重连成功")
             except asyncio.CancelledError:
                 return
             except Exception as e:
