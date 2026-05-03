@@ -460,6 +460,36 @@ class GitHubWebhookMonitor(BaseMonitor):
         logger.info("GitHub Webhook server stopped gracefully")
 
 
+def _start_lark_ws_thread(app_id, app_secret, event_queue):
+    """线程方式启动 lark SDK WebSocket 客户端（Windows 下子进程回调不触发，必须用线程）"""
+    from lark_oapi import ws as lark_ws, LogLevel as LarkLogLevel
+    from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
+
+    def on_approval_event(data):
+        try:
+            event = data.event or {}
+            instance_code = event.get("instance_code", "")
+            status = event.get("status", "")
+            print(f"[approval-ws] 收到: instance_code={instance_code}, status={status}", flush=True)
+            if instance_code:
+                event_queue.put((instance_code, status))
+        except Exception as e:
+            print(f"[approval-ws] 回调异常: {e}", flush=True)
+
+    event_handler = EventDispatcherHandler.builder("", "") \
+        .register_p1_customized_event("approval_instance", on_approval_event) \
+        .build()
+
+    client = lark_ws.Client(
+        app_id=app_id, app_secret=app_secret,
+        event_handler=event_handler,
+        log_level=LarkLogLevel.DEBUG,
+        auto_reconnect=True,
+    )
+    print("[approval-ws] 启动 WebSocket 客户端", flush=True)
+    client.start()
+
+
 def run_webhook_server(
     host: str = "0.0.0.0",
     port: int = 8000,
@@ -764,52 +794,63 @@ def run_webhook_server(
                 await asyncio.sleep(1)
 
     async def approval_event_listener():
-        """通过飞书长连接监听审批状态变更事件，处理待处理事件的确认/拒绝"""
-        import sys as _sys
+        """通过飞书 SDK WebSocket 长连接监听审批状态变更事件"""
+        log.info("[approval] approval_event_listener 任务已启动")
 
-        log.info(">>> approval_event_listener 函数开始执行")
-        lark_cmd = "lark-cli.cmd" if _sys.platform == "win32" else "lark-cli"
-        cmd_str = f"{lark_cmd} event +subscribe --as bot --event-types approval_instance --force"
-
-        log.info("启动飞书审批事件监听 (WebSocket 长连接)")
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                cmd_str, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        except Exception as e:
-            log.error(f"启动审批事件监听失败: {e}", exc_info=True)
+        if not settings.lark.app_id or not settings.lark.app_secret:
+            log.error("[approval] 飞书 app_id 或 app_secret 未配置，无法监听审批事件")
             return
 
         pending_store = get_pending_event_store()
         from src.store.repair_store import get_pending_approval_store
         approval_store = get_pending_approval_store()
 
-        try:
-            while True:
-                line = await proc.stdout.readline()
-                if not line:
-                    break
-                try:
-                    data = json.loads(line.decode("utf-8").strip())
-                except (json.JSONDecodeError, UnicodeDecodeError):
+        # 确保审批事件已订阅（异步调用，不阻塞事件循环）
+        from src.notify.lark_notify import _load_approval_code, subscribe_approval_events
+        approval_code = settings.lark.approval_code or _load_approval_code()
+        if approval_code:
+            log.info(f"[approval] 订阅审批事件: {approval_code}")
+            await subscribe_approval_events(approval_code)
+
+        # 线程方式运行 lark SDK（Windows 下子进程回调不触发）
+        import queue as thread_queue
+        import threading
+
+        event_queue = thread_queue.Queue()
+        ws_thread = threading.Thread(
+            target=_start_lark_ws_thread,
+            args=(settings.lark.app_id, settings.lark.app_secret, event_queue),
+            daemon=True, name="lark-ws",
+        )
+        ws_thread.start()
+        log.info("[approval] 飞书 WebSocket 线程已启动")
+
+        # 主循环：从线程 Queue 中读取事件并处理（run_in_executor 不阻塞事件循环）
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                instance_code, status = await asyncio.wait_for(
+                    loop.run_in_executor(None, event_queue.get), timeout=30
+                )
+                log.info(f"[approval] 主循环收到事件: instance_code={instance_code}, status={status}")
+
+                # PENDING 事件仅记录日志，不处理
+                if status == "PENDING":
                     continue
 
-                # 提取审批事件信息
-                event = data.get("event", data)
-                instance_code = event.get("instance_code", "")
-                status = event.get("status", "")
-
-                if not instance_code:
-                    continue
-
-                # 查找对应的审批记录
                 approval = approval_store.get_by_instance_code(instance_code)
-                if not approval or approval["status"] != "PENDING":
+                if not approval:
+                    log.warning(f"[approval] 未找到审批记录: {instance_code}")
+                    continue
+
+                # 已处理过的审批不再重复处理
+                if approval["status"] != "PENDING":
+                    log.info(f"[approval] 审批已处理过: {instance_code}, 状态: {approval['status']}")
                     continue
 
                 log.info(f"收到审批事件: {instance_code}, 状态: {status}")
 
                 if status == "APPROVED":
-                    # 恢复处理待处理事件
                     pending_events = pending_store.get_all_pending()
                     count = 0
                     for record in pending_events:
@@ -823,33 +864,54 @@ def run_webhook_server(
                             count += 1
                         except Exception as e:
                             log.error(f"恢复事件 {record['event_id']} 失败: {e}")
-                            pending_store.delete(record["event_id"])
-                    log.info(f"审批通过：已恢复 {count} 个待处理事件")
+                    # 不管修复流程成功还是失败，都清除待处理记录
+                    deleted = pending_store.delete_all_pending()
+                    log.info(f"审批通过：已恢复 {count} 个待处理事件，已清除 {deleted} 条记录")
                     approval_store.update_status(instance_code, "APPROVED")
 
                 elif status in ("REJECTED", "CANCELED", "DELETED"):
-                    # 丢弃待处理事件
                     count = pending_store.delete_all_pending()
                     log.info(f"审批拒绝/取消：已丢弃 {count} 个待处理事件")
                     approval_store.update_status(instance_code, status)
 
-        except asyncio.CancelledError:
-            pass
-        finally:
-            proc.terminate()
+            except asyncio.TimeoutError:
+                # 超时，检查线程是否还活着
+                if not ws_thread.is_alive():
+                    log.warning("[approval] 飞书 WebSocket 线程已退出，正在重启...")
+                    event_queue = thread_queue.Queue()
+                    ws_thread = threading.Thread(
+                        target=_start_lark_ws_thread,
+                        args=(settings.lark.app_id, settings.lark.app_secret, event_queue),
+                        daemon=True, name="lark-ws",
+                    )
+                    ws_thread.start()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.error(f"[approval] 处理审批事件异常: {e}", exc_info=True)
+                await asyncio.sleep(1)
 
     async def _run():
-        # 启动时恢复上次中断的未处理事件
-        await recover_pending_events()
-        tasks = [asyncio.create_task(monitor.start())]
+        def _task_done_callback(task: asyncio.Task):
+            """任务结束回调：记录异常或意外退出"""
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc:
+                log.error(f"任务 [{task.get_name()}] 异常退出: {exc}", exc_info=exc)
+
+        tasks = [
+            asyncio.create_task(monitor.start(), name="monitor"),
+        ]
         if orchestrator:
-            tasks.append(asyncio.create_task(event_consumer()))
-        approval_task = asyncio.create_task(approval_event_listener())
+            tasks.append(asyncio.create_task(event_consumer(), name="event_consumer"))
+        # 始终启动审批事件监听（WebSocket 客户端），即使没有待处理事件
+        approval_task = asyncio.create_task(approval_event_listener(), name="approval_listener")
+        approval_task.add_done_callback(_task_done_callback)
         tasks.append(approval_task)
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                log.error(f"任务 {i} 异常退出: {result}", exc_info=result)
+        # 启动时恢复上次中断的未处理事件（在 WebSocket 启动之后）
+        await recover_pending_events()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     try:
         audit_logger.log_event("milestone", node="service_start")
