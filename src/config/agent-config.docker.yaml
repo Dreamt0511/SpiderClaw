@@ -1,0 +1,62 @@
+# SpiderClaw Docker 测试环境配置
+# 敏感值通过 ${ENV_VAR} 从 .env 文件注入，其余与 agent-config.yaml 保持一致
+
+webhook:
+  secret: "${WEBHOOK_SECRET}"
+  host: "0.0.0.0"
+  port: 8000
+  reload: false
+  allowed_events:
+    - "workflow_run"
+    - "pull_request"
+  max_payload_size: "10MB"
+  event_queue_maxsize: 1000
+  max_processed_ids: 10000
+  shutdown_timeout: 30
+  ssl_verify: false
+
+agent:
+  enabled: true
+  max_retries: 3
+  max_change_lines: 50
+  auto_create_pr: true
+  require_human_approval: false
+  pending_event_auto_threshold: 5
+
+github:
+  token: "${GITHUB_TOKEN}"
+  api_url: "https://api.github.com"
+  default_branch: "main"
+
+openai:
+  api_key: "${OPENAI_API_KEY}"
+  base_url: "${OPENAI_BASE_URL}"
+  model_name: "${OPENAI_MODEL_NAME}"
+  timeout: 60
+
+lark:
+  enabled: true
+  app_id: "${LARK_APP_ID}"
+  app_secret: "${LARK_APP_SECRET}"
+  notify_users:
+    - "${LARK_NOTIFY_USER}"
+  notify_groups: []
+  base_enabled: true
+  base_token: "${LARK_BASE_TOKEN}"
+  repair_table_id: ""
+  auto_create_table: true
+  auto_fix_fields: true
+  as_bot: true
+  alert_on_failure: true
+  alert_threshold: 3
+  approval_code: ""
+  approval_widget_id: ""
+
+logging:
+  level: "INFO"
+  dir: "/app/src/logs"
+  retention_days: 30
+  json_format: true
+
+environment: "production"
+debug: false

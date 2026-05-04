@@ -255,7 +255,7 @@ def _check_file_completeness(
     error_locations: list[dict],
     target_files: list[str] | None = None,
 ) -> ValidationResult:
-    """检查所有目标文件是否都在 code_changes 中
+    """双向检查：遗漏目标文件 + 修改了非目标文件
 
     优先使用 orchestrator 提供的 target_files（确定性列表），
     兜底从 error_locations 提取。
@@ -273,8 +273,9 @@ def _check_file_completeness(
         return ValidationResult(passed=True)
 
     actual = set(fix_result.get("code_changes", {}).keys())
-    missing = expected - actual
 
+    # 正向：遗漏目标文件
+    missing = expected - actual
     if missing:
         return ValidationResult(
             passed=False,
@@ -285,6 +286,20 @@ def _check_file_completeness(
                 "all_target_files": sorted(expected),
             },
         )
+
+    # 反向：修改了非目标文件
+    extra = actual - expected
+    if extra:
+        return ValidationResult(
+            passed=False,
+            violation_type="wrong_file_modified",
+            details=f"修改了非目标文件: {', '.join(sorted(extra))}",
+            error_context={
+                "invalid_files": list(extra),
+                "all_target_files": sorted(expected),
+            },
+        )
+
     return ValidationResult(passed=True)
 
 

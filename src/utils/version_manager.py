@@ -46,34 +46,77 @@ def _ensure_repo_sync(
 ) -> tuple[str, bool]:
     """同步版本的仓库确保逻辑（在线程池中执行）"""
     local_path = os.path.abspath(local_path)
+    git_dir = os.path.join(local_path, ".git")
 
     # 本地不存在 → clone
-    if not os.path.exists(os.path.join(local_path, ".git")):
+    if not os.path.exists(git_dir):
         logger.info(f"首次 clone: {repo_url} -> {local_path}")
         os.makedirs(local_path, exist_ok=True)
         try:
             Repo.clone_from(repo_url, local_path)
+            logger.info(f"clone 完成，当前分支: {branch}")
         except GitCommandError as e:
             logger.error(f"clone 失败: {e}")
             raise
 
     repo = Repo(local_path)
+    current = _current_branch(repo)
 
-    # fetch + checkout 到指定版本
+    # version == branch 且已在该分支上 → 跳过本地 checkout，直接尝试网络更新
+    if version == branch and current == branch:
+        logger.info(f"已在目标分支 {branch} 上，跳过本地 checkout")
+    else:
+        # 尝试本地 checkout
+        try:
+            repo.git.checkout(version)
+            logger.info(f"checkout 到配置版本: {version}")
+        except GitCommandError as e:
+            logger.warning(f"本地无法 checkout 到 {version}: {e}，降级到最新 {branch}")
+            try:
+                repo.git.checkout(branch)
+                logger.info(f"已降级到分支 {branch}")
+            except GitCommandError as e2:
+                logger.warning(f"checkout {branch} 也失败: {e2}，使用当前代码")
+                return local_path, True
+
+    # 尝试 fetch + pull 更新（网络失败不影响已有代码）
     try:
         repo.git.fetch("origin")
-        repo.git.checkout(version)
-        logger.info(f"checkout 到配置版本: {version}")
-        return local_path, False
-    except GitCommandError:
-        logger.warning(f"无法 checkout 到 {version}，降级到最新 {branch}")
-
-    # 降级：checkout 到最新分支
-    try:
-        repo.git.checkout(branch)
-        repo.git.pull("origin", branch)
-        logger.info(f"降级到最新 {branch}")
+        logger.info("fetch 成功")
     except GitCommandError as e:
-        logger.warning(f"降级到 {branch} 也失败: {e}，使用本地现有代码")
+        logger.info(f"网络 fetch 失败: {e}，使用本地代码")
+        return local_path, False
 
-    return local_path, True
+    try:
+        repo.git.checkout(version)
+        repo.git.pull("origin", version)
+        logger.info(f"已更新到最新 {version}")
+        return local_path, False
+    except GitCommandError as e:
+        logger.info(f"网络更新失败: {e}，使用本地代码")
+        return local_path, False
+
+
+def _current_branch(repo: Repo) -> str:
+    """获取当前分支名，detached HEAD 返回空字符串"""
+    try:
+        return repo.active_branch.name
+    except TypeError:
+        return ""
+
+
+async def pre_sync_repos(services: list) -> None:
+    """启动时预同步所有注册服务的仓库，确保本地有可用代码"""
+    for svc in services:
+        if not svc.repo_url or not svc.repo_local_path:
+            continue
+        try:
+            await ensure_repo_with_version(
+                repo_url=svc.repo_url,
+                local_path=svc.repo_local_path,
+                version=svc.version,
+                branch=svc.git_branch,
+            )
+            logger.info(f"预同步完成: {svc.name}")
+        except Exception as e:
+            logger.warning(f"预同步失败 {svc.name}: {e}")

@@ -1,0 +1,55 @@
+services:
+  spiderclaw:
+    build: .
+    container_name: spiderclaw-agent
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./src:/app/src
+      - ./entrypoint.sh:/app/entrypoint.sh
+      # 配置文件挂载（优先使用宿主机的配置文件，若不存在则由entrypoint自动初始化）
+      - ./src/config/agent-config.yaml:/app/src/config/agent-config.yaml
+      - ./src/config/services.yaml:/app/src/config/services.yaml
+      # 复用你本地的Git配置和凭证，和你本地操作GitHub完全一样
+      - C:\Users\dream time\.gitconfig:/root/.gitconfig:ro
+      - C:\Users\dream time\.ssh:/root/.ssh:ro
+      # 直接挂载你本地已经克隆好的仓库，不需要容器内clone
+      - ./data/repos:/app/data/repos
+      # 日志挂载
+      - spiderclaw-logs:/app/src/logs
+    env_file:
+      - .env
+    environment:
+      - GIT_SSL_NO_VERIFY=true
+    command: ["spiderclaw", "--no-dashboard"]
+    stdin_open: true
+    tty: true
+    networks:
+      - spiderclaw-net
+    extra_hosts:
+      - "github.com:10.17.80.179"
+      - "api.github.com:10.17.80.179"
+    restart: unless-stopped
+
+  biz-server:
+    build: ./docker/biz-server
+    container_name: biz-server
+    volumes:
+      - ./docker/biz-server/app:/opt/biz-app/app
+      # 挂载采集器相关配置和脚本，修改后无需重建镜像（仅2个文件）
+      - ./docker/biz-server/agent-mapping.conf:/opt/agent-sidecar/agent-mapping.conf
+      - ./docker/biz-server/collector.sh:/opt/agent-sidecar/collector.sh
+      - ./docker/biz-server/entrypoint.sh:/opt/agent-sidecar/entrypoint.sh
+    depends_on:
+      - spiderclaw
+    networks:
+      - spiderclaw-net  # 和spiderclaw在同一个网络
+    restart: unless-stopped
+
+volumes:
+  spiderclaw-data:
+  spiderclaw-logs:
+
+networks:
+  spiderclaw-net:
+    driver: bridge

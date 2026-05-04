@@ -622,6 +622,56 @@ def parse_python_errors(log_content: str) -> List[Dict]:
         def _ek(fp, et, ln):
             return (fp or "", et or "", ln or 0)
 
+        # ----- 3c2. 运行时日志格式（[ERROR] logger.name: message） -----
+        # 适配 biz-server 通过 collector 上报的结构化日志行
+        runtime_log_pattern = re.compile(
+            r'^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+'
+            r'\[(ERROR|WARNING)\]\s+'
+            r'([\w.]+):\s+(.*)$',
+            re.MULTILINE,
+        )
+        for match in runtime_log_pattern.finditer(content):
+            level = match.group(1)
+            logger_name = match.group(2)
+            message = match.group(3)
+
+            # logger 名 → 文件路径：尝试多种路径转换策略
+            logger_parts = logger_name.split('.')
+            # 策略1: 直接转换 (app.user_service -> app/user_service.py)
+            direct_path = logger_name.replace('.', '/') + '.py'
+            # 策略2: 去掉第一段 (app.user_service -> user_service.py)
+            if len(logger_parts) > 1:
+                short_path = '/'.join(logger_parts[1:]) + '.py'
+            else:
+                short_path = direct_path
+            # 策略3: 尝试常见映射 (app -> src)
+            src_path = 'src/' + short_path if not short_path.startswith('src/') else short_path
+
+            # 将这些路径都记录下来，后续由 _filter_valid_errors 验证哪个真实存在
+            candidate_paths = list(dict.fromkeys([direct_path, short_path, src_path]))
+            file_path = candidate_paths[0]  # 默认使用第一个，_filter_valid_errors 会处理
+
+            # 尝试从 message 中提取行号（如 "line 11"）
+            line_number = 0
+            ln_match = re.search(r'line\s+(\d+)', message)
+            if ln_match:
+                line_number = int(ln_match.group(1))
+
+            error_type = "RuntimeError" if level == "ERROR" else "RuntimeWarning"
+
+            key = _ek(file_path, error_type, line_number)
+            if key not in existing_err_set:
+                existing_err_set.add(key)
+                local_errors.append({
+                    "type": "runtime_log",
+                    "file_path": file_path,
+                    "line_number": line_number,
+                    "error_type": error_type,
+                    "error_message": message,
+                    "traceback": f"{error_type}: {message}",
+                    "ci_stage": ci_stage,
+                })
+
         for match in simple_error_pattern.finditer(content):
             error_type = match.group(1)
             error_message = match.group(2)
@@ -1021,25 +1071,31 @@ def create_pull_request(
     if not github_token:
         return "Error: GitHub Token未设置"
 
+    import requests
+
+    logger.info(f"创建PR: {repo_full_name} {head_branch} → {base_branch}")
+
+    verify_ssl = os.getenv("SSL_VERIFY", "true").lower() != "false"
+    api_url = f"https://api.github.com/repos/{repo_full_name}/pulls"
+    headers = {
+        "Authorization": f"token {github_token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+    payload = {
+        "title": title,
+        "body": body,
+        "head": head_branch,
+        "base": base_branch,
+    }
+
     try:
-        from github import Github, GithubException
-        logger.info(f"创建PR: {repo_full_name} {head_branch} → {base_branch}")
-
-        # 遵循SSL_VERIFY环境变量（与download_ci_logs保持一致）
-        verify_ssl = os.getenv("SSL_VERIFY", "true").lower() != "false"
-        g = Github(github_token, verify=verify_ssl)
-        repo = g.get_repo(repo_full_name)
-
-        pr = repo.create_pull(
-            title=title,
-            body=body,
-            head=head_branch,
-            base=base_branch
-        )
-
-        return pr.html_url
-    except GithubException as e:
-        return f"Error: 创建PR失败: {str(e)}"
+        resp = requests.post(api_url, json=payload, headers=headers, verify=verify_ssl, timeout=30)
+        if resp.status_code in (200, 201):
+            pr_url = resp.json().get("html_url", "")
+            logger.info(f"PR创建成功: {pr_url}")
+            return pr_url
+        else:
+            return f"Error: 创建PR失败 (HTTP {resp.status_code}): {resp.text[:300]}"
     except Exception as e:
         return f"Error: 创建PR失败: {str(e)}"
 

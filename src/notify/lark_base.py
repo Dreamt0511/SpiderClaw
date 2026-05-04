@@ -140,6 +140,7 @@ class LarkBaseClient:
         self._initialized = False  # 是否已完成初始化（版本校验+字段校验）
         self._last_fields_refresh: Optional[datetime] = None  # 上次字段缓存刷新时间
         self._fields_cache_ttl = 300  # 字段缓存有效期：5分钟
+        self._last_stderr: str = ""  # 最近一次命令的stderr输出
 
         # 版本和字段校验推迟到第一次上报时执行，避免在初始化时创建异步任务导致问题
         self._check_version = check_version
@@ -215,6 +216,7 @@ class LarkBaseClient:
         Returns:
             命令执行结果，失败返回None
         """
+        self._last_stderr = ""
         try:
             # 构造完整命令
             import sys
@@ -252,6 +254,7 @@ class LarkBaseClient:
                     return None
             else:
                 error_msg = stderr.decode('utf-8', errors='ignore')
+                self._last_stderr = error_msg
                 # 800070003: "no operation produced" — 字段已是目标状态，视为成功
                 if "800070003" in error_msg:
                     logger.debug(f"字段已是目标状态，无需修改: {error_msg}")
@@ -266,10 +269,82 @@ class LarkBaseClient:
             logger.error(f"执行lark-cli命令异常: {e}", exc_info=True)
             return None
 
-    async def list_tables(self) -> List[Dict[str, Any]]:
-        """列出所有数据表"""
+    async def _create_base(self) -> Optional[str]:
+        """机器人自动创建多维表格（仅 bot 身份可用）"""
+        import sys
+        lark_cmd = "lark-cli.cmd" if sys.platform == "win32" else "lark-cli"
+        full_cmd = [lark_cmd, "base", "+base-create", "--name", "SpiderClaw修复记录", "--as", self.as_user]
+
+        logger.info("机器人自动创建多维表格...")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *full_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await proc.communicate()
+
+            if proc.returncode == 0:
+                result = json.loads(stdout.decode('utf-8', errors='ignore'))
+                new_token = result.get("data", {}).get("base", {}).get("base_token", "")
+                if new_token:
+                    logger.info(f"多维表格创建成功: token={new_token}")
+                    self._persist_base_token(new_token)
+                    return new_token
+            logger.error(f"创建多维表格失败: {stderr.decode('utf-8', errors='ignore')}")
+        except Exception as e:
+            logger.error(f"创建多维表格异常: {e}", exc_info=True)
+        return None
+
+    @staticmethod
+    def _persist_base_token(token: str) -> None:
+        """将新创建的 base_token 写回 agent-config.yaml，避免重启后重复创建"""
+        import re
+        config_path = "src/config/agent-config.yaml"
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            new_content = re.sub(
+                r'(base_token:\s*)"[^"]*"',
+                f'\\1"{token}"',
+                content,
+                count=1,
+            )
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write(new_content)
+            logger.info(f"base_token 已持久化到 {config_path}: {token}")
+        except Exception as e:
+            logger.warning(f"持久化 base_token 失败（不影响运行）: {e}")
+
+    async def _ensure_base(self) -> bool:
+        """确保 base_token 可用，无权限时自动创建新表格"""
+        if not self.base_token:
+            new_token = await self._create_base()
+            if new_token:
+                self.base_token = new_token
+                return True
+            return False
+
+        # 验证当前 token 是否可用
+        tables = await self.list_tables()
+        if tables is not None:
+            return True
+
+        # list_tables 返回 None 说明无权限，自动创建
+        logger.warning(f"当前 base_token 无权限，自动创建新多维表格")
+        new_token = await self._create_base()
+        if new_token:
+            self.base_token = new_token
+            self._tables.clear()
+            return True
+        return False
+
+    async def list_tables(self) -> Optional[List[Dict[str, Any]]]:
+        """列出所有数据表，无权限返回 None，空表返回 []"""
         result = await self._run_command(["+table-list"])
-        return result.get("data", {}).get("tables", []) if result else []
+        if result is None:
+            return None
+        return result.get("data", {}).get("tables", [])
 
     async def create_repair_table(self, table_name: str = "修复记录") -> Optional[str]:
         """
@@ -283,6 +358,9 @@ class LarkBaseClient:
         """
         # 检查表是否已存在
         tables = await self.list_tables()
+        if tables is None:
+            logger.error(f"无法访问多维表格，表创建失败: {table_name}")
+            return None
         for table in tables:
             if table.get("name") == table_name:
                 tid = table.get("id") or table.get("table_id")
@@ -317,6 +395,17 @@ class LarkBaseClient:
             await self._fix_datetime_field_format()
             return table_id
         else:
+            # 表已存在时从错误提示中提取 table_id
+            import re as _re
+            match = _re.search(r'existing table .+\((\w+)\)', self._last_stderr)
+            if match:
+                existing_id = match.group(1)
+                self._tables[table_name] = existing_id
+                self.repair_table_id = existing_id
+                logger.info(f"表已存在（从错误提示提取），名称: {table_name}, ID: {existing_id}")
+                await self._init_fields()
+                await self.validate_and_migrate_fields()
+                return existing_id
             logger.error(f"表创建失败: {table_name}")
             return None
 
@@ -506,6 +595,10 @@ class LarkBaseClient:
             return
 
         try:
+            # 确保 base_token 可用（无权限时自动创建）
+            if not await self._ensure_base():
+                logger.error("无法获取可用的多维表格，跳过初始化")
+                return
             # 版本校验
             if self._check_version:
                 await self.check_lark_cli_version()

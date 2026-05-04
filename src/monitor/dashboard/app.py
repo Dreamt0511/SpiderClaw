@@ -141,7 +141,7 @@ class Dashboard:
         try:
             # 首帧
             frame = _render()
-            sys.stdout.write('\x1b[2J\x1b[H' + frame)
+            sys.stdout.write('\x1b[H' + frame)
             sys.stdout.flush()
             # 清除启动过程中 reader 线程可能已累积的事件信号
             self.state.clear_refresh()
@@ -167,7 +167,7 @@ class Dashboard:
                 if should_render:
                     last_refresh = now
                     frame = _render()
-                    sys.stdout.write('\x1b[2J\x1b[H' + frame)
+                    sys.stdout.write('\x1b[H' + frame)
                     sys.stdout.flush()
 
         except KeyboardInterrupt:

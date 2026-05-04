@@ -66,9 +66,16 @@ INSTRUCTION_TEMPLATES = {
         "🚨 强制性指令：你遗漏了以下目标文件：{missing_files}。\n"
         "本次修复的 `code_changes` 必须包含上述所有文件（一个都不能少）。\n"
         "**被遗漏的文件也必须修复**，不允许仅用原始内容填充。\n"
-        "你必须调用 read_file 读取遗漏文件的当前内容，分析其中的错误并进行修复。\n"
+        "所有目标文件的完整代码已在 prompt 中提供，请基于提供的代码进行修复。\n"
         "如果再次遗漏则修复直接失败。\n"
         "全部目标文件列表：{all_target_files}。"
+    ),
+
+    "wrong_file_modified": (
+        "🚨 强制性指令：你修改了以下非目标文件：{invalid_files}。\n"
+        "这些文件与本次报错无关，你绝对不能修改它们。\n"
+        "你必须将 code_changes 的范围限制在以下目标文件内：{all_target_files}。\n"
+        "如果再次修改非目标文件则修复直接失败。"
     ),
 
     # === ValidationGate 其他 ===

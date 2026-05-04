@@ -1,9 +1,26 @@
 """配置管理模块"""
+import os
+import re
 from typing import Optional, Dict, Any
 from pathlib import Path
 import yaml
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _resolve_env_vars(obj):
+    """递归解析配置中的 ${ENV_VAR} 环境变量引用"""
+    if isinstance(obj, str):
+        def _replace(m):
+            var = m.group(1)
+            default = m.group(3) if m.group(3) is not None else ""
+            return os.environ.get(var, default)
+        return re.sub(r'\$\{(\w+)(:-([^}]*))?\}', _replace, obj)
+    elif isinstance(obj, dict):
+        return {k: _resolve_env_vars(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_resolve_env_vars(v) for v in obj]
+    return obj
 
 
 class WebhookConfig(BaseModel):
@@ -69,7 +86,7 @@ class LarkConfig(BaseModel):
     repair_table_id: str = Field(default="", description="修复记录表ID")
     auto_create_table: bool = Field(default=True, description="表不存在时是否自动创建修复记录表")
     auto_fix_fields: bool = Field(default=True, description="字段缺失时是否自动补全字段")
-    as_bot: bool = Field(default=False, description="是否以机器人身份操作（需要将机器人添加到base协作成员）")
+    as_bot: bool = Field(default=True, description="是否以机器人身份操作（需要将机器人添加到base协作成员）")
     # 告警配置
     alert_on_failure: bool = Field(default=True, description="上报失败时是否发送告警通知")
     alert_threshold: int = Field(default=3, description="连续失败多少次后发送告警")
@@ -159,6 +176,9 @@ class Settings(BaseSettings):
         try:
             with open(config_path, "r", encoding="utf-8") as f:
                 config_data = yaml.safe_load(f) or {}
+
+            # 解析 ${ENV_VAR} 环境变量引用
+            config_data = _resolve_env_vars(config_data)
 
             # 向后兼容：如果agent段有llm_model，自动迁移到openai段的model_name
             if "agent" in config_data and "llm_model" in config_data["agent"]:

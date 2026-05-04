@@ -1,0 +1,13 @@
+services:
+- name: order-service
+  repo_url: https://github.com/Dreamt0511/AutoFix_Test_rep
+  repo_local_path: /app/data/repos/order-service
+  version: main
+  git_branch: main
+  path_mapping:
+    /opt/biz-app/app/: src/
+rate_limit:
+  max_fixes_per_minute: 3
+  max_fixes_per_hour: 20
+  dedup_window_seconds: 300
+  aggregate_window_seconds: 60

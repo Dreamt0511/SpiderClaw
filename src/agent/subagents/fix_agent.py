@@ -5,11 +5,13 @@ import json
 import logging
 import re
 from langchain.agents import create_agent
+from langchain.agents.middleware import ToolCallLimitMiddleware
+from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 
 from src.agent.state import ErrorLocation, FixAttempt
 from src.agent.prompts.fix_agent import FIX_AGENT_SYSTEM_PROMPT, FIX_AGENT_USER_PROMPT
-from src.agent.tools.langchain_tools import all_tools, set_tool_context, search_code, search_files
+from src.agent.tools.langchain_tools import set_tool_context, search_code, search_files, read_file as _read_file
 from src.agent.code_context import build_error_context_section
 from src.utils.audit import AuditCallbackHandler
 
@@ -33,6 +35,7 @@ class FixAgent:
         self.repo_path = repo_path
         self.github_token = github_token
         self.max_change_lines = max_change_lines
+        self.system_prompt_override = system_prompt_override
 
         self.llm = ChatOpenAI(
             model=llm_model,
@@ -42,19 +45,47 @@ class FixAgent:
             callbacks=[AuditCallbackHandler("修复Agent")],
         )
 
-        self.tools = [
-            tool for tool in all_tools if tool.name in ["read_file", "search_files"]
-        ]
+        # 目标文件映射：generate_fix 调用前动态设置
+        # key=文件ID(0,1,2...), value=相对路径
+        self._target_file_map: Dict[int, str] = {}
 
-        # 动态注入变更行数阈值，消除硬编码
+        # 受限的 read_file 工具：只能通过 ID 读取预设的目标文件
+        agent_self = self
+
+        @tool
+        def read_target_file(id: int) -> str:
+            """读取目标文件的完整代码。只能传入 prompt 中列出的文件 ID（0, 1, 2, ...）。
+
+            Args:
+                id: 文件 ID，对应 prompt 中「可读取文件列表」的编号
+            """
+            if id not in agent_self._target_file_map:
+                available = sorted(agent_self._target_file_map.keys())
+                return f"Error: 无效的文件 ID {id}。可用 ID: {available}"
+            rel_path = agent_self._target_file_map[id]
+            set_tool_context({"repo_path": agent_self.repo_path, "github_token": agent_self.github_token})
+            return _read_file.invoke({"file_path": f"{agent_self.repo_path}/{rel_path}"})
+
+        self.read_target_file_tool = read_target_file
+
+    def _create_agent(self, run_limit: int):
+        """创建 Agent，run_limit = 目标文件数量（每个文件最多读一次）"""
         prompt = FIX_AGENT_SYSTEM_PROMPT.replace(
             "__MAX_CHANGE_LINES__", str(self.max_change_lines)
         )
-        if system_prompt_override:
-            prompt = system_prompt_override + "\n\n" + prompt
+        if self.system_prompt_override:
+            prompt = self.system_prompt_override + "\n\n" + prompt
 
-        self.agent = create_agent(
-            model=self.llm, tools=self.tools, system_prompt=prompt
+        return create_agent(
+            model=self.llm,
+            tools=[self.read_target_file_tool],
+            system_prompt=prompt,
+            middleware=[
+                ToolCallLimitMiddleware(
+                    tool_name="read_target_file",
+                    run_limit=run_limit,
+                ),
+            ],
         )
 
     @staticmethod
@@ -180,15 +211,6 @@ class FixAgent:
             logger.info(f"使用LangChain Agent生成修复代码，重试次数: {retry_count}")
             token_usage = 0  # 本次调用总token消耗
 
-            if retry_count >= 3:
-                logger.error("重试次数达到上限，放弃修复")
-                return {
-                    "fix_description": "修复失败：重试次数已达3次上限，无法生成有效修复",
-                    "modified_files": [],
-                    "code_changes": {},
-                    "error": "重试次数达到上限",
-                    "token_usage": token_usage,
-                }
 
             # 使用 orchestrator 提供的 target_files（确定性），兜底从 error_locations 推导
             tf = target_files if target_files else None
@@ -379,6 +401,30 @@ class FixAgent:
             elif original_codes:
                 logger.warning("有 original_codes 但无目标文件或错误位置，跳过上下文构建")
 
+            # 设置目标文件 ID 映射（read_target_file 工具使用）
+            self._target_file_map = {i: fp for i, fp in enumerate(tf)} if tf else {}
+
+            # 创建 Agent：run_limit = 目标文件数（每个文件最多读一次完整代码）
+            agent = self._create_agent(run_limit=max(len(tf), 1))
+
+            # 构建可读取文件列表（注入 prompt，让 Agent 知道可用的文件 ID）
+            target_file_list_section = ""
+            if self._target_file_map:
+                rows = "\n".join(
+                    f"| {fid} | {fpath} |" for fid, fpath in self._target_file_map.items()
+                )
+                target_file_list_section = (
+                    "## 📂 可读取文件列表\n\n"
+                    "| ID | 文件路径 |\n|----|----------|\n"
+                    + rows
+                    + "\n\n"
+                    + "- 错误代码上下文片段已在下方展示，通常足够定位问题\n"
+                    + "- 如果片段不够，使用 `read_target_file(id=N)` 读取完整文件代码\n"
+                    + "- 你**只能**读取上表中的文件，ID 越界会返回错误\n"
+                    + "- 你**只能**修改这些文件，`code_changes` 的 key 必须是表中的文件路径\n"
+                )
+                logger.info(f"目标文件 ID 映射: {self._target_file_map}")
+
             # 构建目标文件指令
             force_instruction_content = ""
             if tf:
@@ -407,11 +453,16 @@ class FixAgent:
             else:
                 logger.info("没有找到带文件路径的错误，不添加目标文件指令")
 
+            # ci_logs 截断：只保留最后 2000 字符（错误通常在末尾）
+            ci_logs_display = ci_logs[-2000:] if len(ci_logs) > 2000 else ci_logs
+
             user_input = FIX_AGENT_USER_PROMPT.format(
                 force_instruction_content=force_instruction_content,
+                ci_logs=ci_logs_display,
                 error_locations=error_locations_json,
                 repo_path=self.repo_path,
                 root_cause_section=root_cause_section,
+                target_file_list_section=target_file_list_section,
                 error_context_section=error_context_section,
                 review_feedback_section=review_feedback_section,
                 risk_warnings_section=risk_warnings_section,
@@ -430,7 +481,7 @@ class FixAgent:
                     logger.info(f"Prompt中错误代码上下文区块:\n{snippet}...")
 
             config = {"recursion_limit": 50}
-            result = await self.agent.ainvoke({"input": user_input}, config=config)
+            result = await agent.ainvoke({"input": user_input}, config=config)
             logger.info("Agent调用完成")
 
             # 获取token用量（遍历所有AIMessage累加，agent循环中每次LLM调用都有独立的token_usage）
@@ -455,12 +506,10 @@ class FixAgent:
             )
             if json_match:
                 json_content = json_match.group(1)
-                logger.info(f"从markdown中提取JSON: {json_content}")
             else:
                 json_match = _re.search(r"\{.*\}", response_content, _re.DOTALL)
                 if json_match:
                     json_content = json_match.group(0)
-                    logger.info(f"从响应中直接提取JSON: {json_content}")
                 else:
                     start_idx = response_content.find("{")
                     end_idx = response_content.rfind("}")
@@ -505,21 +554,52 @@ class FixAgent:
                 invalid_files = [
                     f for f in returned_files if f not in expected_files
                 ]
+                missing_files = [f for f in expected_files if f not in returned_files]
 
+                # 移除无关文件
                 if invalid_files:
                     logger.warning(
-                        f"修复Agent返回了目标列表外的文件（已接受）: {invalid_files}"
+                        f"修复Agent返回了目标列表外的文件（已移除）: {invalid_files}"
                     )
+                    # 从 code_changes 和 modified_files 中移除无关文件
+                    for f in invalid_files:
+                        fix_result["code_changes"].pop(f, None)
+                    fix_result["modified_files"] = [
+                        f for f in fix_result.get("modified_files", [])
+                        if f not in invalid_files
+                    ]
 
-                # 自动填充遗漏文件（LLM 训练先验难以覆盖，程序化兜底）
-                for fp in expected_files:
-                    if fp not in returned_files:
-                        orig = original_codes.get(fp, "") if original_codes else ""
-                        if orig:
-                            fix_result["code_changes"][fp] = orig
-                            if fp not in fix_result.get("modified_files", []):
-                                fix_result.setdefault("modified_files", []).append(fp)
-                            logger.info(f"修复后自动填充遗漏文件: {fp}（保留原始内容，{len(orig)}字符）")
+                    # 🔴 补充：强制清理 fix_description，移除包含无效文件名的行
+                    desc_lines = fix_result.get("fix_description", "").split('\n')
+                    cleaned_lines = []
+                    for line in desc_lines:
+                        if any(invalid_file in line for invalid_file in invalid_files):
+                            continue
+                        cleaned_lines.append(line)
+                    fix_result["fix_description"] = '\n'.join(cleaned_lines)
+                    logger.info(f"已从修复描述中移除无效文件相关行")
+
+                # 🔴 新增：如果移除无关文件后，目标文件仍缺失，直接报错
+                if missing_files:
+                    remaining_files = list(fix_result.get("code_changes", {}).keys())
+                    if not any(f in remaining_files for f in expected_files):
+                        logger.error(
+                            f"修复Agent未能修复任何目标文件！"
+                            f"期望: {expected_files}, 实际: {remaining_files}"
+                        )
+                        return {
+                            "fix_description": "修复Agent未能修复目标文件",
+                            "modified_files": fix_result.get("modified_files", []),
+                            "code_changes": fix_result.get("code_changes", {}),
+                            "error": "target_files_missing",
+                            "invalid_files": invalid_files,
+                            "expected_files": expected_files,
+                        }
+                    else:
+                        # 部分修复：记录但仍继续
+                        logger.warning(
+                            f"修复Agent遗漏了部分目标文件: {missing_files}"
+                        )
 
             if (
                 not fix_result.get("code_changes")

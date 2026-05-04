@@ -24,6 +24,7 @@ _FRAMEWORK_PATHS = (
 
 class RepairLifecycleStatus(str, Enum):
     """修复生命周期状态"""
+    FIXING = "fixing"                    # 正在修复中（阻塞重复事件）
     PENDING_DEPLOY = "pending_deploy"    # PR 已创建，等待部署
     DEPLOYED = "deployed"                # 修复已部署上线
     SUPERSEDED = "superseded"            # 版本已变更，记录过期

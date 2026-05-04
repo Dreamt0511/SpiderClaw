@@ -45,6 +45,10 @@ class ServiceRegistry:
         """列出所有已注册的服务名"""
         return list(self._services.keys())
 
+    def all(self) -> list[ServiceConfig]:
+        """返回所有已注册的服务配置"""
+        return list(self._services.values())
+
     @property
     def rate_limit(self) -> RateLimitConfig:
         return self._rate_limit

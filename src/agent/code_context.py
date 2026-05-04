@@ -2,9 +2,29 @@
 
 import ast
 import logging
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_err_fields(err: Any) -> dict:
+    """从 ErrorLocation 对象或 dict 中提取错误字段"""
+    def _get(attr, default=""):
+        if hasattr(err, attr):
+            return getattr(err, attr) or default
+        if isinstance(err, dict):
+            return err.get(attr, default)
+        return default
+
+    return {
+        "file_path": _get("file_path", ""),
+        "line_number": _get("line_number", 0),
+        "error_type": _get("error_type", ""),
+        "error_message": _get("error_message", ""),
+        "is_root_cause": _get("is_root_cause", False),
+        "traceback": _get("traceback", ""),
+    }
 
 
 def build_error_context_section(
@@ -17,52 +37,38 @@ def build_error_context_section(
 
     对每个目标文件，根据 ErrorLocation 的行号定位到函数/类体，
     提取语义完整的代码片段，而非完整文件。
+    对无 file_path 的错误，从 traceback 提取路径或单独展示。
     """
-    if not original_codes or not target_files or not error_locations:
+    if not error_locations:
+        return ""
+    if not target_files:
         return ""
 
     # 构建文件→错误列表的映射
     file_errors: dict[str, list[dict]] = {}
+    orphan_errors: list[dict] = []  # 无 file_path 的错误
+
     for err in error_locations:
-        fp = ""
-        if hasattr(err, "file_path"):
-            fp = err.file_path
-        elif isinstance(err, dict):
-            fp = err.get("file_path", "")
+        fields = _extract_err_fields(err)
+        fp = fields["file_path"]
 
-        if not fp:
-            continue
-
-        lineno = 0
-        if hasattr(err, "line_number"):
-            lineno = err.line_number
-        elif isinstance(err, dict):
-            lineno = err.get("line_number", 0)
-
-        etype = ""
-        if hasattr(err, "error_type"):
-            etype = err.error_type
-        elif isinstance(err, dict):
-            etype = err.get("error_type", "")
-
-        emsg = ""
-        if hasattr(err, "error_message"):
-            emsg = err.error_message
-        elif isinstance(err, dict):
-            emsg = err.get("error_message", "")
-
-        is_root = False
-        if hasattr(err, "is_root_cause"):
-            is_root = err.is_root_cause
-        elif isinstance(err, dict):
-            is_root = err.get("is_root_cause", False)
-
-        file_errors.setdefault(fp, []).append({
-            "line_number": lineno,
-            "error_type": etype,
-            "error_message": emsg,
-            "is_root_cause": is_root,
-        })
+        if fp:
+            file_errors.setdefault(fp, []).append(fields)
+        else:
+            # 尝试从 traceback 提取文件路径
+            tb = fields["traceback"]
+            if tb:
+                tb_files = re.findall(r'File "([^"]+\.py)"', tb)
+                if tb_files:
+                    extracted_fp = tb_files[-1]  # 取最后一个（实际出错位置）
+                    ln_matches = re.findall(r'line\s+(\d+)', tb)
+                    if ln_matches:
+                        fields["line_number"] = int(ln_matches[-1])
+                    file_errors.setdefault(extracted_fp, []).append(fields)
+                    logger.info(f"从 traceback 提取文件路径: {extracted_fp}")
+                    continue
+            # 无法提取 → 记录为孤立错误
+            orphan_errors.append(fields)
 
     blocks = []
     for fp in target_files:
@@ -76,7 +82,7 @@ def build_error_context_section(
 
         # 目标文件中没有错误 → 简短注释
         if not err_list:
-            blocks.append(f"### {fp}\n_（目标文件中无直接错误，可按需使用 `read_file` 查看）_\n")
+            blocks.append(f"### {fp}\n_（此文件中无直接错误定位，使用 `read_target_file` 查看完整代码）_\n")
             continue
 
         # 尝试 AST 解析
@@ -158,15 +164,27 @@ def build_error_context_section(
                 header = f"### {fp}"
                 blocks.append(_format_block(header, "\n\n".join(snippets), err_list))
 
+    # 孤立错误（无 file_path 且无法从 traceback 提取）→ 单独展示
+    if orphan_errors:
+        lines = []
+        for err in orphan_errors:
+            prefix = "🔴 [根因] " if err.get("is_root_cause") else ""
+            et = err.get("error_type", "")
+            em = (err.get("error_message", "") or "")[:300]
+            lines.append(f"- {prefix}[{et}]: {em}")
+        header = "### ⚠️ 无法定位文件的错误（需结合上下文推断）"
+        blocks.append(header + "\n" + "\n".join(lines))
+        logger.info(f"有 {len(orphan_errors)} 个孤立错误（无文件路径）")
+
     if not blocks:
         return ""
 
     # 构建最终输出
     sections = "\n\n".join(blocks)
     section = (
-        "## 📂 错误代码上下文（仅展示与错误相关的代码片段，非完整文件）\n\n"
+        "## 📂 错误代码上下文（仅展示与错误相关的代码片段）\n\n"
         + sections
-        + "\n\n_💡 如需查看完整文件内容，请使用 `read_file` 工具。_"
+        + "\n\n_💡 如需查看完整文件代码，使用 `read_target_file(id=N)`。_"
     )
     return section
 

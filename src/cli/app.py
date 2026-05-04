@@ -265,7 +265,7 @@ def init_sidecar(
     agent_url: str = typer.Option("http://agent-host:8000/webhook/log", "--agent-url", help="Agent Webhook 地址"),
     log_path: str = typer.Option("/var/log/app/app.log", "--log-path", help="日志文件路径"),
 ):
-    """生成采集脚本和配置模板"""
+    """生成采集脚本和配置模板（支持日志监控 + 命令执行两种模式）"""
     import os
     from rich.panel import Panel
 
@@ -273,10 +273,9 @@ def init_sidecar(
 
     # 生成 agent-mapping.conf
     conf_content = f'''# SpiderClaw 采集脚本配置
-# 部署到业务服务器: /opt/agent-sidecar/agent-mapping.conf
 
 SERVICE_NAME="{service_name}"
-SERVICE_VERSION=""  # 部署时写入: echo "SERVICE_VERSION=$(git rev-parse HEAD)" >> agent-mapping.conf
+SERVICE_VERSION="main"
 LOG_PATH="{log_path}"
 AGENT_URL="{agent_url}"
 '''
@@ -286,9 +285,19 @@ AGENT_URL="{agent_url}"
 
     # 生成 collector.sh
     collector_content = r'''#!/bin/bash
-# SpiderClaw 远程日志采集脚本
-# 部署到业务服务器: /opt/agent-sidecar/collector.sh
-# 启动: nohup bash /opt/agent-sidecar/collector.sh > /dev/null 2>&1 &
+# SpiderClaw 远程日志采集脚本（整合版）
+# ==============================================
+# 两个文件即可实现全功能：collector.sh + agent-mapping.conf
+# 零侵入业务代码，不需要任何修改
+# ==============================================
+# 使用方式：
+# 1. 日志监控模式（默认）：后台运行，持续监控日志文件
+#    nohup bash /opt/agent-sidecar/collector.sh > /dev/null 2>&1 &
+#
+# 2. 命令执行模式：运行任意命令，同时捕获输出到日志+显示到屏幕
+#    bash /opt/agent-sidecar/collector.sh exec <你的命令>
+#    示例：bash /opt/agent-sidecar/collector.sh exec python3 -m pytest app/tests/ -v
+# ==============================================
 
 set -euo pipefail
 
@@ -298,7 +307,7 @@ source "$SCRIPT_DIR/agent-mapping.conf"
 AGENT_URL="${AGENT_URL:-http://agent-host:8000/webhook/log}"
 DEDUP_WINDOW="${DEDUP_WINDOW:-300}"
 BATCH_INTERVAL="${BATCH_INTERVAL:-10}"
-MAX_BATCH_LINES="${MAX_BATCH_LINES:-50}"
+MAX_BATCH_LINES="${MAX_BATCH_LINES:-200}"
 MAX_BACKOFF="${MAX_BACKOFF:-300}"
 
 LAST_HASH=""
@@ -306,26 +315,99 @@ BACKOFF=1
 ERROR_CACHE=""
 LAST_SEND_TIME=0
 LINE_COUNT=0
+COLLECTING=0
 
-# 错误哈希函数：提取 File+行号+错误类型 → MD5 前12位
+# Python 错误关键词（含解释器级别的错误、pytest测试失败）
+ERROR_KEYWORDS='Error|Traceback|Exception|FAILED|SyntaxError|IndentationError|ImportError|ModuleNotFoundError|NameError|RecursionError'
+# Python 解释器输出特征（无时间戳的 Traceback 帧和异常行、pytest异常输出）
+PYTHON_INTERPRETER_PATTERN='^  File ".+", line \d+|^\w+Error:|^\w+Exception:'
+
+# ==============================================
+# 命令执行模式：运行命令并捕获输出
+# ==============================================
+exec_command() {
+    local log_file="$LOG_PATH"
+    mkdir -p "$(dirname "$log_file")"
+    touch "$log_file"
+
+    echo "[采集器] 开始执行命令：$*" | tee -a "$log_file"
+    echo "----------------------------------------" | tee -a "$log_file"
+
+    # 使用script命令捕获所有终端输出，包括颜色、进度条等
+    local exit_code=0
+    if command -v script >/dev/null 2>&1; then
+        # Linux/macOS 系统使用script
+        script -q -c "$*" /dev/null | tee -a "$log_file"
+        exit_code=${PIPESTATUS[0]}
+    else
+        # 兼容系统使用tee
+        "$@" 2>&1 | tee -a "$log_file"
+        exit_code=${PIPESTATUS[0]}
+    fi
+
+    echo "----------------------------------------" | tee -a "$log_file"
+    echo "[采集器] 命令执行完成，退出码：$exit_code" | tee -a "$log_file"
+
+    # 从日志中提取错误信息并上报到 SpiderClaw 服务端
+    if [ "$exit_code" -ne 0 ] || grep -qiE "$ERROR_KEYWORDS" "$log_file" 2>/dev/null; then
+        echo "[采集器] 检测到错误，正在上报到服务端..." | tee -a "$log_file"
+        local collecting=0
+        while IFS= read -r line; do
+            if echo "$line" | grep -qP '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}'; then
+                collecting=0
+                if echo "$line" | grep -qiE "$ERROR_KEYWORDS"; then
+                    ERROR_CACHE="${ERROR_CACHE}${line}\n"
+                    LINE_COUNT=$((LINE_COUNT + 1))
+                    collecting=1
+                fi
+            elif echo "$line" | grep -qE "$PYTHON_INTERPRETER_PATTERN"; then
+                if [ "$collecting" -eq 0 ]; then
+                    collecting=1
+                    ERROR_CACHE="[no-timestamp at $(date '+%Y-%m-%d %H:%M:%S')]\n"
+                    LINE_COUNT=0
+                fi
+                ERROR_CACHE="${ERROR_CACHE}${line}\n"
+                LINE_COUNT=$((LINE_COUNT + 1))
+            elif [ "$collecting" -eq 1 ]; then
+                ERROR_CACHE="${ERROR_CACHE}${line}\n"
+                LINE_COUNT=$((LINE_COUNT + 1))
+            fi
+        done < "$log_file"
+        flush_cache
+        echo "[采集器] 错误上报完成" | tee -a "$log_file"
+    fi
+
+    exit $exit_code
+}
+
+# ==============================================
+# 日志监控模式：原有采集逻辑
+# ==============================================
 compute_hash() {
     local text="$1"
     local file_line
     file_line=$(echo "$text" | grep -oP 'File "[^"]+", line \d+' | tail -1 || true)
     local error_type
-    error_type=$(echo "$text" | grep -oP '[A-Z][a-zA-Z0-9]*Error' | head -1 || true)
-    local key="${file_line}:${error_type}"
+    error_type=$(echo "$text" | grep -oP '[A-Z][a-zA-Z0-9]*(Error|Exception)' | head -1 || true)
+    local key
+    if [ -n "$file_line" ]; then
+        key="${file_line}:${error_type}"
+    else
+        local first_line
+        first_line=$(echo "$text" | head -1 | cut -c1-50)
+        key="${error_type}:${first_line}"
+    fi
     echo -n "$key" | md5sum | cut -c1-12
 }
 
 send_batch() {
     local payload="$1"
     local http_code
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" \\
-        -X POST "$AGENT_URL" \\
-        -H "Content-Type: application/json" \\
-        -d "$payload" \\
-        --connect-timeout 10 \\
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        -X POST "$AGENT_URL" \
+        -H "Content-Type: application/json" \
+        -d "$payload" \
+        --connect-timeout 10 \
         --max-time 30 || echo "000")
 
     if [ "$http_code" = "429" ]; then
@@ -348,14 +430,12 @@ flush_cache() {
     local now
     now=$(date +%s)
 
-    # 去重：相同错误在 DEDUP_WINDOW 内不重复发送
     if [ "$hash" = "$LAST_HASH" ] && [ $((now - LAST_SEND_TIME)) -lt "$DEDUP_WINDOW" ]; then
         ERROR_CACHE=""
         LINE_COUNT=0
         return
     fi
 
-    # 构造 JSON payload
     local escaped_log
     escaped_log=$(echo "$ERROR_CACHE" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))' 2>/dev/null || echo '""')
     local payload="{\"log\":${escaped_log},\"service\":\"${SERVICE_NAME}\",\"version\":\"${SERVICE_VERSION}\",\"hostname\":\"$(hostname)\"}"
@@ -368,23 +448,58 @@ flush_cache() {
     LINE_COUNT=0
 }
 
-# 主循环
-echo "SpiderClaw collector started: service=$SERVICE_NAME log=$LOG_PATH"
-tail -F "$LOG_PATH" 2>/dev/null | while IFS= read -r line; do
-    # 检测错误关键词
-    if echo "$line" | grep -qiE 'Error|Traceback|Exception|FAILED'; then
-        ERROR_CACHE="${ERROR_CACHE}${line}\n"
-        LINE_COUNT=$((LINE_COUNT + 1))
+start_monitoring() {
+    echo "SpiderClaw collector started: service=$SERVICE_NAME log=$LOG_PATH"
+    tail -n0 -F "$LOG_PATH" 2>/dev/null | while IFS= read -r line; do
 
-        # 批量发送条件：间隔到达 或 行数到达
-        local now
-        now=$(date +%s)
-        if [ $LINE_COUNT -ge "$MAX_BATCH_LINES" ] || \\
-           ([ $((now - LAST_SEND_TIME)) -ge "$BATCH_INTERVAL" ] && [ $LINE_COUNT -gt 0 ]); then
+        # ── 1. 时间戳行：新日志条目的开始 ──
+        if echo "$line" | grep -qP '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}'; then
+            if [ "$COLLECTING" -eq 1 ]; then
+                COLLECTING=0
+            fi
+            if echo "$line" | grep -qiE "$ERROR_KEYWORDS"; then
+                ERROR_CACHE="${ERROR_CACHE}${line}\n"
+                LINE_COUNT=$((LINE_COUNT + 1))
+                COLLECTING=1
+            fi
+
+        # ── 2. Python 解释器输出（无时间戳的 Traceback/语法错误等）──
+        elif echo "$line" | grep -qE "$PYTHON_INTERPRETER_PATTERN"; then
+            if [ "$COLLECTING" -eq 0 ]; then
+                COLLECTING=1
+                ERROR_CACHE="[no-timestamp at $(date '+%Y-%m-%d %H:%M:%S')]\n"
+                LINE_COUNT=0
+            fi
+            ERROR_CACHE="${ERROR_CACHE}${line}\n"
+            LINE_COUNT=$((LINE_COUNT + 1))
+
+        # ── 3. 采集模式下的续行（堆栈帧、异常描述等）──
+        elif [ "$COLLECTING" -eq 1 ]; then
+            ERROR_CACHE="${ERROR_CACHE}${line}\n"
+            LINE_COUNT=$((LINE_COUNT + 1))
+
+        fi
+
+        # 批量发送
+        if [ "$LINE_COUNT" -ge "$MAX_BATCH_LINES" ] || \
+           ([ $(( $(date +%s) - LAST_SEND_TIME )) -ge "$BATCH_INTERVAL" ] && [ "$LINE_COUNT" -gt 0 ]); then
+            COLLECTING=0
             flush_cache
         fi
-    fi
-done
+    done
+}
+
+# ==============================================
+# 主入口：判断运行模式
+# ==============================================
+if [ $# -gt 0 ] && [ "$1" = "exec" ]; then
+    # 命令执行模式
+    shift
+    exec_command "$@"
+else
+    # 日志监控模式（默认）
+    start_monitoring
+fi
 '''
     collector_path = os.path.join(output_dir, "collector.sh")
     with open(collector_path, "w", encoding="utf-8") as f:
@@ -398,8 +513,12 @@ done
         f"采集脚本: [#20d5f0]{collector_path}[/#20d5f0]\n\n"
         f"部署步骤：\n"
         f"1. 将上述文件复制到业务服务器 /opt/agent-sidecar/\n"
-        f"2. 修改 agent-mapping.conf 中的 SERVICE_VERSION\n"
-        f"3. 启动: nohup bash /opt/agent-sidecar/collector.sh > /dev/null 2>&1 &",
+        f"2. 修改 agent-mapping.conf 中的 SERVICE_NAME、LOG_PATH、AGENT_URL\n\n"
+        f"使用方式：\n"
+        f"  日志监控（后台运行，持续监控日志文件）:\n"
+        f"    nohup bash /opt/agent-sidecar/collector.sh > /dev/null 2>&1 &\n"
+        f"  命令执行（运行命令并自动上报错误）:\n"
+        f"    bash /opt/agent-sidecar/collector.sh exec python3 -m pytest app/tests/ -v",
         title="[bold #20d5f0]init-sidecar 完成[/bold #20d5f0]",
         border_style="#20d5f0",
     ))

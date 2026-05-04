@@ -238,5 +238,16 @@ class AuditReader:
             ts = datetime.now().strftime("%H:%M:%S")
             msg = line[:500]
 
+        # 过滤启动阶段初始化噪音（不重复展示）
+        _INIT_NOISE = [
+            "[entrypoint]",
+            "容器初始化完成",
+            "飞书多维表格客户端初始化完成",
+            "飞书多维表格上报功能已启用",
+            "飞书多维表格客户端延迟初始化完成",
+        ]
+        if any(kw in msg for kw in _INIT_NOISE):
+            return
+
         entry = {"ts": ts, "event": "app_log", "summary": msg[:500]}
         self.state.append_log(entry)

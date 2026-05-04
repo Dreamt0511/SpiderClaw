@@ -10,7 +10,6 @@ webhook:
   allowed_events:                            # 允许的GitHub事件类型
     - "workflow_run"
     - "pull_request"
-    - "check_run"
   event_queue_maxsize: 1000                  # 事件队列最大容量
   max_processed_ids: 10000                   # 已处理事件ID最大保存数量
 
@@ -49,7 +48,7 @@ lark:
   repair_table_id: "tblxxxxxx"                 # 修复记录表ID（可选，为空时自动创建）
   auto_create_table: true                      # 表不存在时是否自动创建修复记录表
   auto_fix_fields: true                        # 字段缺失时是否自动补全字段
-  as_bot: false                                # 是否以机器人身份操作（false=使用当前登录用户身份）
+  as_bot: true                                 # 是否以机器人身份操作（Docker环境必须为true）
   # 告警配置
   alert_on_failure: true                       # 上报失败时是否发送告警通知
   alert_threshold: 3                           # 连续失败多少次后发送告警

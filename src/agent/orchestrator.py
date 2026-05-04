@@ -1,7 +1,6 @@
 """修复流程编排器 — 图构建 + 路由 + 节点实现"""
 
 import asyncio
-import ast
 import datetime
 import logging
 import os
@@ -117,8 +116,15 @@ class RepairOrchestrator:
 
         self.processed_events: set[str] = set()
         self.lock = asyncio.Lock()
+        self._repo_locks: dict[str, asyncio.Lock] = {}  # per-repo 锁，防止并发 git 操作
 
         self.graph = self._build_graph()
+
+    def _get_repo_lock(self, repo_path: str) -> asyncio.Lock:
+        """获取指定仓库的锁（同仓库串行，不同仓库并行）"""
+        if repo_path not in self._repo_locks:
+            self._repo_locks[repo_path] = asyncio.Lock()
+        return self._repo_locks[repo_path]
 
     # ==================== 图构建 ====================
 
@@ -193,6 +199,9 @@ class RepairOrchestrator:
             instruction_kwargs["details"] = rejection_data.get("details", "")
             if violation_type == "file_incomplete":
                 instruction_kwargs["missing_files"] = ", ".join(ctx.get("missing_files", []))
+                instruction_kwargs["all_target_files"] = ", ".join(ctx.get("all_target_files", []))
+            if violation_type == "wrong_file_modified":
+                instruction_kwargs["invalid_files"] = ", ".join(ctx.get("invalid_files", []))
                 instruction_kwargs["all_target_files"] = ", ".join(ctx.get("all_target_files", []))
             if violation_type == "syntax_line_violation":
                 instruction_kwargs["target_files"] = ", ".join(state.get("target_files", []))
@@ -405,9 +414,20 @@ class RepairOrchestrator:
         event: RuntimeLogEvent = state["event"]
         logger.info(f"收集运行时上下文: service={event.service}")
 
+        # 🔴 服务级别修复互斥锁：同一服务不允许并发修复
+        fixing_lock_key = f"__fixing__:{event.service}"
+        event_key = f"runtime:{event.service}:{event.event_id}"
+        mutex_acquired = False
+
         try:
+            async with self.lock:
+                if fixing_lock_key in self.processed_events:
+                    logger.info(f"服务 {event.service} 已有修复流程在进行中，跳过")
+                    return {"success": False, "error_message": f"服务 {event.service} 已有修复流程在进行中"}
+                self.processed_events.add(fixing_lock_key)
+                mutex_acquired = True
+
             # 事件去重
-            event_key = f"runtime:{event.service}:{event.event_id}"
             async with self.lock:
                 if event_key in self.processed_events:
                     logger.info(f"事件 {event_key} 已处理过，跳过")
@@ -462,11 +482,18 @@ class RepairOrchestrator:
 
                 fingerprint = compute_traceback_fingerprint(event.log or "")
                 if fingerprint:
+                    # 🔴 先查询现有状态，再决定是否写入 FIXING
                     existing = store.query_by_fingerprint(fingerprint)
                     if existing:
                         status = existing.get("status", "")
                         record_id = existing.get("id", 0)
-                        if status == RepairLifecycleStatus.PENDING_DEPLOY:
+                        if status == RepairLifecycleStatus.FIXING:
+                            logger.info(f"指纹 {fingerprint} 正在修复中，跳过")
+                            return {
+                                "success": False,
+                                "error_message": f"相同错误正在修复中 (指纹: {fingerprint})",
+                            }
+                        elif status == RepairLifecycleStatus.PENDING_DEPLOY:
                             logger.info(f"指纹 {fingerprint} 已有 pending_deploy 记录，跳过")
                             return {
                                 "success": False,
@@ -491,6 +518,22 @@ class RepairOrchestrator:
                         elif status == RepairLifecycleStatus.SUPERSEDED:
                             logger.info(f"指纹 {fingerprint} 已过期，继续修复")
                             repair_record_id = record_id
+
+                    # 🔴 查询通过后，写入 FIXING 状态阻塞后续事件
+                    try:
+                        store.upsert(
+                            fingerprint,
+                            RepairLifecycleStatus.FIXING.value,
+                            service=event.service,
+                            error_type=error_locations_raw[0].get("error_type", "Unknown") if error_locations_raw else "Unknown",
+                            service_version=svc_config.version,
+                            repo_name=svc_config.repo_url,
+                            branch_name=svc_config.git_branch,
+                        )
+                        logger.info(f"指纹 {fingerprint} 已标记为 FIXING")
+                    except Exception as e:
+                        logger.warning(f"写入 FIXING 状态失败: {e}")
+
             except Exception as e:
                 logger.warning(f"状态机查重失败（降级为直接修复）: {e}")
 
@@ -500,13 +543,15 @@ class RepairOrchestrator:
                 if fp:
                     err["file_path"] = apply_path_mapping(fp, svc_config.path_mapping)
 
-            # 5. 确保本地仓库可用（使用配置的版本，不猜测）
-            repo_path, degraded = await ensure_repo_with_version(
-                repo_url=svc_config.repo_url,
-                local_path=svc_config.repo_local_path,
-                version=svc_config.version,
-                branch=svc_config.git_branch,
-            )
+            # 5. 确保本地仓库可用（使用配置的版本，不猜测，per-repo 锁串行化）
+            repo_lock = self._get_repo_lock(svc_config.repo_local_path)
+            async with repo_lock:
+                repo_path, degraded = await ensure_repo_with_version(
+                    repo_url=svc_config.repo_url,
+                    local_path=svc_config.repo_local_path,
+                    version=svc_config.version,
+                    branch=svc_config.git_branch,
+                )
             repo = Repo(repo_path)
             set_tool_context({"github_token": self.github_token, "repo_path": repo_path, "repo": repo})
 
@@ -514,7 +559,7 @@ class RepairOrchestrator:
                 logger.warning(f"版本降级：使用最新 {svc_config.git_branch} 分支代码")
 
             # 6. 过滤有效错误
-            error_locations = self._filter_valid_errors(error_locations_raw, repo_path)
+            error_locations = self._filter_valid_errors(error_locations_raw, repo_path, svc_config.path_mapping)
             if not error_locations:
                 async with self.lock:
                     self.processed_events.discard(event_key)
@@ -582,7 +627,7 @@ class RepairOrchestrator:
         return f"{event.repository}:event:{event.event_id}"
 
     @staticmethod
-    def _filter_valid_errors(error_locations: list[dict], repo_path: str) -> list[ErrorLocation]:
+    def _filter_valid_errors(error_locations: list[dict], repo_path: str, path_mapping: dict = None) -> list[ErrorLocation]:
         """过滤有效错误，处理 CI 路径前缀（/github/workspace/ 等）到本地路径的映射"""
         valid = []
         repo_path_abs = os.path.abspath(repo_path)
@@ -621,13 +666,15 @@ class RepairOrchestrator:
                 if any(kw in err_msg for kw in ["HAS_ERROR=", "HAS_WARNING=", "EXIT_CODE="]):
                     logger.info(f"丢弃错误: CI变量赋值, msg={err_msg[:80]}")
                     continue
-                tb_match = re.search(r'File "([^"]+\.py)"', err["traceback"])
-                if tb_match:
-                    fp = tb_match.group(1)
-                    base_fields["file_path"] = fp
-                    ln_match = re.search(r'line\s+(\d+)', err["traceback"])
-                    if ln_match:
-                        base_fields["line_number"] = int(ln_match.group(1))
+                tb_files = re.findall(r'File "([^"]+\.py)"', err["traceback"])
+                if tb_files:
+                    fp = tb_files[-1]  # 取最后一个文件（实际出错位置）
+                    if path_mapping:
+                        fp = apply_path_mapping(fp, path_mapping)
+                    # 取最后一个 line number（对应实际出错位置）
+                    ln_matches = re.findall(r'line\s+(\d+)', err["traceback"])
+                    if ln_matches:
+                        base_fields["line_number"] = int(ln_matches[-1])
                     logger.info(f"从 traceback 提取文件路径: {fp}")
                 else:
                     logger.info(
@@ -675,6 +722,25 @@ class RepairOrchestrator:
             if full.startswith(repo_path_abs) and os.path.isfile(full):
                 rel = os.path.relpath(full, repo_path_abs).replace("\\", "/")
                 valid.append(ErrorLocation(file_path=rel, **base_fields))
+            elif path_mapping:
+                # 运行时日志路径（如 app/calculator.py）可能需要反向映射
+                # path_mapping key 是容器绝对路径（/opt/biz-app/app/），value 是仓库路径（src/）
+                # logger 名生成的路径（app/calculator.py）不匹配 key，用 value 做前缀替换
+                found = False
+                for map_val in sorted(path_mapping.values(), key=len, reverse=True):
+                    # 尝试 map_val + 去掉第一段后的路径
+                    parts = cleaned.split("/", 1)
+                    if len(parts) > 1:
+                        candidate = map_val + parts[1]
+                        candidate_full = os.path.abspath(os.path.join(repo_path, candidate))
+                        if candidate_full.startswith(repo_path_abs) and os.path.isfile(candidate_full):
+                            rel = os.path.relpath(candidate_full, repo_path_abs).replace("\\", "/")
+                            valid.append(ErrorLocation(file_path=rel, **base_fields))
+                            logger.info(f"路径反向映射: {fp} -> {rel}")
+                            found = True
+                            break
+                if not found:
+                    logger.info(f"丢弃错误: 相对路径文件不存在 {fp} -> {full}")
             else:
                 logger.info(f"丢弃错误: 相对路径文件不存在 {fp} -> {full}")
 
@@ -943,6 +1009,62 @@ class RepairOrchestrator:
                     goto=END,
                 )
 
+            # 🔴 目标文件缺失 → 强警告重试，重试耗尽才失败
+            if fix_result.get("error") == "target_files_missing":
+                invalid = fix_result.get("invalid_files", [])
+                expected = fix_result.get("expected_files", state.get("target_files", []))
+                logger.error(
+                    f"FixAgent 修复方向错误！"
+                    f"期望: {expected}, 实际返回: {list(fix_result.get('code_changes', {}).keys())}"
+                )
+
+                if state.get("retry_count", 0) < state.get("max_retries", 3):
+                    # 回滚后重试，注入强警告
+                    repo = Repo(state["repo_path"])
+                    repo.git.checkout("--", ".")
+
+                    warning = (
+                        "🚨🚨🚨 严重警告：修复方向完全错误！🚨🚨🚨\n\n"
+                        f"你上一次返回的修改针对了错误的文件！\n\n"
+                        f"❌ 你错误修改的文件（已丢弃）：{invalid}\n"
+                        f"✅ 你必须且只能修改的文件：{expected}\n\n"
+                        f"这是第 {state.get('retry_count', 0) + 1} 次重试。"
+                        f"你必须立即修正方向，只输出上述 ✅ 文件的修改！"
+                    )
+                    retry_ctx = self._build_retry_context(
+                        state, "gate",
+                        violation_type="wrong_file_modified",
+                        rejection_data={
+                            "violation_type": "wrong_file_modified",
+                            "details": warning,
+                            "error_context": {
+                                "invalid_files": invalid,
+                                "all_target_files": expected,
+                            },
+                        },
+                    )
+                    return Command(
+                        update={
+                            **retry_ctx,
+                            "retry_count": state.get("retry_count", 0),
+                            "current_phase": "retry_from_wrong_file",
+                            "total_token_usage": total_token,
+                        },
+                        goto="fix_agent",
+                    )
+
+                return Command(
+                    update={
+                        "success": False,
+                        "error_message": (
+                            f"修复Agent始终修改错误文件！"
+                            f"期望: {expected}, 错误返回: {invalid}"
+                        ),
+                        "total_token_usage": total_token,
+                    },
+                    goto="handle_failure",
+                )
+
             if not fix_result.get("code_changes"):
                 return Command(
                     update={"success": False, "error_message": "修复Agent未能生成有效修复代码", "total_token_usage": total_token},
@@ -992,30 +1114,6 @@ class RepairOrchestrator:
     async def _validation_gate(self, state: RepairState) -> Command:
         audit_logger.log_event("node_enter", node="validation_gate")
         logger.info("运行校验门禁")
-
-        # ★ 自动填充遗漏文件：LLM 常因训练先验省略"不需要改"的文件，
-        #    在编排层用原始内容补全，避免 file_incomplete 死循环
-        target_files = state.get("target_files", [])
-        original_codes = state.get("original_codes", {})
-        code_changes = state.get("code_changes", {})
-
-        if target_files and code_changes:
-            modified_files = state.get("modified_files", [])
-            for fp in target_files:
-                if fp not in code_changes and fp in original_codes:
-                    orig = original_codes[fp]
-                    # 原始内容有语法错误时不自动填充，标记为需要 LLM 修复
-                    try:
-                        ast.parse(orig)
-                    except SyntaxError:
-                        logger.warning(
-                            f"文件 {fp} 原始内容有语法错误，跳过自动填充（需要修复）"
-                        )
-                        continue
-                    code_changes[fp] = orig
-                    if fp not in modified_files:
-                        modified_files.append(fp)
-                    logger.info(f"自动填充遗漏文件: {fp}（保留原始内容）")
 
         validation = validate_fix(
             fix_result={
@@ -1385,6 +1483,10 @@ class RepairOrchestrator:
             logger.error(f"创建PR失败: {e}", exc_info=True)
             return {"success": False, "error_message": f"创建PR失败: {str(e)}"}
         finally:
+            # 释放服务级别修复锁
+            fixing_lock_key = f"__fixing__:{event.service}"
+            async with self.lock:
+                self.processed_events.discard(fixing_lock_key)
             audit_logger.log_event("node_exit", node="create_pr")
 
     # ==================== 节点: handle_failure ====================
@@ -1534,6 +1636,10 @@ class RepairOrchestrator:
             logger.error(f"状态机 failed 写入失败: {e}")
 
         finally:
+            # 释放服务级别修复锁
+            fixing_lock_key = f"__fixing__:{event.service}"
+            async with self.lock:
+                self.processed_events.discard(fixing_lock_key)
             audit_logger.log_event("node_exit", node="handle_failure")
 
         return {"success": False, "error_message": error_msg}
@@ -1569,13 +1675,13 @@ class RepairOrchestrator:
 
         if state.get("has_high_risks", False) or risk_level == "HIGH":
             if retry_count < state.get("max_retries", 3):
-                logger.info(f"高危风险，重试 ({retry_count + 1}/{state['max_retries']})")
+                logger.info(f"高危风险，重试 ({retry_count}/{state['max_retries']})")
                 return "fix_agent"
             return "create_pr"
 
         if not state.get("review_passed", False):
             if retry_count < state.get("max_retries", 3):
-                logger.info(f"审查未通过，重试 ({retry_count + 1}/{state['max_retries']})")
+                logger.info(f"审查未通过，重试 ({retry_count}/{state['max_retries']})")
                 return "fix_agent"
             return "handle_failure"
 
@@ -1608,7 +1714,7 @@ class RepairOrchestrator:
                 return "create_pr"
 
             if state.get("retry_count", 0) < state.get("max_retries", 3):
-                logger.info(f"验证失败，重试 ({state.get('retry_count', 0) + 1}/{state['max_retries']})")
+                logger.info(f"验证失败，重试 ({state.get('retry_count', 0)}/{state['max_retries']})")
                 return "fix_agent"
 
             logger.warning(f"重试 {state['max_retries']} 次后验证仍未通过，创建 PR")

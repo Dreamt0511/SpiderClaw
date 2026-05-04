@@ -21,6 +21,7 @@ from src.config.service_registry import get_service_registry
 from src.store.repair_store import get_pending_event_store
 from src.utils.audit import audit_logger
 from src.utils.rate_limiter import ServiceRateLimiter
+from src.utils.version_manager import pre_sync_repos
 
 class SafeRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
     """文件被删除后自动重建的日志 Handler。"""
@@ -667,6 +668,7 @@ def run_webhook_server(
     )
 
     approval_ws_ready = asyncio.Event()
+    _repair_lock = asyncio.Lock()  # 修复流程排队锁，确保串行执行
 
     async def recover_pending_events():
         """启动时恢复上次中断的未处理事件"""
@@ -774,7 +776,8 @@ def run_webhook_server(
 
                     async def process_runtime_and_mark_done(evt=event):
                         try:
-                            await orchestrator.run(evt)
+                            async with _repair_lock:
+                                await orchestrator.run(evt)
                         finally:
                             pending_store.delete(evt.event_id)
                             event_bus.mark_done()
@@ -791,7 +794,8 @@ def run_webhook_server(
 
                     async def process_and_mark_done(evt=event):
                         try:
-                            await orchestrator.run(evt)
+                            async with _repair_lock:
+                                await orchestrator.run(evt)
                         finally:
                             pending_store.delete(evt.event_id)
                             event_bus.mark_done()
@@ -939,6 +943,11 @@ def run_webhook_server(
         approval_task = asyncio.create_task(approval_event_listener(), name="approval_listener")
         approval_task.add_done_callback(_task_done_callback)
         tasks.append(approval_task)
+        # 启动时预同步所有注册服务的仓库（确保本地有可用代码）
+        if orchestrator:
+            registry = get_service_registry()
+            await pre_sync_repos(registry.all())
+
         # 启动时恢复上次中断的未处理事件（在 WebSocket 启动之后）
         await recover_pending_events()
         await asyncio.gather(*tasks, return_exceptions=True)
