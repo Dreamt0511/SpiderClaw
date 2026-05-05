@@ -409,25 +409,6 @@ class FixAgent:
 """
                 logger.info(f"检测到 {len(root_cause_errors)} 个根因错误")
 
-            # 从嵌套 traceback 提取实际 error_type（直接修改原始对象）
-            # 这样 _serialize_error_locations 和 build_error_context_section 都能使用正确的 error_type
-            for err in error_locations:
-                if isinstance(err, ErrorLocation):
-                    et, msg = err.error_type, err.error_message or ""
-                else:
-                    et = err.get("error_type", "")
-                    msg = err.get("error_message", "")
-                if et == "RuntimeError" and "Traceback" in msg:
-                    msg_norm = msg.replace('\\n', '\n')
-                    tb_match = re.search(r'\b(\w+Error):\s', msg_norm)
-                    if tb_match and tb_match.group(1) != "RuntimeError":
-                        new_et = tb_match.group(1)
-                        logger.info(f"error_type 提取: {et} → {new_et}")
-                        if isinstance(err, ErrorLocation):
-                            err.error_type = new_et
-                        else:
-                            err["error_type"] = new_et
-
             # 统一 error_locations 的 file_path 与 target_files 格式
             # target_files 来自 orchestrator 的路径映射（如 src/calculator.py），
             # error_locations 来自 parse_python_errors（如 calculator.py），

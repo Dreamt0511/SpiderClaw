@@ -652,7 +652,27 @@ def parse_python_errors(log_content: str) -> List[Dict]:
 
             # 将这些路径都记录下来，后续由 _filter_valid_errors 验证哪个真实存在
             candidate_paths = list(dict.fromkeys([direct_path, short_path, src_path]))
-            file_path = candidate_paths[0]  # 默认使用第一个，_filter_valid_errors 会处理
+            fallback_file_path = candidate_paths[0]
+
+            # === 尝试从 message 中提取嵌套的标准 traceback ===
+            nested_errors = _match_patterns(message, ci_stage=ci_stage)
+            if nested_errors:
+                for ne in nested_errors:
+                    if not ne.get("file_path"):
+                        ne["file_path"] = fallback_file_path
+                    ne["source"] = "runtime_log"
+                    ne_key = _ek(
+                        ne.get("file_path", ""),
+                        ne.get("error_type", ""),
+                        ne.get("line_number", 0)
+                    )
+                    if ne_key not in existing_err_set:
+                        existing_err_set.add(ne_key)
+                        local_errors.append(ne)
+                continue  # 已添加具体错误，跳过 RuntimeError 兜底
+
+            # === 兜底：message 中无标准 traceback 时保持原有逻辑 ===
+            file_path = fallback_file_path
 
             # 尝试从 message 中提取行号（如 "line 11"）
             line_number = 0

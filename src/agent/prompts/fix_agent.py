@@ -1,6 +1,10 @@
 """修复Agent提示词模板"""
 
 FIX_AGENT_SYSTEM_PROMPT = """
+## 🔴 铁律：无论如何必须返回 code_changes
+
+如果 error_locations 中有你无法识别或不在修改边界表中的 error_type，你仍然必须尝试修复。根据 error_message 中嵌套的 traceback、error_context_section 中的代码片段，推断实际错误类型并修复。**禁止返回空的 code_changes。**
+
 你是专业的 Python 代码修复专家。你的目标是用最小的代码变更解决 CI 错误。
 
 ## 🔴🔴 最高优先级：单文件修复锁定协议 🔴🔴

@@ -6,11 +6,15 @@ import re
 
 from rich.panel import Panel
 from rich.text import Text
-from rich.console import Console, RenderableType
+from rich.console import Console, RenderableType, Group
 
 from ..base import MonitorModule
 from ..state import DashboardState
 from ..colors import EVENT_COLORS, EVENT_LABELS, DIM, PRIMARY, ERROR, WARNING, SUCCESS, ACCENT, ICE, INFO
+
+# Agent 响应 Panel 占用行数（上边框 + 内容 + 下边框）
+_PANEL_LINES = 3
+_AGENT_NAME_RE = re.compile(r'^(修复Agent|审查Agent|测试Agent|主Agent)\s')
 
 console = Console()
 # 启动时固定的内容行数（不含边框和脚注），确保 Panel 高度恒定防抖动
@@ -35,60 +39,97 @@ class LogModule(MonitorModule):
         start = max(0, end - visible)
         shown = entries[start:end]
 
-        text = Text()
+        renderables: list[RenderableType] = []
+        used_lines = 0
+
         for entry in shown:
             event = entry.get("event", "")
             ts = entry.get("ts", "")
             summary = entry.get("summary", "")
-            color = EVENT_COLORS.get(event, "white")
-            label = EVENT_LABELS.get(event, event)
 
-            if event == "milestone":
-                text.append(f" {ts} ", style=DIM)
-                text.append(summary, style=color)
-            elif event == "app_log":
-                text.append(f" {ts} ", style=DIM)
-                # 根据日志级别着色（只匹配大写级别，避免模块名误伤如 uvicorn.error）
-                if re.search(r'\b(ERROR|错误|失败|exception|traceback)\b', summary):
-                    summary_color = ERROR
-                elif re.search(r'\b(WARNING|警告)\b', summary):
-                    summary_color = WARNING
-                elif re.search(r'\b(SUCCESS|成功|完成|启动)\b', summary):
-                    summary_color = SUCCESS
-                elif re.search(r'\b(INFO|信息)\b', summary):
-                    summary_color = INFO  # INFO现在是青绿色，避免和边框撞色
-                elif re.search(r'\b(DEBUG|调试)\b', summary):
-                    summary_color = DIM
-                else:
-                    summary_color = ICE
-                text.append(summary, style=summary_color)
+            if event == "llm_response":
+                # Agent 响应：用彩色 Panel 包裹
+                agent_name = self._extract_agent_name(summary)
+                color = self._response_color(summary)
+                panel = Panel(
+                    Text(f" {summary}", style=ICE),
+                    title=f"[bold {color}]{agent_name} 的响应[/]",
+                    border_style=color,
+                    padding=(0, 1),
+                )
+                renderables.append(panel)
+                used_lines += _PANEL_LINES
             else:
-                text.append(f" {ts} ", style=DIM)
-                text.append(f"{label:<12}", style=f"bold {color}")
-                if summary:
-                    text.append(f" │ ", style=DIM)
-                    text.append(summary, style=color)
-            text.append("\n")
+                text = self._render_entry(event, ts, summary)
+                renderables.append(text)
+                used_lines += 1
 
-        # 空行补齐：shown 可能少于 visible，用空行填到 _HEIGHT 行
-        # 预留末尾 1 行给脚注
-        pad = max(0, visible - len(shown))
-        for _ in range(pad):
-            text.append("\n")
+            if used_lines >= visible:
+                break
 
-        # 始终显示脚注（1 行）
+        # 空行补齐
+        pad = max(0, visible - used_lines)
+        if pad > 0:
+            renderables.append(Text("\n" * pad))
+
+        # 脚注
+        footer = Text()
         if n == 0:
-            text.append("[dim]等待事件...[/]")
+            footer.append("等待事件...", style=DIM)
         elif offset > 0:
             remaining = n - end
-            text.append(f"[dim]↑ {offset} 行 (↑↓ 滚动)[/]")
+            footer.append(f"↑ {offset} 行 (↑↓ 滚动)", style=DIM)
         elif n > visible:
-            text.append(f"[dim]共 {n} 条 (↑ 键查看历史)[/]")
+            footer.append(f"共 {n} 条 (↑ 键查看历史)", style=DIM)
         else:
-            text.append(f"[dim]─{''.join(['─' for _ in range(8)])}[/]")
+            footer.append(f"─{''.join(['─' for _ in range(8)])}", style=DIM)
+        renderables.append(footer)
 
         return Panel(
-            text,
+            Group(*renderables),
             title=f"[bold {PRIMARY}]事件日志[/]",
             border_style=PRIMARY, padding=(0, 1),
         )
+
+    @staticmethod
+    def _extract_agent_name(summary: str) -> str:
+        m = _AGENT_NAME_RE.match(summary)
+        return m.group(1) if m else "Agent"
+
+    @staticmethod
+    def _response_color(summary: str) -> str:
+        if re.search(r'\b(ERROR|错误|失败|exception|traceback)\b', summary, re.IGNORECASE):
+            return ERROR
+        return SUCCESS
+
+    @staticmethod
+    def _render_entry(event: str, ts: str, summary: str) -> Text:
+        text = Text()
+        color = EVENT_COLORS.get(event, "white")
+        label = EVENT_LABELS.get(event, event)
+
+        if event == "milestone":
+            text.append(f" {ts} ", style=DIM)
+            text.append(summary, style=color)
+        elif event == "app_log":
+            text.append(f" {ts} ", style=DIM)
+            if re.search(r'\b(ERROR|错误|失败|exception|traceback)\b', summary):
+                summary_color = ERROR
+            elif re.search(r'\b(WARNING|警告)\b', summary):
+                summary_color = WARNING
+            elif re.search(r'\b(SUCCESS|成功|完成|启动)\b', summary):
+                summary_color = SUCCESS
+            elif re.search(r'\b(INFO|信息)\b', summary):
+                summary_color = INFO
+            elif re.search(r'\b(DEBUG|调试)\b', summary):
+                summary_color = DIM
+            else:
+                summary_color = ICE
+            text.append(summary, style=summary_color)
+        else:
+            text.append(f" {ts} ", style=DIM)
+            text.append(f"{label:<12}", style=f"bold {color}")
+            if summary:
+                text.append(f" │ ", style=DIM)
+                text.append(summary, style=color)
+        return text
