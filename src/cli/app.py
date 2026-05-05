@@ -188,14 +188,7 @@ def main(
             # 无仪表盘模式：直接在主线程运行 Webhook 服务
             run_webhook_server(console_output=True, **webhook_kwargs)
         else:
-            # 带仪表盘模式：Webhook 在后台线程，前台运行 TUI 面板
-            webhook_thread = threading.Thread(
-                target=run_webhook_server,
-                kwargs={"console_output": False, **webhook_kwargs},
-                daemon=True,
-            )
-            webhook_thread.start()
-
+            # 带仪表盘模式：先创建Dashboard实例，再启动Webhook线程，将state传递过去
             from src.monitor.dashboard import Dashboard
             from src.monitor.dashboard.modules.log_module import LogModule
             from src.monitor.dashboard.modules.node_module import NodeModule
@@ -209,6 +202,15 @@ def main(
             dash.register(ToolModule())
             dash.register(StatsModule())
             dash.register(StatusModule())
+
+            # Webhook 在后台线程，前台运行 TUI 面板
+            webhook_thread = threading.Thread(
+                target=run_webhook_server,
+                kwargs={"console_output": False, "dashboard_state": dash.state, **webhook_kwargs},
+                daemon=True,
+            )
+            webhook_thread.start()
+
             dash.run()
 
 

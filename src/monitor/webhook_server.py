@@ -461,7 +461,7 @@ class GitHubWebhookMonitor(BaseMonitor):
         logger.info("GitHub Webhook server stopped gracefully")
 
 
-def _start_lark_ws_thread(app_id, app_secret, event_queue, connected_event=None):
+def _start_lark_ws_thread(app_id, app_secret, enqueue_callback, connected_event=None):
     """线程方式启动 lark SDK WebSocket 客户端（Windows 下子进程回调不触发，必须用线程）"""
     from lark_oapi import ws as lark_ws, LogLevel as LarkLogLevel
     from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
@@ -473,12 +473,48 @@ def _start_lark_ws_thread(app_id, app_secret, event_queue, connected_event=None)
             status = event.get("status", "")
             print(f"[approval-ws] 收到: instance_code={instance_code}, status={status}", flush=True)
             if instance_code:
-                event_queue.put((instance_code, status))
+                enqueue_callback(("instance_code", instance_code, status))
         except Exception as e:
             print(f"[approval-ws] 回调异常: {e}", flush=True)
 
+    def on_message_event(data):
+        """处理用户发送的消息事件"""
+        try:
+            # 结构化数据对象，直接访问属性
+            message = data.event.message
+            sender = data.event.sender
+
+            # 获取消息内容和发送者ID
+            content = message.content
+            sender_id = sender.sender_id.open_id
+
+            # 解析文本消息
+            import json
+            try:
+                content_dict = json.loads(content)
+                text = content_dict.get("text", "").strip()
+
+                # 移除@机器人的前缀（如果是群聊@消息）
+                if text.startswith("@_user_"):
+                    # 分割@和实际内容
+                    parts = text.split(" ", 1)
+                    if len(parts) > 1:
+                        text = parts[1].strip()
+            except:
+                text = ""
+
+            # 处理/status命令
+            if text == "/status" and sender_id:
+                print(f"[im-ws] 收到/status命令，发送者: {sender_id}", flush=True)
+                # 将命令放入队列，由主线程处理
+                enqueue_callback(("status_command", sender_id))
+
+        except Exception as e:
+            print(f"[im-ws] 消息处理异常: {e}", flush=True)
+
     event_handler = EventDispatcherHandler.builder("", "") \
         .register_p1_customized_event("approval_instance", on_approval_event) \
+        .register_p2_im_message_receive_v1(on_message_event) \
         .build()
 
     client = lark_ws.Client(
@@ -510,6 +546,7 @@ def run_webhook_server(
     console_output: bool = True,
     config_path: Optional[str] = None,
     log_level: Optional[str] = None,
+    dashboard_state = None,
 ) -> None:
     """同步方式启动Webhook服务（用于CLI直接调用）
 
@@ -618,6 +655,27 @@ def run_webhook_server(
         allowed_events=set(settings.webhook.allowed_events),
     )
 
+    # 更新状态的启动时间，确保运行时长正确
+    if dashboard_state:
+        # 带仪表盘模式：使用传入的dashboard_state
+        dashboard_state.start_time = monitor.start_time
+    else:
+        # 无仪表盘模式：使用全局状态，并启动AuditReader更新统计数据
+        from src.monitor.dashboard.global_state import get_global_dashboard_state
+        from src.monitor.dashboard.reader import AuditReader
+        from pathlib import Path
+        global_state = get_global_dashboard_state()
+        global_state.start_time = monitor.start_time
+        # 启动AuditReader实时更新全局状态
+        audit_reader = AuditReader(Path("src/logs/audit.jsonl"), global_state)
+        audit_reader.start()
+        log.info("[webhook] 审计日志读取器已启动，统计数据将实时更新")
+
+    # 打印监听地址，方便确认
+    log.info(f"[webhook] 服务监听地址: http://{host}:{port}")
+    log.info(f"[webhook] GitHub Webhook端点: http://{host}:{port}/webhook/github")
+    log.info(f"[webhook] 健康检查: http://{host}:{port}/health")
+
     # 初始化修复编排器
     orchestrator = None
     if settings.agent.enabled:
@@ -667,8 +725,9 @@ def run_webhook_server(
         max_per_hour=get_service_registry().rate_limit.max_fixes_per_hour,
     )
 
+    import threading
     approval_ws_ready = asyncio.Event()
-    _repair_lock = asyncio.Lock()  # 修复流程排队锁，确保串行执行
+    _repair_lock = threading.Lock()  # 修复流程排队锁，确保串行执行（线程安全，适用于多线程环境）
 
     async def recover_pending_events():
         """启动时恢复上次中断的未处理事件"""
@@ -802,8 +861,19 @@ def run_webhook_server(
                     event_bus.mark_done()
 
             try:
-                async with _repair_lock:
-                    result = await orchestrator.run(merged_event)
+                # 修复流程放到独立线程中运行，避免阻塞主事件循环
+                def run_repair():
+                    with _repair_lock:
+                        # 在线程中运行异步函数，需要新创建事件循环
+                        import asyncio
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        try:
+                            return loop.run_until_complete(orchestrator.run(merged_event))
+                        finally:
+                            loop.close()
+
+                result = await asyncio.to_thread(run_repair)
             except Exception as e:
                 log.error(f"处理合并事件失败: {e}", exc_info=True)
                 result = {"success": False}
@@ -854,14 +924,26 @@ def run_webhook_server(
 
                     async def process_and_mark_done(evt=event):
                         try:
-                            async with _repair_lock:
-                                result = await orchestrator.run(evt)
+                            # 修复流程放到独立线程中运行，避免阻塞主事件循环
+                            def run_repair():
+                                with _repair_lock:
+                                    # 在线程中运行异步函数，需要新创建事件循环
+                                    import asyncio
+                                    loop = asyncio.new_event_loop()
+                                    asyncio.set_event_loop(loop)
+                                    try:
+                                        return loop.run_until_complete(orchestrator.run(evt))
+                                    finally:
+                                        loop.close()
+
+                            result = await asyncio.to_thread(run_repair)
                             if result.get("is_api_failure"):
                                 log.warning(f"API请求失败，事件回退到待修复队列: {evt.event_id}")
                                 pending_store.mark_pending(evt.event_id)
                             else:
                                 pending_store.delete(evt.event_id)
-                        except Exception:
+                        except Exception as e:
+                            log.error(f"处理CI事件失败: {e}", exc_info=True)
                             pending_store.delete(evt.event_id)
                         finally:
                             event_bus.mark_done()
@@ -880,7 +962,7 @@ def run_webhook_server(
                 log.error(f"事件消费出错: {e}", exc_info=True)
                 await asyncio.sleep(1)
 
-    async def approval_event_listener():
+    async def approval_event_listener(dashboard_state=None, monitor=None):
         """通过飞书 SDK WebSocket 长连接监听审批状态变更事件"""
         log.info("[approval] approval_event_listener 任务已启动")
 
@@ -893,22 +975,31 @@ def run_webhook_server(
         approval_store = get_pending_approval_store()
 
         # 1. 先启动 WebSocket 长连接
-        import queue as thread_queue
         import threading
+        import functools
 
-        event_queue = thread_queue.Queue()
+        loop = asyncio.get_running_loop()
+        # 使用asyncio Queue，更适合异步环境
+        event_queue = asyncio.Queue(maxsize=100)
         ws_connected = threading.Event()
+
+        # 定义线程安全的事件入队函数，供WebSocket线程调用
+        def _enqueue_event(item):
+            """线程安全地将事件放入asyncio队列"""
+            try:
+                loop.call_soon_threadsafe(event_queue.put_nowait, item)
+            except Exception as e:
+                log.error(f"[approval] 事件入队失败: {e}")
 
         ws_thread = threading.Thread(
             target=_start_lark_ws_thread,
-            args=(settings.lark.app_id, settings.lark.app_secret, event_queue, ws_connected),
+            args=(settings.lark.app_id, settings.lark.app_secret, _enqueue_event, ws_connected),
             daemon=True, name="lark-ws",
         )
         ws_thread.start()
         log.info("[approval] 飞书 WebSocket 线程已启动，等待连接建立...")
 
         # 2. 等待 WebSocket 连接真正建立
-        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, ws_connected.wait)
         log.info("[approval] 飞书 WebSocket 已连接")
 
@@ -923,63 +1014,277 @@ def run_webhook_server(
         approval_ws_ready.set()
         log.info("[approval] 审批监听就绪")
 
-        # 主循环：从线程 Queue 中读取事件并处理
+        # 主循环：从asyncio Queue中读取事件并处理（无阻塞）
         while True:
             try:
-                instance_code, status = await asyncio.wait_for(
-                    loop.run_in_executor(None, event_queue.get), timeout=30
-                )
-                log.info(f"[approval] 主循环收到事件: instance_code={instance_code}, status={status}")
+                # 直接await异步队列，无需线程池
+                item = await asyncio.wait_for(event_queue.get(), timeout=30)
 
-                # PENDING 事件仅记录日志，不处理
-                if status == "PENDING":
-                    continue
+                # 处理不同类型的事件
+                if isinstance(item, tuple) and len(item) >= 2:
+                    event_type = item[0]
 
-                approval = approval_store.get_by_instance_code(instance_code)
-                if not approval:
-                    log.warning(f"[approval] 未找到审批记录: {instance_code}")
-                    continue
+                    if event_type == "instance_code":
+                        # 审批事件
+                        _, instance_code, status = item
+                        log.info(f"[approval] 主循环收到事件: instance_code={instance_code}, status={status}")
 
-                # 已处理过的审批不再重复处理
-                if approval["status"] != "PENDING":
-                    log.info(f"[approval] 审批已处理过: {instance_code}, 状态: {approval['status']}")
-                    continue
+                        # PENDING 事件仅记录日志，不处理
+                        if status == "PENDING":
+                            continue
 
-                log.info(f"收到审批事件: {instance_code}, 状态: {status}")
+                        approval = approval_store.get_by_instance_code(instance_code)
+                        if not approval:
+                            log.warning(f"[approval] 未找到审批记录: {instance_code}")
+                            continue
 
-                if status == "APPROVED":
-                    pending_events = pending_store.get_all_pending()
-                    count = 0
-                    for record in pending_events:
+                        # 已处理过的审批不再重复处理
+                        if approval["status"] != "PENDING":
+                            log.info(f"[approval] 审批已处理过: {instance_code}, 状态: {approval['status']}")
+                            continue
+
+                        log.info(f"收到审批事件: {instance_code}, 状态: {status}")
+
+                        if status == "APPROVED":
+                            pending_events = pending_store.get_all_pending()
+                            count = 0
+                            for record in pending_events:
+                                try:
+                                    payload = json.loads(record["payload"])
+                                    if record["event_type"] == "runtime_log":
+                                        event_obj = RuntimeLogEvent(**payload)
+                                    else:
+                                        event_obj = GitHubEvent(**payload)
+                                    await event_bus.publish(event_obj)
+                                    count += 1
+                                except Exception as e:
+                                    log.error(f"恢复事件 {record['event_id']} 失败: {e}")
+                            # 不管修复流程成功还是失败，都清除待处理记录
+                            deleted = pending_store.delete_all_pending()
+                            log.info(f"审批通过：已恢复 {count} 个待处理事件，已清除 {deleted} 条记录")
+                            approval_store.update_status(instance_code, "APPROVED")
+
+                        elif status in ("REJECTED", "CANCELED", "DELETED"):
+                            count = pending_store.delete_all_pending()
+                            log.info(f"审批拒绝/取消：已丢弃 {count} 个待处理事件")
+                            approval_store.update_status(instance_code, status)
+
+                    elif event_type == "status_command":
+                        # 处理/status命令
+                        _, sender_id = item
+                        log.info(f"[im] 收到/status命令，发送者: {sender_id}")
+
+                        # 检查飞书通知是否启用
+                        if not settings.lark.enabled:
+                            log.warning("[im] 飞书通知未启用，无法回复/status命令")
+                            continue
+
+                        # 检查用户是否有权限
+                        log.info(f"[im] 配置的通知用户列表: {settings.lark.notify_users}")
+                        log.info(f"[im] 发送者ID: {sender_id}")
+
+                        if sender_id not in settings.lark.notify_users:
+                            log.warning(f"[im] 用户 {sender_id} 无权限使用/status命令")
+                            from src.notify.lark_notify import send_markdown_message
+                            try:
+                                log.info(f"[im] 正在发送权限不足提示...")
+                                await send_markdown_message(
+                                    sender_id,
+                                    "⚠️ 您没有权限使用此命令，请联系管理员配置。",
+                                    title="权限不足"
+                                )
+                                log.info(f"[im] 权限不足提示已发送")
+                            except Exception as e:
+                                log.error(f"[im] 发送权限不足提示失败: {e}", exc_info=True)
+                            continue
+
+                        # 生成状态报告
+                        from datetime import datetime
+                        from src.store.repair_store import get_repair_store
+                        from src.monitor.dashboard.global_state import get_global_dashboard_state
+
+                        # 1. 运行时长：使用webhook服务启动时间计算，最准确
+                        elapsed = datetime.now() - monitor.start_time
+                        hours, remainder = divmod(int(elapsed.total_seconds()), 3600)
+                        minutes, seconds = divmod(remainder, 60)
+
+                        # 2. 修复统计：从数据库查询，持久化数据，服务重启不丢失
+                        repair_stats = get_repair_store().get_statistics()
+
+                        # 3. 内存统计：从全局DashboardState获取实时运行数据
+                        if dashboard_state:
+                            state = dashboard_state.snapshot()
+                        else:
+                            # 无仪表盘模式下使用全局状态
+                            state = get_global_dashboard_state().snapshot()
+
+                        # 4. 待处理数据：直接查询数据库
+                        pending_events = get_pending_event_store().get_all_pending()
+                        pending_pushes = get_pending_push_store().get_all()
+
+                        # 生成卡片消息
+                        from src.monitor.dashboard.colors import AGENT_STATUS_CN, STATUS_COLORS
+                        import json
+
+                        status_cn = AGENT_STATUS_CN.get(state.agent_status, state.agent_status)
+                        status_color = STATUS_COLORS.get(state.agent_status, "blue")
+
+                        # 状态颜色映射到飞书卡片模板色
+                        color_map = {
+                            "green": "green",
+                            "red": "red",
+                            "orange": "orange",
+                            "blue": "blue",
+                            "purple": "purple",
+                            "grey": "grey"
+                        }
+                        card_template_color = color_map.get(status_color, "blue")
+
+                        # 构造飞书卡片
+                        card_content = {
+                            "config": {"wide_screen_mode": True},
+                            "header": {
+                                "title": {"tag": "plain_text", "content": "🤖 SpiderClaw 系统状态报告"},
+                                "template": card_template_color,
+                            },
+                            "elements": [
+                                {
+                                    "tag": "div",
+                                    "fields": [
+                                        {
+                                            "is_short": True,
+                                            "text": {
+                                                "tag": "lark_md",
+                                                "content": f"**运行时长**\n{hours:02d}:{minutes:02d}:{seconds:02d}",
+                                            },
+                                        },
+                                        {
+                                            "is_short": True,
+                                            "text": {
+                                                "tag": "lark_md",
+                                                "content": f"**当前状态**\n{status_cn}",
+                                            },
+                                        },
+                                        {
+                                            "is_short": True,
+                                            "text": {
+                                                "tag": "lark_md",
+                                                "content": f"**Token消耗**\n{state.total_tokens:,}",
+                                            },
+                                        },
+                                        {
+                                            "is_short": True,
+                                            "text": {
+                                                "tag": "lark_md",
+                                                "content": f"**LLM调用**\n{state.total_llm_calls} 次",
+                                            },
+                                        },
+                                        {
+                                            "is_short": True,
+                                            "text": {
+                                                "tag": "lark_md",
+                                                "content": f"**工具调用**\n{state.total_tool_calls} 次",
+                                            },
+                                        },
+                                        {
+                                            "is_short": True,
+                                            "text": {
+                                                "tag": "lark_md",
+                                                "content": f"**成功修复**\n{max(repair_stats['success'], state.total_repair_success)} 次",
+                                            },
+                                        },
+                                        {
+                                            "is_short": True,
+                                            "text": {
+                                                "tag": "lark_md",
+                                                "content": f"**失败修复**\n{max(repair_stats['failed'], state.total_repair_failures)} 次",
+                                            },
+                                        },
+                                        {
+                                            "is_short": True,
+                                            "text": {
+                                                "tag": "lark_md",
+                                                "content": f"**异常次数**\n{state.total_errors} 次",
+                                            },
+                                        },
+                                    ],
+                                },
+                                {"tag": "hr"},
+                                {
+                                    "tag": "div",
+                                    "text": {
+                                        "tag": "lark_md",
+                                        "content": "**⏳ 待处理任务**",
+                                    },
+                                },
+                                {
+                                    "tag": "div",
+                                    "fields": [
+                                        {
+                                            "is_short": True,
+                                            "text": {
+                                                "tag": "lark_md",
+                                                "content": f"**待恢复事件**\n{len(pending_events)} 个",
+                                            },
+                                        },
+                                        {
+                                            "is_short": True,
+                                            "text": {
+                                                "tag": "lark_md",
+                                                "content": f"**待推送记录**\n{len(pending_pushes)} 个",
+                                            },
+                                        },
+                                    ],
+                                },
+                                {"tag": "hr"},
+                                {
+                                    "tag": "note",
+                                    "elements": [
+                                        {
+                                            "tag": "plain_text",
+                                            "content": "此报告由 SpiderClaw 自动修复系统生成",
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+
+                        # 序列化为JSON字符串
+                        content_json = json.dumps(card_content, ensure_ascii=False)
+
+                        # 发送卡片消息
+                        from src.notify.lark_notify import send_markdown_message
                         try:
-                            payload = json.loads(record["payload"])
-                            if record["event_type"] == "runtime_log":
-                                event_obj = RuntimeLogEvent(**payload)
-                            else:
-                                event_obj = GitHubEvent(**payload)
-                            await event_bus.publish(event_obj)
-                            count += 1
-                        except Exception as e:
-                            log.error(f"恢复事件 {record['event_id']} 失败: {e}")
-                    # 不管修复流程成功还是失败，都清除待处理记录
-                    deleted = pending_store.delete_all_pending()
-                    log.info(f"审批通过：已恢复 {count} 个待处理事件，已清除 {deleted} 条记录")
-                    approval_store.update_status(instance_code, "APPROVED")
+                            log.info(f"[im] 正在发送状态报告卡片给 {sender_id}...")
+                            # 给发送消息加上超时保护，避免卡住整个事件循环
+                            send_task = asyncio.create_task(
+                                send_markdown_message(
+                                    receive_id=sender_id,
+                                    markdown_content=content_json,
+                                    is_card=True
+                                )
+                            )
+                            send_success = await asyncio.wait_for(send_task, timeout=10)
 
-                elif status in ("REJECTED", "CANCELED", "DELETED"):
-                    count = pending_store.delete_all_pending()
-                    log.info(f"审批拒绝/取消：已丢弃 {count} 个待处理事件")
-                    approval_store.update_status(instance_code, status)
+                            if send_success:
+                                log.info("[im] 状态报告卡片已发送成功")
+                            else:
+                                log.error("[im] 状态报告卡片发送失败")
+
+                        except asyncio.TimeoutError:
+                            log.error("[im] 发送状态报告超时")
+                        except Exception as e:
+                            log.error(f"[im] 发送状态报告异常: {e}", exc_info=True)
+                        continue
 
             except asyncio.TimeoutError:
                 # 超时，检查线程是否还活着
                 if not ws_thread.is_alive():
                     log.warning("[approval] 飞书 WebSocket 线程已退出，正在重启...")
-                    event_queue = thread_queue.Queue()
                     ws_connected = threading.Event()
                     ws_thread = threading.Thread(
                         target=_start_lark_ws_thread,
-                        args=(settings.lark.app_id, settings.lark.app_secret, event_queue, ws_connected),
+                        args=(settings.lark.app_id, settings.lark.app_secret, _enqueue_event, ws_connected),
                         daemon=True, name="lark-ws",
                     )
                     ws_thread.start()
@@ -1166,7 +1471,7 @@ def run_webhook_server(
             tasks.append(asyncio.create_task(_pending_push_timer(), name="pending_push_timer"))
             tasks.append(asyncio.create_task(_pending_event_recovery_timer(), name="pending_event_recovery_timer"))
         # 始终启动审批事件监听（WebSocket 客户端），即使没有待处理事件
-        approval_task = asyncio.create_task(approval_event_listener(), name="approval_listener")
+        approval_task = asyncio.create_task(approval_event_listener(dashboard_state, monitor), name="approval_listener")
         approval_task.add_done_callback(_task_done_callback)
         tasks.append(approval_task)
         # 启动时预同步所有注册服务的仓库（确保本地有可用代码）

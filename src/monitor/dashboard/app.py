@@ -46,7 +46,9 @@ class Dashboard:
 
     def __init__(self, log_path: str | Path, banner: Optional[RenderableType] = None):
         self.log_path = Path(log_path)
-        self.state = DashboardState()
+        # 优先使用全局状态实例，确保所有模块共享同一个状态
+        from .global_state import get_global_dashboard_state, set_global_dashboard_state
+        self.state = get_global_dashboard_state()
         # 从配置读取模型名，启动即显示
         try:
             settings = get_settings()
@@ -59,6 +61,8 @@ class Dashboard:
         self._modules: List[MonitorModule] = []
         self._running = False
         self._banner = banner
+        # 设置为全局状态
+        set_global_dashboard_state(self.state)
 
     def register(self, module: MonitorModule) -> None:
         self._modules.append(module)

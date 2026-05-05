@@ -316,6 +316,36 @@ class RepairStore:
             logger.error(f"标记 deployed 失败: {e}")
             return False
 
+    def get_statistics(self) -> dict:
+        """获取修复统计数据"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                # 统计各状态数量
+                rows = conn.execute(
+                    "SELECT status, COUNT(*) FROM repair_records GROUP BY status"
+                ).fetchall()
+
+                stats = {
+                    "total": 0,
+                    "success": 0,
+                    "failed": 0,
+                    "pending": 0
+                }
+
+                for status, count in rows:
+                    stats["total"] += count
+                    if status == RepairLifecycleStatus.DEPLOYED.value:
+                        stats["success"] += count
+                    elif status == RepairLifecycleStatus.FAILED.value or status == RepairLifecycleStatus.ABANDONED.value:
+                        stats["failed"] += count
+                    else:
+                        stats["pending"] += count
+
+                return stats
+        except Exception as e:
+            logger.error(f"获取统计数据失败: {e}")
+            return {"total": 0, "success": 0, "failed": 0, "pending": 0}
+
 
 class PendingEventStore:
     """待处理事件持久化存储 — 防止服务中断导致事件丢失"""
