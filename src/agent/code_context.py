@@ -153,7 +153,10 @@ def build_error_context_section(
                 blocks.append(_format_block(header, snippet, err_list))
 
         # 如果文件有错误列表但没有任何匹配的代码被提取
-        if err_list and not processed_funcs and not processed_classes and not module_lines:
+        # 注意：module_lines 可能只包含 line_number==0 的错误（运行时日志无精确行号），
+        # 此时 filtered 为空但 module_lines 非空，也需要触发回退
+        has_valid_module_lines = bool([ln for ln in module_lines if ln > 0])
+        if err_list and not processed_funcs and not processed_classes and not has_valid_module_lines:
             snippets = []
             for err in err_list:
                 if err["line_number"] > 0:
@@ -163,6 +166,16 @@ def build_error_context_section(
             if snippets:
                 header = f"### {fp}"
                 blocks.append(_format_block(header, "\n\n".join(snippets), err_list))
+            else:
+                # line_number 全为 0（运行时日志无精确行号）→ 展示错误信息，让 Agent 用 read_target_file 查看完整代码
+                err_info_lines = []
+                for err in err_list:
+                    prefix = "🔴 [根因] " if err.get("is_root_cause") else ""
+                    et = err.get("error_type", "")
+                    em = (err.get("error_message", "") or "")[:200]
+                    err_info_lines.append(f"- {prefix}[{et}]: {em}")
+                header = f"### {fp}（无精确行号，请使用 read_target_file 查看完整代码）"
+                blocks.append(header + "\n" + "\n".join(err_info_lines))
 
     # 孤立错误（无 file_path 且无法从 traceback 提取）→ 单独展示
     if orphan_errors:

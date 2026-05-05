@@ -756,6 +756,60 @@ def run_webhook_server(
         if not orchestrator:
             return
         pending_store = get_pending_event_store()
+
+        # === runtime_log 事件缓冲：按服务聚合，短时间内同一服务的多个事件合并为一次修复 ===
+        _runtime_buffer: dict[str, list[RuntimeLogEvent]] = {}  # service → [events]
+        _runtime_flush_timers: dict[str, asyncio.Task] = {}     # service → timer task
+        _buffer_window = 5  # 秒：同一服务的事件在此窗口内合并
+
+        async def _flush_service_buffer(service: str):
+            """合并并处理同一服务的缓冲事件"""
+            await asyncio.sleep(_buffer_window)
+            events = _runtime_buffer.pop(service, [])
+            _runtime_flush_timers.pop(service, None)
+            if not events:
+                return
+
+            if len(events) == 1:
+                # 单个事件，直接处理
+                merged_event = events[0]
+                log.info(f"服务 {service}: 1 个事件，直接处理")
+            else:
+                # 多个事件合并：日志拼接，元数据取第一个
+                combined_log = "\n".join(evt.log for evt in events)
+                base = events[0]
+                merged_event = RuntimeLogEvent(
+                    event_id=base.event_id,
+                    source=base.source,
+                    log=combined_log,
+                    service=service,
+                    version=base.version,
+                    hostname=base.hostname,
+                    repo_url=base.repo_url,
+                    repo_local_path=base.repo_local_path,
+                    branch=base.branch,
+                    path_mapping=base.path_mapping,
+                    repository=base.repository,
+                    clone_url=base.clone_url,
+                )
+                log.info(
+                    f"服务 {service}: 合并 {len(events)} 个事件为一次修复 "
+                    f"（日志合计 {len(combined_log)} 字符）"
+                )
+                # 清理被合并事件的 pending 记录（保留 base 的 event_id）
+                for evt in events[1:]:
+                    pending_store.delete(evt.event_id)
+                    event_bus.mark_done()
+
+            try:
+                async with _repair_lock:
+                    await orchestrator.run(merged_event)
+            except Exception as e:
+                log.error(f"处理合并事件失败: {e}", exc_info=True)
+            finally:
+                pending_store.delete(merged_event.event_id)
+                event_bus.mark_done()
+
         while True:
             try:
                 event = await event_bus.subscribe()
@@ -763,7 +817,7 @@ def run_webhook_server(
                 # 标记事件为处理中
                 pending_store.mark_processing(event.event_id)
 
-                # 远程日志事件处理（限流在图入口之前）
+                # 远程日志事件处理：缓冲聚合，不立即处理
                 if isinstance(event, RuntimeLogEvent):
                     if not await rate_limiter.check(event.service):
                         log.warning(f"服务 {event.service} 触发限流，跳过")
@@ -774,17 +828,17 @@ def run_webhook_server(
                         continue
                     await rate_limiter.record(event.service)
 
-                    async def process_runtime_and_mark_done(evt=event):
-                        try:
-                            async with _repair_lock:
-                                await orchestrator.run(evt)
-                        finally:
-                            pending_store.delete(evt.event_id)
-                            event_bus.mark_done()
+                    # 加入缓冲
+                    svc = event.service
+                    if svc not in _runtime_buffer:
+                        _runtime_buffer[svc] = []
+                    _runtime_buffer[svc].append(event)
 
-                    asyncio.create_task(
-                        process_runtime_and_mark_done(),
-                        name=f"runtime_{event.event_id}"
+                    # 重置 flush timer：每次新事件到来都重新计时
+                    if svc in _runtime_flush_timers:
+                        _runtime_flush_timers[svc].cancel()
+                    _runtime_flush_timers[svc] = asyncio.create_task(
+                        _flush_service_buffer(svc)
                     )
                     continue
 

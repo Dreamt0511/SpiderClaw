@@ -157,12 +157,19 @@ class FixAgent:
         """将错误位置列表转换为 JSON 字符串（兼容 dict 和 ErrorLocation）"""
         if not error_locations:
             return "[]"
-        if isinstance(error_locations[0], ErrorLocation):
-            return json.dumps(
-                [e.model_dump() for e in error_locations],
-                ensure_ascii=False, indent=2,
-            )
-        return json.dumps(error_locations, ensure_ascii=False, indent=2)
+        MAX_ERR_MSG = 200
+        trimmed = []
+        for e in error_locations:
+            if isinstance(e, ErrorLocation):
+                d = e.model_dump()
+            else:
+                d = dict(e)
+            msg = d.get("error_message", "")
+            # 截断 error_message
+            if len(msg) > MAX_ERR_MSG:
+                d["error_message"] = msg.split('\n')[0][:MAX_ERR_MSG] + "..."
+            trimmed.append(d)
+        return json.dumps(trimmed, ensure_ascii=False, indent=2)
 
     def _build_fix_history_summary(self, fix_history: list[FixAttempt] | None) -> str:
         """构建历史修复记录摘要"""
@@ -176,6 +183,19 @@ class FixAgent:
                 f"修改摘要: {attempt.diff_summary}"
             )
         return "\n".join(lines)
+
+    @staticmethod
+    def _build_error_summary_header(error_locations: list) -> str:
+        """构建错误摘要头，替代完整的 ci_logs 展示"""
+        if not error_locations:
+            return "本次修复基于以下错误信息"
+        types = set()
+        for err in error_locations:
+            et = err.error_type if isinstance(err, ErrorLocation) else err.get("error_type", "")
+            if et:
+                types.add(et)
+        type_str = "、".join(sorted(types)) if types else "未知类型"
+        return f"本次修复基于以下错误信息（共 {len(error_locations)} 个错误，类型：{type_str}）"
 
     async def generate_fix(
         self,
@@ -323,25 +343,33 @@ class FixAgent:
                 {"repo_path": self.repo_path, "github_token": self.github_token}
             )
 
-            # 构建动态部分
-            review_feedback_section = f"""{review_feedback}""" if review_feedback else ""
-
-            risk_warnings_list = risk_warnings or []
-            risk_warnings_section = (
-                f"""{"\n- ".join(risk_warnings_list)}"""
-                if risk_warnings_list else ""
+            # 构建动态部分（标题+内容，空时不输出）
+            review_parts = []
+            if review_feedback:
+                review_parts.append(review_feedback)
+            if risk_warnings:
+                review_parts.append("\n- ".join(risk_warnings))
+            review_feedback_section = (
+                "## 审查反馈\n" + "\n".join(review_parts)
+                if review_parts else ""
             )
 
-            test_output_section = f"""```{test_output}```""" if test_output else ""
-
-            failed_tests_list = failed_tests or []
-            failed_tests_section = (
-                f"""- {"\n- ".join(failed_tests_list)}"""
-                if failed_tests_list else ""
+            test_parts = []
+            if test_output:
+                test_parts.append(f"```\n{test_output}\n```")
+            if failed_tests:
+                test_parts.append("- " + "\n- ".join(failed_tests))
+            test_feedback_section = (
+                "## 测试反馈\n" + "\n".join(test_parts)
+                if test_parts else ""
             )
 
-            # 强制性指令
-            mandatory_section = mandatory_instructions if mandatory_instructions else "无特殊指令"
+            # 强制性指令：首次调用时给 LLM 明确的行动指令，避免"无特殊指令"导致 LLM 选择不行动
+            mandatory_section = mandatory_instructions if mandatory_instructions else (
+                "请立即分析上方「解析后的错误位置」中的 error_type 和 error_message，"
+                "结合「错误代码上下文」中的代码片段，生成修复代码。"
+                "所有必要信息已提供，无需额外查询。"
+            )
 
             # 历史修复摘要
             fix_history_summary = self._build_fix_history_summary(fix_history)
@@ -381,9 +409,49 @@ class FixAgent:
 """
                 logger.info(f"检测到 {len(root_cause_errors)} 个根因错误")
 
+            # 从嵌套 traceback 提取实际 error_type（直接修改原始对象）
+            # 这样 _serialize_error_locations 和 build_error_context_section 都能使用正确的 error_type
+            for err in error_locations:
+                if isinstance(err, ErrorLocation):
+                    et, msg = err.error_type, err.error_message or ""
+                else:
+                    et = err.get("error_type", "")
+                    msg = err.get("error_message", "")
+                if et == "RuntimeError" and "Traceback" in msg:
+                    msg_norm = msg.replace('\\n', '\n')
+                    tb_match = re.search(r'\b(\w+Error):\s', msg_norm)
+                    if tb_match and tb_match.group(1) != "RuntimeError":
+                        new_et = tb_match.group(1)
+                        logger.info(f"error_type 提取: {et} → {new_et}")
+                        if isinstance(err, ErrorLocation):
+                            err.error_type = new_et
+                        else:
+                            err["error_type"] = new_et
+
+            # 统一 error_locations 的 file_path 与 target_files 格式
+            # target_files 来自 orchestrator 的路径映射（如 src/calculator.py），
+            # error_locations 来自 parse_python_errors（如 calculator.py），
+            # 需要对齐避免 LLM 返回不一致的路径
+            if tf:
+                import os
+                basename_to_target = {os.path.basename(f): f for f in tf}
+                for err in error_locations:
+                    if isinstance(err, ErrorLocation):
+                        fp = err.file_path
+                    else:
+                        fp = err.get("file_path", "")
+                    if fp and fp in basename_to_target and fp not in tf:
+                        mapped = basename_to_target[fp]
+                        logger.info(f"路径对齐: error_locations file_path '{fp}' → '{mapped}'")
+                        if isinstance(err, ErrorLocation):
+                            err.file_path = mapped
+                        else:
+                            err["file_path"] = mapped
+
             # 序列化错误位置
             error_locations_json = self._serialize_error_locations(error_locations)
             logger.info(f"找到错误数量: {len(error_locations)}")
+            logger.info(f"error_locations JSON 内容:\n{error_locations_json[:1000]}")
             logger.info(f"目标修复文件列表: {tf}")
 
             # 构建错误代码上下文区块（仅展示与错误相关的代码片段，而非完整文件）
@@ -453,33 +521,27 @@ class FixAgent:
             else:
                 logger.info("没有找到带文件路径的错误，不添加目标文件指令")
 
-            # ci_logs 截断：只保留最后 2000 字符（错误通常在末尾）
-            ci_logs_display = ci_logs[-2000:] if len(ci_logs) > 2000 else ci_logs
+            # ci_logs 仅记录到 debug 日志，不注入 prompt
+            logger.debug(f"ci_logs 长度: {len(ci_logs)}（不注入 prompt，仅 debug）")
+
+            # 错误摘要头（替代 ci_logs 展示）
+            error_summary_header = self._build_error_summary_header(error_locations)
 
             user_input = FIX_AGENT_USER_PROMPT.format(
                 force_instruction_content=force_instruction_content,
-                ci_logs=ci_logs_display,
+                error_summary_header=error_summary_header,
                 error_locations=error_locations_json,
                 repo_path=self.repo_path,
                 root_cause_section=root_cause_section,
                 target_file_list_section=target_file_list_section,
                 error_context_section=error_context_section,
                 review_feedback_section=review_feedback_section,
-                risk_warnings_section=risk_warnings_section,
-                test_output_section=test_output_section,
-                failed_tests_section=failed_tests_section,
+                test_feedback_section=test_feedback_section,
                 mandatory_instructions=mandatory_section,
                 fix_history_summary=fix_history_summary,
             )
 
             logger.info(f"用户提示词构建完成，长度: {len(user_input)}")
-            # 调试：打印 prompt 中代码区块（截取开头）
-            if error_context_section:
-                idx = user_input.find("## 📂 错误代码上下文")
-                if idx >= 0:
-                    snippet = user_input[idx:idx+800]
-                    logger.info(f"Prompt中错误代码上下文区块:\n{snippet}...")
-
             config = {"recursion_limit": 50}
             result = await agent.ainvoke({"input": user_input}, config=config)
             logger.info("Agent调用完成")
@@ -546,6 +608,30 @@ class FixAgent:
             if tf:
                 expected_files = [f.removeprefix("./").replace("\\", "/") for f in tf]
                 expected_files = list(set(expected_files))
+
+                # basename 重映射：LLM 可能返回 calculator.py / services/user_service.py 等非预期路径
+                import os
+                basename_to_expected = {os.path.basename(f): f for f in expected_files}
+                remapped_code_changes = {}
+                for path, content in fix_result["code_changes"].items():
+                    bn = os.path.basename(path)
+                    if path not in expected_files and bn in basename_to_expected:
+                        mapped = basename_to_expected[bn]
+                        logger.info(f"路径重映射: code_changes '{path}' → '{mapped}'")
+                        remapped_code_changes[mapped] = content
+                    else:
+                        remapped_code_changes[path] = content
+                fix_result["code_changes"] = remapped_code_changes
+
+                # 同步修正 modified_files
+                remapped_modified = []
+                for f in fix_result.get("modified_files", []):
+                    bn = os.path.basename(f)
+                    if f not in expected_files and bn in basename_to_expected:
+                        remapped_modified.append(basename_to_expected[bn])
+                    else:
+                        remapped_modified.append(f)
+                fix_result["modified_files"] = remapped_modified
 
                 returned_files = [
                     f.removeprefix("./").replace("\\", "/")
@@ -625,7 +711,6 @@ class FixAgent:
                         f"{file_path}: {e}"
                     )
 
-            logger.info(f"修复生成成功: {fix_result['fix_description']}")
             fix_result["token_usage"] = token_usage
             return fix_result
 

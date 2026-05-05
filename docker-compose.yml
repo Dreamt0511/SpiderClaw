@@ -26,9 +26,9 @@ services:
     tty: true
     networks:
       - spiderclaw-net
-    extra_hosts:
-      - "github.com:10.17.80.179"
-      - "api.github.com:10.17.80.179"
+    dns:
+      - 8.8.8.8
+      - 114.114.114.114
     restart: unless-stopped
 
   biz-server:

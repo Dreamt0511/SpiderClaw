@@ -470,8 +470,11 @@ def parse_python_errors(log_content: str) -> List[Dict]:
         processed_lines.append(processed_line)
     processed_content = '\n'.join(processed_lines)
 
-    # ANSI 码清理
+    # ANSI 码清理：完整的 ANSI 转义序列（\x1b[...m）
     processed_content = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', processed_content)
+    # 清理丢失 \x1b 前缀的残留片段：模式为 [数字;数字m 或 [数字m
+    # 合法日志前缀 [INFO]/[ERROR] 以大写字母开头，不受影响
+    processed_content = re.sub(r'\[[0-9][0-9;]*[a-zA-Z]', '', processed_content)
 
     # ===================== 2. CI 路径标准化 =====================
     def _normalize_ci_path(fp: str) -> str:

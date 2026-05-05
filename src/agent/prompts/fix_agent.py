@@ -108,16 +108,13 @@ FIX_AGENT_SYSTEM_PROMPT = """
 
 
 FIX_AGENT_USER_PROMPT = """
+{error_summary_header}
+
 ## 🔴🔴 强制性修复指令（必须逐字执行，违反即修复失败）🔴🔴
 {mandatory_instructions}
 
 ## 🚨 最高优先级强制指令
 {force_instruction_content}
-
-## 原始错误日志（最关键的信息来源）
-```
-{ci_logs}
-```
 
 ## 解析后的错误位置
 ```json
@@ -133,41 +130,9 @@ FIX_AGENT_USER_PROMPT = """
 
 {error_context_section}
 
-## 必须执行的步骤
-1. 分析上方错误代码上下文片段，定位每个错误对应的函数和行号
-2. 如果上下文片段不足以定位问题，使用 `read_target_file(id=N)` 读取对应文件的完整代码（N 为上方文件列表中的 ID）
-3. 如果错误没有 file_path（或为空），根据 error_locations 中的 traceback 信息推断错误所在的文件，然后用 `read_target_file` 读取完整代码确认
-4. 分析错误类型和根因，选择对应的修复策略
-5. 修复后代码必须与原始代码有实际差异
-6. **只修改与错误直接相关的行，其他代码原样保留**
-7. **🚨 输出前自我验证**：`code_changes` 中每个文件的代码必须能通过 Python 语法检查（`ast.parse()`），自行确保语法正确。语法错误的修复会被 validation_gate 拦截并触发重试
-
-## 输出要求
-返回严格的JSON格式，包含所有修复的文件（**必须包含全部目标文件，一个不能少**）：
-```json
-{{
-    "fix_description": "1. 修复xxx\n2. 修复xxx\n3. 修复xxx",
-    "modified_files": ["文件路径1", "文件路径2"],
-    "code_changes": {{
-        "文件路径1": "修复后的完整文件内容",
-        "文件路径2": "修复后的完整文件内容"
-    }}
-}}
-```
-
 ## 历史修复记录（避免重复同样的错误）
 {fix_history_summary}
 
-## 审查反馈（如有）
 {review_feedback_section}
-{risk_warnings_section}
-
-## 测试反馈（如有）
-{test_output_section}
-{failed_tests_section}
-
-## 本次修复的强约束清单
-- 上方已提供错误代码上下文（仅错误相关代码片段），仅修改与错误直接相关的行
-- 严格遵守绝对修改边界表约束
-- is_env_error 标记为 true 表示需要环境变更（安装依赖），此时 code_changes 应为空
+{test_feedback_section}
 """
