@@ -1,9 +1,9 @@
-"""calculator 模块测试 — 会触发 bug"""
+"""calculator 模块测试 �?会触�?bug"""
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import logger  # noqa: F401 — 初始化日志
+from src import logger  # noqa: F401 �?初始化日�?
 from app.calculator import divide, average, discount, sqrt_approx
 
 
@@ -22,7 +22,7 @@ def test_average_normal():
 
 
 def test_average_empty_list():
-    """触发 ZeroDivisionError: 空列表"""
+    """触发 ZeroDivisionError"""
     result = average([])
     assert result == 0
 
@@ -33,9 +33,9 @@ def test_discount_normal():
 
 
 def test_discount_negative_rate():
-    """rate 为负数时产生错误结果"""
+    """rate为负数时产生错误结果"""
     result = discount(100, -0.5)
-    assert result < 100  # 预期失败: 实际是 150
+    assert result < 100  # 预期失败: 实际�?150
 
 
 def test_sqrt_normal():

@@ -2,8 +2,9 @@ services:
   spiderclaw:
     build: .
     container_name: spiderclaw-agent
-    ports:
-      - "8000:8000"
+    network_mode: host
+    extra_hosts:
+      - "github.com:host-gateway"
     volumes:
       - ./src:/app/src
       - ./entrypoint.sh:/app/entrypoint.sh
@@ -24,32 +25,22 @@ services:
     command: ["spiderclaw", "--no-dashboard"]
     stdin_open: true
     tty: true
-    networks:
-      - spiderclaw-net
-    dns:
-      - 8.8.8.8
-      - 114.114.114.114
     restart: unless-stopped
 
   biz-server:
     build: ./docker/biz-server
     container_name: biz-server
+    network_mode: host
     volumes:
-      - ./docker/biz-server/app:/opt/biz-app/app
+      - D:\U 盘\AutoFix_Test_rep:/opt/biz-app/app
       # 挂载采集器相关配置和脚本，修改后无需重建镜像（仅2个文件）
       - ./docker/biz-server/agent-mapping.conf:/opt/agent-sidecar/agent-mapping.conf
       - ./docker/biz-server/collector.sh:/opt/agent-sidecar/collector.sh
       - ./docker/biz-server/entrypoint.sh:/opt/agent-sidecar/entrypoint.sh
     depends_on:
       - spiderclaw
-    networks:
-      - spiderclaw-net  # 和spiderclaw在同一个网络
     restart: unless-stopped
 
 volumes:
   spiderclaw-data:
   spiderclaw-logs:
-
-networks:
-  spiderclaw-net:
-    driver: bridge

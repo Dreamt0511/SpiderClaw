@@ -17,7 +17,7 @@ from src.agent.validation_gate import validate_fix
 from src.agent.instruction_templates import generate_instruction
 from src.agent.notification import NotificationService
 from src.notify.lark_base import init_lark_base, report_repair_record, ensure_table_ready
-from src.store.repair_store import get_repair_store, compute_traceback_fingerprint, RepairLifecycleStatus
+from src.store.repair_store import get_repair_store, get_pending_push_store, compute_traceback_fingerprint, RepairLifecycleStatus
 from src.agent.tools import (
     set_tool_context,
     clone_repository,
@@ -197,6 +197,11 @@ class RepairOrchestrator:
             ctx = rejection_data.get("error_context", {})
             instruction_kwargs.update(ctx)
             instruction_kwargs["details"] = rejection_data.get("details", "")
+            # change_limit_exceeded 时计算 overage（超出的行数）
+            if violation_type == "change_limit_exceeded":
+                actual = ctx.get("actual_changes", 0)
+                max_allowed = ctx.get("max_allowed", self.max_change_lines)
+                instruction_kwargs["overage"] = actual - max_allowed
             if violation_type == "file_incomplete":
                 instruction_kwargs["missing_files"] = ", ".join(ctx.get("missing_files", []))
                 instruction_kwargs["all_target_files"] = ", ".join(ctx.get("all_target_files", []))
@@ -660,21 +665,38 @@ class RepairOrchestrator:
             }
 
             # 对无 file_path 的错误，从 traceback 强制提取文件路径
+            # 用多种正则同时匹配所有已知格式（标准Python、pytest绝对/相对路径），
+            # 不依赖特定 traceback 头部格式，只找 .py 文件引用
             if not fp and err.get("traceback"):
                 # 跳过 CI 脚本中的变量赋值（如 HAS_ERROR=0）
                 err_msg = err.get("error_message", "")
                 if any(kw in err_msg for kw in ["HAS_ERROR=", "HAS_WARNING=", "EXIT_CODE="]):
                     logger.info(f"丢弃错误: CI变量赋值, msg={err_msg[:80]}")
                     continue
-                tb_files = re.findall(r'File "([^"]+\.py)"', err["traceback"])
+                # 清理 ANSI 转义序列 + 还原转义换行（\\n → \n）
+                clean_tb = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07', '', err["traceback"])
+                clean_tb = clean_tb.replace('\\n', '\n').replace('\\t', '\t')
+                # 通用文件路径提取：多种格式同时匹配
+                tb_files = []
+                tb_lines = []
+                for _pat in [
+                    r'File "([^"]+\.py)"',              # 标准 Python: File "path.py"
+                    r'(/[^\s:"<>]+\.py):\d+:',          # pytest 绝对路径: /abs/path.py:42:
+                    r'(?<!\S)([^\s:"<>*?]+\.py):\d+:',  # pytest 相对路径: src/path.py:42:
+                ]:
+                    tb_files.extend(re.findall(_pat, clean_tb))
+                # 提取行号（多种格式）
+                for _ln_pat in [
+                    r'line\s+(\d+)',                    # 标准: line 42
+                    r'\.py:(\d+):',                     # pytest: .py:42:
+                ]:
+                    tb_lines.extend(int(x) for x in re.findall(_ln_pat, clean_tb))
                 if tb_files:
                     fp = tb_files[-1]  # 取最后一个文件（实际出错位置）
                     if path_mapping:
                         fp = apply_path_mapping(fp, path_mapping)
-                    # 取最后一个 line number（对应实际出错位置）
-                    ln_matches = re.findall(r'line\s+(\d+)', err["traceback"])
-                    if ln_matches:
-                        base_fields["line_number"] = int(ln_matches[-1])
+                    if tb_lines:
+                        base_fields["line_number"] = tb_lines[-1]
                     logger.info(f"从 traceback 提取文件路径: {fp}")
                 else:
                     logger.info(
@@ -978,6 +1000,10 @@ class RepairOrchestrator:
                 extra_context["test_output"] = state["test_output"]
             if state.get("failed_tests"):
                 extra_context["failed_tests"] = state["failed_tests"]
+            # 重试时传递上一轮的代码变更，让 LLM 知道自己改了什么、哪里被拒绝
+            if state.get("retry_count", 0) > 0 and state.get("code_changes"):
+                extra_context["previous_code_changes"] = state["code_changes"]
+                extra_context["previous_fix_description"] = state.get("fix_description", "")
 
             # 调试：确认 original_codes 包含哪些文件
             oc = state.get("original_codes", {})
@@ -1308,14 +1334,9 @@ class RepairOrchestrator:
             # 提交后获取真实 diff（修复前 diff_content 在文件写入前捕获，始终为空）
             real_diff = get_diff.invoke({"base_branch": event.branch})
 
-            set_tool_context({"repo_path": state["repo_path"], "github_token": self.github_token})
-
-            if push_branch.invoke({"branch_name": branch_name}) != "Success":
-                return {"success": False, "error_message": "推送分支失败"}
-
+            # 提前构建 PR 正文和标题（推送失败时也需要保存）
             pr_body = self.notification.build_pr_body(state, branch_name, diff_content=real_diff)
 
-            # 远程日志降级风险标注
             if state.get("degraded_version"):
                 svc_ver = state.get("service_version", "")
                 ver_info = f"（配置版本: `{svc_ver}`）" if svc_ver else ""
@@ -1324,25 +1345,58 @@ class RepairOrchestrator:
                     "本次修复基于最新代码。修复可能不完全精确，请仔细审查。"
                 )
 
-            # 提取首个 error_type 使 PR 标题有区分度
             error_locs = state.error_locations
             if error_locs:
                 first = error_locs[0]
                 primary_error = first.error_type if hasattr(first, 'error_type') else first.get('error_type', 'Unknown')
             else:
                 primary_error = 'Unknown'
-            # 截断 fix_description 到 40 字
             raw_desc = state.fix_description or ''
             short_desc = raw_desc[:40]
             if len(raw_desc) > 40:
                 short_desc = short_desc[:37] + '...'
 
-            # PR 标题：区分来源和环境（runtime_log=生产，CI=开发）
             if getattr(event, "event_type", "") == "runtime_log":
                 pr_title = f"[SpiderClaw: fix][生产] {primary_error} @{event.service}: {short_desc}"
             else:
                 pr_author_title = event.payload.get('sender', {}).get('login', '未知用户')
                 pr_title = f"[SpiderClaw: fix][开发] {primary_error} @{pr_author_title}: {short_desc}"
+
+            set_tool_context({"repo_path": state["repo_path"], "github_token": self.github_token})
+
+            push_result = push_branch.invoke({"branch_name": branch_name})
+            if push_result != "Success":
+                # 推送失败但修复已完成，保存结果等待重试
+                logger.warning(f"推送分支失败，保存修复结果等待下次重试: {push_result}")
+                try:
+                    push_store = get_pending_push_store()
+                    push_store.insert(
+                        fingerprint=state.get("traceback_fingerprint", ""),
+                        branch_name=branch_name,
+                        repo_path=state["repo_path"],
+                        repo_full_name=event.repository,
+                        base_branch=event.branch,
+                        pr_title=pr_title,
+                        pr_body=pr_body,
+                        event_type=getattr(event, "event_type", ""),
+                        event_payload=event.model_dump_json() if hasattr(event, "model_dump_json") else "",
+                        service=getattr(event, "service", "") or event.repository,
+                        fix_description=state.fix_description,
+                        diff_content=real_diff,
+                    )
+                    fp = state.get("traceback_fingerprint", "")
+                    if fp:
+                        store = get_repair_store()
+                        store.upsert(fp, RepairLifecycleStatus.PENDING_PUSH.value,
+                                     service=getattr(event, "service", "") or event.repository,
+                                     error_type=primary_error,
+                                     fix_description=state.fix_description,
+                                     repo_name=event.repository,
+                                     branch_name=event.branch)
+                except Exception as e:
+                    logger.error(f"保存待推送记录失败: {e}", exc_info=True)
+
+                return {"success": True, "pr_url": "", "diff_content": real_diff}
 
             pr_url = create_pull_request.invoke({
                 "repo_full_name": event.repository,

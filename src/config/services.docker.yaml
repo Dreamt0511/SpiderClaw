@@ -5,7 +5,7 @@ services:
   version: main
   git_branch: main
   path_mapping:
-    /opt/biz-app/app/: src/
+    /opt/biz-app/app/: ./
 rate_limit:
   max_fixes_per_minute: 3
   max_fixes_per_hour: 20

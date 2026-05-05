@@ -26,6 +26,7 @@ class RepairLifecycleStatus(str, Enum):
     """修复生命周期状态"""
     FIXING = "fixing"                    # 正在修复中（阻塞重复事件）
     PENDING_DEPLOY = "pending_deploy"    # PR 已创建，等待部署
+    PENDING_PUSH = "pending_push"        # 修复完成但推送失败，等待重试推送
     DEPLOYED = "deployed"                # 修复已部署上线
     SUPERSEDED = "superseded"            # 版本已变更，记录过期
     FAILED = "failed"                    # 修复尝试失败
@@ -496,6 +497,142 @@ def get_pending_event_store(db_path: str = "data/repair_records.db") -> PendingE
     if _pending_event_store is None:
         _pending_event_store = PendingEventStore(db_path)
     return _pending_event_store
+
+
+class PendingPushStore:
+    """待推送修复记录存储 — 修复完成但推送失败，等待重试"""
+
+    def __init__(self, db_path: str = "data/repair_records.db"):
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+        self._init_table()
+
+    def _init_table(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS pending_pushes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fingerprint TEXT NOT NULL,
+                    branch_name TEXT NOT NULL,
+                    repo_path TEXT NOT NULL,
+                    repo_full_name TEXT NOT NULL,
+                    base_branch TEXT NOT NULL,
+                    pr_title TEXT NOT NULL,
+                    pr_body TEXT NOT NULL,
+                    event_type TEXT DEFAULT '',
+                    event_payload TEXT DEFAULT '',
+                    service TEXT DEFAULT '',
+                    fix_description TEXT DEFAULT '',
+                    diff_content TEXT DEFAULT '',
+                    created_at REAL NOT NULL,
+                    retry_count INTEGER DEFAULT 0,
+                    last_retry_at REAL DEFAULT 0
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_push_fingerprint
+                ON pending_pushes(fingerprint)
+            """)
+            conn.commit()
+
+    def insert(
+        self,
+        fingerprint: str,
+        branch_name: str,
+        repo_path: str,
+        repo_full_name: str,
+        base_branch: str,
+        pr_title: str,
+        pr_body: str,
+        event_type: str = "",
+        event_payload: str = "",
+        service: str = "",
+        fix_description: str = "",
+        diff_content: str = "",
+    ) -> int:
+        """保存一条待推送记录，返回 record id"""
+        now = time.time()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute(
+                    """INSERT INTO pending_pushes
+                       (fingerprint, branch_name, repo_path, repo_full_name,
+                        base_branch, pr_title, pr_body, event_type, event_payload,
+                        service, fix_description, diff_content, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (fingerprint, branch_name, repo_path, repo_full_name,
+                     base_branch, pr_title, pr_body, event_type, event_payload,
+                     service, fix_description, diff_content, now),
+                )
+                conn.commit()
+                record_id = cursor.lastrowid or 0
+                logger.info(f"保存待推送记录: id={record_id}, branch={branch_name}")
+                return record_id
+        except Exception as e:
+            logger.error(f"保存待推送记录失败: {e}")
+            return 0
+
+    def get_all(self) -> list[dict]:
+        """获取所有待推送记录"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT * FROM pending_pushes ORDER BY created_at ASC"
+                ).fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"查询待推送记录失败: {e}")
+            return []
+
+    def delete(self, record_id: int) -> bool:
+        """删除已推送成功的记录"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("DELETE FROM pending_pushes WHERE id = ?", (record_id,))
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"删除待推送记录失败: {e}")
+            return False
+
+    def increment_retry(self, record_id: int) -> bool:
+        """重试失败后递增 retry_count"""
+        now = time.time()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    """UPDATE pending_pushes
+                       SET retry_count = retry_count + 1, last_retry_at = ?
+                       WHERE id = ?""",
+                    (now, record_id),
+                )
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"更新重试次数失败: {e}")
+            return False
+
+    def count(self) -> int:
+        """统计待推送记录数量"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute("SELECT COUNT(*) FROM pending_pushes").fetchone()
+                return row[0] if row else 0
+        except Exception as e:
+            logger.error(f"统计待推送记录失败: {e}")
+            return 0
+
+
+_pending_push_store: Optional[PendingPushStore] = None
+
+
+def get_pending_push_store(db_path: str = "data/repair_records.db") -> PendingPushStore:
+    """获取全局待推送记录存储实例"""
+    global _pending_push_store
+    if _pending_push_store is None:
+        _pending_push_store = PendingPushStore(db_path)
+    return _pending_push_store
 
 
 class PendingApprovalStore:

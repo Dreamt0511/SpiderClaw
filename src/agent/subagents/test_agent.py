@@ -1,10 +1,10 @@
 """测试Agent实现 - 动态验证代码修复"""
 import ast
+import json
 import logging
 import os
 import re
 import subprocess
-from collections import Counter
 from typing import Dict, Any, List, Optional
 
 from src.agent.state import ErrorLocation
@@ -16,8 +16,9 @@ logger = logging.getLogger(__name__)
 class TestAgent:
     """测试Agent - 动态验证代码修复
 
-    核心改进：不再固定执行 pytest，而是从 CI 日志中提取原始失败命令，
-    用同样的命令验证修复是否有效。如果无法提取命令，使用降级策略。
+    验证策略：
+    1. 主验证：ast.parse 语法检查 + execute_python_code 运行时验证
+    2. 补充验证：CI 原始命令（仅作参考，失败不判 failure）
     """
 
     # 危险命令模式 - 禁止执行
@@ -46,15 +47,6 @@ class TestAgent:
         openai_base_url: str = "https://api.openai.com/v1",
         test_command: str = "pytest"
     ):
-        """
-        初始化测试Agent
-
-        Args:
-            repo_path: 本地仓库路径
-            openai_api_key: OpenAI API密钥（保留接口兼容）
-            openai_base_url: OpenAI API基础URL（保留接口兼容）
-            test_command: 默认测试命令（当无法从日志提取时作为降级选项）
-        """
         self.repo_path = repo_path
         self.test_command = test_command
 
@@ -68,491 +60,209 @@ class TestAgent:
                 return False
         return True
 
-    # ---------- 命令提取 ----------
+    # ---------- 源码验证（核心） ----------
 
-    def _extract_failure_command(
-        self, ci_logs: str, error_locations: List[ErrorLocation]
-    ) -> Optional[str]:
-        """从 CI 日志中提取原始失败命令
+    async def _verify_source_code(
+        self,
+        error_locations: List[ErrorLocation],
+        diff_content: str,
+    ) -> Optional[Dict[str, Any]]:
+        """验证修复后的源码本身（ast.parse + execute_python_code）
 
-        优先级（核心原则：错误文件路径推断 > CI 日志提取）：
-        1. 从 error_locations 的文件路径推断（最可靠）
-        2. GitHub Actions 的 "##[command]<实际命令>" 行
-        3. GitHub Actions 的 "Run <命令>" 行
+        不依赖外部测试文件，直接检查被修复的代码：
+        1. ast.parse 语法检查
+        2. execute_python_code 子进程执行，检查运行时错误
 
-        返回前会检查命令是否在测试白名单中，环境准备命令（pip install 等）会被拒绝。
+        Returns:
+            None 表示无法确定（无文件可验证），交给后续流程
         """
-        # 剥离 ANSI 转义码（CI 日志中可能包含颜色控制序列如 [0m）
-        if ci_logs:
-            ci_logs = re.sub(r'\033\[[0-9;]*[a-zA-Z]', '', ci_logs)
-            ci_logs = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', ci_logs)
-
-        # 环境/准备命令黑名单 — — 这些不是验证命令
-        _ENV_COMMAND_PATTERNS = [
-            re.compile(p) for p in [
-                r'\bpip\b',         # pip install/ uninstall / etc
-                r'\bconda\b',       # conda install / etc
-                r'\bpoetry\b',      # poetry install / add / etc
-                r'\bnpm\b',         # npm install / ci / etc
-                r'\binstall\b',     # setup.py install, make install, etc
-                r'\bsetup\.py\b',   # python setup.py ...
-            ]
-        ]
-
-        def _is_env_setup_command(cmd: str) -> bool:
-            """检查是否为环境准备命令（非验证命令）"""
-            for pattern in _ENV_COMMAND_PATTERNS:
-                if pattern.search(cmd):
-                    return True
-            return False
-
-        # --- 模式1（最高优先级）：从 error_locations 的文件路径推断 ---
-        inferred = self._infer_command_from_errors(error_locations)
-        if inferred:
-            logger.info(f"从错误位置推断命令: {inferred}")
-            return inferred
-
-        # --- 模式2（次高优先级）：从错误消息提取 Python 命令 ---
-        if error_locations:
-            for err in error_locations:
-                error_msg = err.error_message
-                # 匹配 CI 错误中常见的命令形式
-                for cmd_prefix in ['pytest ', 'python ', 'python3 ', 'nosetests ', 'tox ']:
-                    lines = error_msg.split('\n')
-                    for line in lines:
-                        line = line.strip()
-                        if line.lower().startswith(cmd_prefix) and 'Error' not in line:
-                            cmd = line.split('|')[0].split('&&')[0].strip()
-                            if self._safety_filter(cmd):
-                                logger.info(f"从错误消息提取命令: {cmd}")
-                                return cmd
-
-        # --- 无日志时直接返回 ---
-        if not ci_logs:
-            logger.warning("未能从 CI 日志中提取到任何命令")
+        source_files = self._extract_modified_files(error_locations, diff_content)
+        if not source_files:
+            logger.info("无法从错误位置和 diff 提取源文件，跳过源码验证")
             return None
 
-        # --- CI 日志提取（仅当推断失败且有日志时才执行）---
+        logger.info(f"源码验证: 检查 {len(source_files)} 个文件")
+
+        results = []
+        all_passed = True
+        failure_details = []
+
+        for fp in source_files:
+            if not fp.endswith('.py'):
+                continue
+
+            full_path = os.path.join(self.repo_path, fp)
+            if not os.path.exists(full_path):
+                logger.warning(f"源码验证: 文件不存在 {fp}")
+                continue
+
+            # ---- 1. ast.parse 语法检查 ----
+            try:
+                with open(full_path, 'r', encoding='utf-8') as f:
+                    source = f.read()
+                ast.parse(source, full_path)
+                logger.info(f"源码验证: {fp} 语法检查通过")
+            except SyntaxError as e:
+                error_detail = f"{fp} 语法错误: line {e.lineno}: {e.msg}"
+                results.append(f"[FAIL] {error_detail}")
+                failure_details.append(error_detail)
+                all_passed = False
+                continue
+
+            # ---- 2. execute_python_code 运行时检查 ----
+            logger.info(f"源码验证: 执行 {fp}")
+            exec_result_str = execute_python_code.invoke({
+                "file_path": fp,
+                "timeout": 15,
+            })
+
+            try:
+                exec_result = json.loads(exec_result_str)
+            except json.JSONDecodeError:
+                error_detail = f"{fp}: 执行结果解析失败"
+                results.append(f"[FAIL] {error_detail}")
+                failure_details.append(error_detail)
+                all_passed = False
+                continue
+
+            if exec_result.get("success"):
+                results.append(f"[PASS] {fp}: 执行成功")
+                continue
+
+            # 执行失败 — 判断是原始错误还是新错误
+            error_type = exec_result.get("error_type", "Unknown")
+            error_msg = exec_result.get("error_message", "")
+            error_line = exec_result.get("error_line", 0)
+
+            # 导入失败是致命错误
+            if error_type in ("ModuleNotFoundError", "ImportError"):
+                error_detail = (
+                    f"{fp}: 导入失败 - {error_type}: {error_msg} (行 {error_line})"
+                )
+                results.append(f"[FAIL] {error_detail}")
+                failure_details.append(error_detail)
+                all_passed = False
+                continue
+
+            # 检查是否是原始错误未修复
+            is_original = any(
+                error_type == err.error_type
+                and err.error_message[:30] in error_msg[:30]
+                for err in error_locations
+                if err.file_path == fp
+            )
+
+            if is_original:
+                error_detail = (
+                    f"{fp}: 原始错误未修复 - {error_type}: {error_msg} (行 {error_line})"
+                )
+                results.append(f"[FAIL] {error_detail}")
+                failure_details.append(error_detail)
+                all_passed = False
+            else:
+                results.append(
+                    f"[WARN] {fp}: 新错误 {error_type}: {error_msg} (行 {error_line})"
+                    f"，但原始错误已修复"
+                )
+
+        if not results:
+            return None
+
+        output = "\n".join(results)
+
+        if all_passed:
+            return {
+                "validation_status": "success",
+                "validation_method": "source_code",
+                "command_used": "ast.parse + execute_python_code",
+                "test_passed": True,
+                "test_output": output,
+                "failed_tests": [],
+                "verification_summary": f"源码验证通过: {len(source_files)} 个文件语法正确且无原始错误",
+            }
+
+        if failure_details:
+            return {
+                "validation_status": "failure",
+                "validation_method": "source_code",
+                "command_used": "ast.parse + execute_python_code",
+                "test_passed": False,
+                "test_output": output,
+                "failed_tests": failure_details,
+                "verification_summary": f"源码验证失败: {'; '.join(failure_details)}",
+            }
+
+        # 有警告但无明确失败
+        return {
+            "validation_status": "uncertain",
+            "validation_method": "source_code",
+            "command_used": "ast.parse + execute_python_code",
+            "test_passed": False,
+            "test_output": output,
+            "failed_tests": [],
+            "verification_summary": "源码验证: 原始错误已修复但出现新错误",
+        }
+
+    # ---------- CI 命令提取（补充验证用） ----------
+
+    def _extract_ci_command(self, ci_logs: str) -> Optional[str]:
+        """从 CI 日志中提取原始测试命令（仅从日志提取，不做文件推断）
+
+        仅作为补充验证手段，失败不直接判 failure。
+        """
+        if not ci_logs:
+            return None
+
+        # 剥离 ANSI 转义码
+        ci_logs = re.sub(r'\033\[[0-9;]*[a-zA-Z]', '', ci_logs)
+        ci_logs = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', ci_logs)
+
         lines = ci_logs.split('\n')
 
-        # Python 测试命令白名单
         PYTHON_TEST_PREFIXES = ('pytest', 'python ', 'python3 ', 'nosetests', 'tox', 'unittest')
 
         def _is_python_command(cmd: str) -> bool:
             return any(cmd.lower().strip().startswith(p) for p in PYTHON_TEST_PREFIXES)
 
-        # 常见测试命令前缀（用于日志行匹配）
-        COMMAND_PREFIXES = [
-            'pytest', 'python ', 'python3 ', 'nosetests',
-            'tox', 'make test', 'make check', 'make ',
-        ]
-
-        def _is_test_command(cmd: str) -> bool:
-            return any(cmd.startswith(p) for p in COMMAND_PREFIXES)
-
-        def _is_valid_verification_command(cmd: str) -> bool:
-            """同时满足：是测试命令 + 是 Python 命令 + 不是环境准备命令"""
-            return _is_test_command(cmd) and _is_python_command(cmd) and not _is_env_setup_command(cmd)
-
         def _clean_command(cmd: str) -> Optional[str]:
-            """清理命令：去掉管道/链式/重定向，返回纯命令"""
             cmd = cmd.split('|')[0].strip()
             cmd = cmd.split('&&')[0].strip()
             cmd = cmd.split(';')[0].strip()
             cmd = re.sub(r'\s+2>&1$', '', cmd).strip()
             return cmd if cmd else None
 
-        # 模式2: GitHub Actions ##[command] 格式（精确提取实际执行的命令）
+        def _is_env_setup_command(cmd: str) -> bool:
+            env_patterns = [r'\bpip\b', r'\bconda\b', r'\binstall\b', r'\bsetup\.py\b']
+            return any(re.search(p, cmd) for p in env_patterns)
+
+        # ##[command] 格式
         for line in lines:
             m = re.search(r'##\[command\](\S.+)', line)
             if m:
                 cmd = _clean_command(m.group(1))
-                if cmd and _is_valid_verification_command(cmd):
+                if cmd and _is_python_command(cmd) and not _is_env_setup_command(cmd):
                     logger.info(f"从 ##[command] 提取到命令: {cmd}")
                     return cmd
 
-        # 模式3: 查找 "Run <命令>" 行（剥离 ##[group]/Run 前缀）
+        # "Run <命令>" 行
         for line in lines:
             stripped = line.strip()
             if not stripped:
                 continue
-
             cleaned = re.sub(r'^##\[group\]', '', stripped)
-
-            # 多次剥离 "Run " 前缀（处理 "Run Run pytest" 的情况）
             prev = None
             while cleaned != prev:
                 prev = cleaned
                 cleaned = re.sub(r'^Run\s+', '', cleaned)
-
             cleaned = re.sub(r'^[$#>]\s*', '', cleaned)
-
             cmd = _clean_command(cleaned)
-            if cmd and _is_valid_verification_command(cmd):
+            if cmd and _is_python_command(cmd) and not _is_env_setup_command(cmd):
                 logger.info(f"从 Run 行提取到命令: {cmd}")
                 return cmd
 
-        logger.warning("未能从 CI 日志中提取到任何有效验证命令")
         return None
 
-    def _infer_command_from_errors(
-        self, error_locations: List[ErrorLocation]
-    ) -> Optional[str]:
-        """从错误位置的文件路径推断验证命令"""
-        py_files = [
-            err.file_path
-            for err in error_locations
-            if err.file_path.endswith('.py')
-        ]
-        if py_files:
-            most_common_file = Counter(py_files).most_common(1)[0][0]
-            basename = os.path.basename(most_common_file)
-
-            # 以 test_ 开头的不一定是 pytest 测试文件（可能是语法错误示例）
-            # 读取文件内容检查是否包含实际测试函数
-            if basename.startswith('test_') or basename.startswith('test-'):
-                full_path = os.path.join(self.repo_path, most_common_file)
-                if os.path.exists(full_path):
-                    try:
-                        with open(full_path, 'r', encoding='utf-8') as f:
-                            content = f.read()
-                        if 'def test_' in content:
-                            inferred = f"pytest {most_common_file}"
-                            logger.info(f"检测到测试函数，使用 pytest: {inferred}")
-                            return inferred
-                    except Exception:
-                        pass
-                # 文件不存在或不包含测试函数 → 使用 py_compile 安全验证
-                inferred = f"python -m py_compile {most_common_file}"
-                logger.info(f"文件不含测试函数或无法读取，使用 py_compile: {inferred}")
-                return inferred
-
-            # 普通文件 → py_compile
-            inferred = f"python -m py_compile {most_common_file}"
-            logger.info(f"非测试文件，使用 py_compile 验证语法: {inferred}")
-            return inferred
-
-        logger.warning("未能从 error_locations 提取到 .py 文件")
-        return None
-
-    # ---------- 降级验证 ----------
-
-    async def _replay_verification(
-        self, error_locations: List[ErrorLocation], ci_logs: str = ""
-    ) -> Dict[str, Any]:
-        """回放式验证：直接检测原始错误是否已修复
-
-        作为降级策略的第一优先级，在语法错误检查之前执行。
-        通过编译/导入检测来验证特定类型的错误是否已修复。
-        """
-        results = []
-        all_passed = True
-
-        for error in error_locations:
-            error_type = error.error_type
-            error_msg = error.error_message
-            file_path = error.file_path
-
-            # 1. NameError 检测 — compile 不能捕获运行时 NameError
-            #    这里仅做语法检查，真正的运行时验证交给 Code Interpreter
-            if error_type == "NameError":
-                full_path = os.path.join(self.repo_path, file_path) if file_path else None
-                if full_path and os.path.exists(full_path):
-                    try:
-                        with open(full_path, 'r', encoding='utf-8') as f:
-                            source = f.read()
-                        compile(source, full_path, 'exec')
-                        # compile 通过仅说明语法正确，NameError 仍需运行时验证
-                        results.append(f"[INFO] {error_type}: 文件语法正确，需运行时验证")
-                        all_passed = False  # 标记为未通过，继续降级做运行时验证
-                    except SyntaxError as e:
-                        all_passed = False
-                        results.append(f"[FAIL] {error_type}: 仍存在语法错误: {e}")
-                    except Exception as e:
-                        all_passed = False
-                        results.append(f"[FAIL] {error_type}: 编译失败: {e}")
-
-            # 2. ImportError 检测 — 使用 subprocess 验证模块导入
-            # 使用子进程而非 in-process __import__，避免当前运行环境的迷惑性
-            if error_type in ("ImportError", "ModuleNotFoundError"):
-                import re
-                match = re.search(r"No module named '(\w+)'", error_msg)
-                if match:
-                    module_name = match.group(1)
-                    try:
-                        check_result = subprocess.run(
-                            ["python", "-c", f"import {module_name}"],
-                            capture_output=True, text=True, timeout=15
-                        )
-                        if check_result.returncode == 0:
-                            results.append(f"[PASS] {error_type}: 模块 {module_name} 导入成功")
-                        else:
-                            all_passed = False
-                            stderr_tail = check_result.stderr.strip()[:100]
-                            results.append(
-                                f"[FAIL] {error_type}: 模块 {module_name} 仍未找到: {stderr_tail}"
-                            )
-                    except subprocess.TimeoutExpired:
-                        all_passed = False
-                        results.append(f"[FAIL] {error_type}: 验证模块 {module_name} 超时")
-                    except Exception as e:
-                        all_passed = False
-                        results.append(f"[FAIL] {error_type}: 验证模块 {module_name} 失败: {e}")
-                else:
-                    # 无法提取模块名，使用通用检查
-                    full_path = os.path.join(self.repo_path, file_path) if file_path else None
-                    if full_path and os.path.exists(full_path):
-                        try:
-                            with open(full_path, 'r', encoding='utf-8') as f:
-                                source = f.read()
-                            compile(source, full_path, 'exec')
-                            results.append(f"[PASS] {error_type}: 文件编译成功，导入错误可能已修复")
-                        except Exception as e:
-                            all_passed = False
-                            results.append(f"[FAIL] {error_type}: 编译失败: {e}")
-
-        if not results:
-            return None
-
-        if all_passed and all("[PASS]" in r or "[INFO]" in r for r in results):
-            return {
-                "validation_status": "success",
-                "validation_method": "replay_verification",
-                "command_used": "",
-                "output": "\n".join(results),
-                "details": f"回放验证全部通过: {'; '.join(results)}",
-            }
-        elif any("[FAIL]" in r for r in results):
-            return {
-                "validation_status": "failure",
-                "validation_method": "replay_verification",
-                "command_used": "",
-                "output": "\n".join(results),
-                "details": f"回放验证失败: {'; '.join(results)}",
-            }
-        else:
-            return {
-                "validation_status": "uncertain",
-                "validation_method": "replay_verification",
-                "command_used": "",
-                "output": "\n".join(results),
-                "details": f"回放验证部分通过: {'; '.join(results)}",
-            }
-
-    async def _fallback_verify(
-        self, error_locations: List[ErrorLocation],
-        ci_logs: str = "",
-        diff_content: str = "",
-    ) -> Dict[str, Any]:
-        """降级验证：通过多种方案验证修复的正确性
-
-        优先级：
-        1. 回放式验证 → compile 检查（轻量级，先过滤语法错误）
-        2. Code Interpreter → 直接执行修复后的文件，检查错误是否消失
-        3. 语法错误 → ast.parse 静态解析
-        4. 常见测试命令 → pytest / unittest（兜底）
-        """
-        # --- 方案1: 回放式验证（compile 检查）---
-        replay_result = await self._replay_verification(error_locations, ci_logs)
-        if replay_result and replay_result.get("validation_status") == "failure":
-            return replay_result
-
-        # --- 方案2: Code Interpreter 直接执行修复后的代码 ---
-        modified_files = self._extract_modified_files(error_locations, diff_content)
-        if not modified_files:
-            # 如果 error_locations 和 diff 都无法提供文件列表，
-            # 主动扫描仓库找到修改/相关的 .py 文件
-            logger.info("从错误位置和 diff 均未提取到文件，主动扫描仓库中的 .py 文件")
-            modified_files = self._scan_repo_for_py_files(max_files=5)
-        if modified_files:
-            logger.info(f"Code Interpreter: 将执行 {len(modified_files)} 个文件")
-            import json
-
-            results = []
-            all_passed = True
-
-            for fp in modified_files:
-                if not fp.endswith('.py'):
-                    continue
-
-                logger.info(f"Code Interpreter 执行: {fp}")
-                exec_result_str = execute_python_code.invoke({
-                    "file_path": fp,
-                    "timeout": 15,
-                })
-
-                try:
-                    exec_result = json.loads(exec_result_str)
-                except json.JSONDecodeError:
-                    results.append(f"文件 {fp}: 执行结果解析失败")
-                    all_passed = False
-                    continue
-
-                if exec_result.get("success"):
-                    results.append(f"[PASS] 文件 {fp}: 执行成功（退出码 0）")
-                else:
-                    error_type = exec_result.get("error_type", "Unknown")
-                    error_msg = exec_result.get("error_message", "")
-                    error_line = exec_result.get("error_line", 0)
-
-                    # 检查是否是原始错误还是新错误
-                    # 导入失败是致命错误，应阻止通过
-                    if error_type in ("ModuleNotFoundError", "ImportError"):
-                        results.append(
-                            f"[FAIL] 文件 {fp}: 导入失败 - {error_type}: {error_msg} "
-                            f"(行 {error_line})"
-                        )
-                        all_passed = False
-                    else:
-                        is_original_error = any(
-                            error_type == err.error_type
-                            and err.error_message[:30] in error_msg[:30]
-                            for err in error_locations
-                        )
-
-                        if is_original_error:
-                            results.append(
-                                f"[FAIL] 文件 {fp}: 原始错误未修复 - {error_type}: {error_msg} "
-                                f"(行 {error_line})"
-                            )
-                            all_passed = False
-                        else:
-                            results.append(
-                                f"[WARN] 文件 {fp}: 有新错误 - {error_type}: {error_msg} "
-                                f"(行 {error_line})，但原始错误已消失"
-                            )
-
-            if results:
-                if all_passed:
-                    return {
-                        "validation_status": "success",
-                        "validation_method": "code_interpreter",
-                        "command_used": "execute_python_code",
-                        "output": "\n".join(results),
-                        "details": "Code Interpreter 验证全部通过，置信度: 高",
-                    }
-                elif any("[FAIL]" in r for r in results):
-                    return {
-                        "validation_status": "failure",
-                        "validation_method": "code_interpreter",
-                        "command_used": "execute_python_code",
-                        "output": "\n".join(results),
-                        "details": "Code Interpreter 验证失败，原始错误仍存在，置信度: 高",
-                    }
-                else:
-                    return {
-                        "validation_status": "uncertain",
-                        "validation_method": "code_interpreter",
-                        "command_used": "execute_python_code",
-                        "output": "\n".join(results),
-                        "details": "Code Interpreter 验证: 原始错误已修复但出现新错误，置信度: 中",
-                    }
-
-        # --- 方案3: 语法错误 → ast.parse ---
-        is_syntax_err = any(
-            err.error_type in ('SyntaxError', 'IndentationError', 'TabError')
-            for err in error_locations
-        )
-        if is_syntax_err:
-            for err in error_locations:
-                fp = err.file_path
-                if not fp:
-                    continue
-                full_path = os.path.join(self.repo_path, fp)
-                if not os.path.exists(full_path):
-                    continue
-                try:
-                    with open(full_path, 'r', encoding='utf-8') as f:
-                        ast.parse(f.read())
-                    logger.info(f"AST解析验证通过: {fp}")
-                    return {
-                        "validation_status": "success",
-                        "validation_method": "ast",
-                        "command_used": f"ast.parse({fp})",
-                        "output": "AST 语法解析通过",
-                        "details": f"文件 {fp} 语法正确，置信度: 高",
-                    }
-                except SyntaxError as e:
-                    logger.warning(f"AST解析发现 {fp} 仍有语法错误: {e}")
-                    return {
-                        "validation_status": "failure",
-                        "validation_method": "ast",
-                        "command_used": f"ast.parse({fp})",
-                        "output": str(e),
-                        "details": f"文件 {fp} 仍然存在语法错误: {e}，置信度: 高",
-                    }
-
-        # --- 方案4: 尝试常见测试命令（兜底）---
-        test_commands = []
-        if modified_files:
-            basename = os.path.basename(modified_files[0])
-            if basename.startswith('test_') or basename.startswith('test-'):
-                test_commands.append(f"pytest {modified_files[0]}")
-            else:
-                test_commands.append(f"python -m py_compile {modified_files[0]}")
-        test_commands += [
-            self.test_command,                    # 默认命令 pytest
-            "python -m pytest --tb=short -x",     # 失败即停
-            "python -m unittest discover -v",      # unittest
-            "python -m pytest",                    # 通用 pytest
-        ]
-
-        # 过滤掉 None
-        test_commands = [cmd for cmd in test_commands if cmd]
-
-        for cmd in test_commands:
-            if not cmd or not self._safety_filter(cmd):
-                continue
-
-            try:
-                logger.info(f"降级验证: 尝试命令 '{cmd}'")
-                result = subprocess.run(
-                    cmd, shell=True, cwd=self.repo_path,
-                    capture_output=True, text=True, timeout=60
-                )
-                output = self._format_output(cmd, result)
-
-                if result.returncode == 0:
-                    logger.info(f"降级命令 '{cmd}' 执行成功")
-                    return {
-                        "validation_status": "success",
-                        "validation_method": "fallback_test",
-                        "command_used": cmd,
-                        "output": output,
-                        "details": f"降级测试命令 '{cmd}' 执行成功",
-                    }
-
-                # pytest 退出码 5 = 无测试用例收集
-                if result.returncode == 5:
-                    logger.info(f"降级命令 '{cmd}' 退出码 5（无测试用例）")
-                    confidence = self._estimate_confidence(error_locations, diff_content)
-                    return {
-                        "validation_status": "uncertain",
-                        "validation_method": "fallback_test",
-                        "command_used": cmd,
-                        "output": output,
-                        "details": (
-                            f"仓库中无测试用例，无法自动验证修复正确性。"
-                            f"置信度: {confidence}"
-                        ),
-                    }
-
-                logger.warning(f"降级命令 '{cmd}' 退出码 {result.returncode}")
-
-            except subprocess.TimeoutExpired:
-                logger.warning(f"降级命令 '{cmd}' 超时")
-            except Exception as e:
-                logger.warning(f"降级命令 '{cmd}' 执行异常: {e}")
-
-        # --- 全部降级失败 ---
-        confidence = self._estimate_confidence(error_locations, diff_content)
-        return {
-            "validation_status": "uncertain",
-            "validation_method": "none",
-            "command_used": "",
-            "output": "所有降级验证方案均不可用",
-            "details": f"无法提取原始失败命令，且所有降级验证方案均不可用。置信度: {confidence}",
-        }
+    # ---------- 辅助方法 ----------
 
     def _extract_modified_files(
         self, error_locations: List[ErrorLocation], diff_content: str
@@ -580,24 +290,6 @@ class TestAgent:
 
         return list(modified_files)
 
-    def _scan_repo_for_py_files(self, max_files: int = 5) -> List[str]:
-        """扫描仓库中的 .py 文件（排除无关目录），作为 Code Interpreter 的兜底目标
-
-        Args:
-            max_files: 最大返回文件数，避免执行过多文件
-        """
-        py_files = []
-        for root, dirs, files in os.walk(self.repo_path):
-            dirs[:] = [d for d in dirs if d not in ('.git', '__pycache__', '.venv', 'venv', 'node_modules')]
-            for f in files:
-                if f.endswith('.py'):
-                    full = os.path.join(root, f)
-                    rel = os.path.relpath(full, self.repo_path).replace('\\', '/')
-                    py_files.append(rel)
-                    if len(py_files) >= max_files:
-                        return py_files
-        return py_files
-
     def _estimate_confidence(
         self, error_locations: List[ErrorLocation], diff_content: str
     ) -> str:
@@ -605,7 +297,6 @@ class TestAgent:
         if not diff_content:
             return "低"
 
-        # 语法错误 + 有diff → 高置信度
         has_syntax_err = any(
             err.error_type in ("SyntaxError", "IndentationError", "TabError")
             for err in error_locations
@@ -613,7 +304,6 @@ class TestAgent:
         if has_syntax_err and diff_content.strip():
             return "高"
 
-        # NameError/ImportError + diff中包含import/变量定义 → 中高置信度
         has_name_err = any(
             err.error_type in ("NameError", "ImportError", "ModuleNotFoundError")
             for err in error_locations
@@ -621,23 +311,10 @@ class TestAgent:
         if has_name_err and ("import " in diff_content or "def " in diff_content):
             return "中高"
 
-        # 有diff但不确定逻辑正确性
         if diff_content.strip():
             return "中"
 
         return "低"
-
-    def _check_orig_errors_fixed(
-        self, error_locations: List[ErrorLocation], check_details: List[str]
-    ) -> bool:
-        """检查语义检查结果中是否表明原始错误已被修复"""
-        # 如果没有出现"原始错误未修复"，则认为已修复
-        for detail in check_details:
-            if "原始错误未修复" in detail:
-                return False
-        return True
-
-    # ---------- 辅助方法 ----------
 
     def _format_output(self, command: str, result: subprocess.CompletedProcess) -> str:
         """格式化命令输出"""
@@ -647,29 +324,6 @@ class TestAgent:
         if result.stderr:
             output += f"STDERR:\n{result.stderr[:3000]}\n"
         return output
-
-    def _parse_failed_tests(self, test_output: str) -> List[str]:
-        """
-        解析测试输出中的失败用例（辅助方法，不再作为主要判断依据）
-        """
-        failed_tests = []
-
-        # 匹配pytest失败格式
-        failed_pattern = re.compile(r'^FAILED ([^\s:]+::[^\s]+)', re.MULTILINE)
-        matches = failed_pattern.findall(test_output)
-        failed_tests.extend(matches)
-
-        # 匹配简短摘要格式
-        summary_pattern = re.compile(
-            r'=+ short test summary info =+\n(.*?)\n=+', re.DOTALL
-        )
-        summary_match = summary_pattern.search(test_output)
-        if summary_match:
-            summary_content = summary_match.group(1)
-            summary_failed = re.findall(r'FAILED\s+([^\s]+)', summary_content)
-            failed_tests.extend(summary_failed)
-
-        return list(set(failed_tests))
 
     # ---------- 核心验证方法 ----------
 
@@ -684,10 +338,9 @@ class TestAgent:
         动态验证修复有效性
 
         策略：
-        1. 从 CI 日志提取原始失败命令
-        2. 如果提取到 → 安全过滤 → 执行命令 → 根据退出码判断
-        3. 未提取到 → 降级验证（ast.parse / 常见测试命令）
-        4. 返回统一格式的验证结果
+        1. 主验证：ast.parse + execute_python_code 验证源码本身
+        2. 补充验证：CI 原始命令（失败不判 failure，降为 uncertain）
+        3. 全部不确定 → uncertain + 置信度估算
 
         Args:
             error_locations: 原始错误位置列表
@@ -696,119 +349,91 @@ class TestAgent:
             ci_logs: CI日志内容（用于提取原始命令）
 
         Returns:
-            Dict: 验证结果，包含 validation_status 字段
+            Dict: 验证结果，包含 validation_status, test_output, failed_tests 等字段
         """
         try:
             logger.info("=== 测试Agent: 动态验证修复 ===")
 
-            # ---- 步骤1: 提取原始失败命令 ----
-            original_command = self._extract_failure_command(ci_logs, error_locations)
+            # ---- 步骤1: 源码验证（主验证） ----
+            source_result = await self._verify_source_code(
+                error_locations, diff_content
+            )
 
-            if original_command:
-                logger.info(f"使用原始命令验证: {original_command}")
+            if source_result:
+                status = source_result["validation_status"]
+                logger.info(f"源码验证结果: {status}")
 
-                # 安全检查
-                if not self._safety_filter(original_command):
-                    return {
-                        "validation_status": "uncertain",
-                        "validation_method": "blocked",
-                        "command_used": original_command,
-                        "test_passed": False,
-                        "test_output": f"命令被安全过滤器拦截: {original_command}",
-                        "failed_tests": [],
-                        "verification_summary": "原始命令被安全策略拦截，无法自动验证",
-                        "details": f"命令 '{original_command}' 包含危险操作，已被拦截",
-                    }
+                # 通过 → 直接返回
+                if status == "success":
+                    return source_result
 
-                # 执行命令
+                # 明确失败 → 返回失败（带详细信息供修复 Agent 重试）
+                if status == "failure":
+                    return source_result
+
+                # uncertain → 继续尝试补充验证
+
+            # ---- 步骤2: 补充验证 — CI 原始命令 ----
+            ci_command = self._extract_ci_command(ci_logs)
+
+            if ci_command and self._safety_filter(ci_command):
+                logger.info(f"补充验证: 执行 CI 原始命令 {ci_command}")
                 try:
-                    logger.info(f"执行验证命令: {original_command}")
                     result = subprocess.run(
-                        original_command,
+                        ci_command,
                         shell=True,
                         cwd=self.repo_path,
                         capture_output=True,
                         text=True,
                         timeout=120,
                     )
-                    output = self._format_output(original_command, result)
-                    failed_tests = self._parse_failed_tests(output)
+                    output = self._format_output(ci_command, result)
 
-                    # 根据退出码判断
                     if result.returncode == 0:
-                        logger.info("验证通过: 命令退出码为 0")
+                        logger.info("CI 命令验证通过")
                         return {
                             "validation_status": "success",
-                            "validation_method": "command",
-                            "command_used": original_command,
+                            "validation_method": "ci_command",
+                            "command_used": ci_command,
                             "test_passed": True,
                             "test_output": output,
                             "failed_tests": [],
-                            "verification_summary": f"原始命令 '{original_command}' 执行成功，修复有效",
+                            "verification_summary": f"CI 命令 '{ci_command}' 执行成功",
                         }
 
-                    if result.returncode == 5:
-                        # pytest 退出码 5 = 无测试用例 → 降级到 Code Interpreter
-                        logger.info("pytest 无测试用例，降级到 Code Interpreter 验证")
-                    else:
-                        # 非零退出码（非5）= 验证失败
-                        logger.warning(
-                            f"验证失败: 命令退出码 {result.returncode}"
+                    # CI 命令失败不判 failure（测试文件本身可能有问题）
+                    logger.warning(
+                        f"CI 命令退出码 {result.returncode}，但不作为最终判定"
+                    )
+                    if source_result:
+                        # 源码验证已给出 uncertain，合并 CI 信息
+                        source_result["test_output"] += f"\n\n--- CI 命令补充 ---\n{output}"
+                        source_result["verification_summary"] += (
+                            f"；CI 命令 '{ci_command}' 也失败（退出码 {result.returncode}），"
+                            f"但测试文件本身可能有问题"
                         )
-                        return {
-                            "validation_status": "failure",
-                            "validation_method": "command",
-                            "command_used": original_command,
-                            "test_passed": False,
-                            "test_output": output,
-                            "failed_tests": failed_tests,
-                            "verification_summary": (
-                                f"原始命令 '{original_command}' 执行失败（退出码 {result.returncode}），修复无效"
-                            ),
-                        }
+                        return source_result
 
                 except subprocess.TimeoutExpired:
-                    logger.warning(f"验证命令超时: {original_command}")
-                    return {
-                        "validation_status": "uncertain",
-                        "validation_method": "timeout",
-                        "command_used": original_command,
-                        "test_passed": False,
-                        "test_output": f"命令执行超时（120秒）: {original_command}",
-                        "failed_tests": [],
-                        "verification_summary": "验证命令执行超时，无法确定修复是否正确",
-                    }
-
+                    logger.warning(f"CI 命令超时: {ci_command}")
                 except Exception as e:
-                    logger.error(f"验证命令执行异常: {e}")
-                    return {
-                        "validation_status": "uncertain",
-                        "validation_method": "error",
-                        "command_used": original_command,
-                        "test_passed": False,
-                        "test_output": f"命令执行异常: {str(e)}",
-                        "failed_tests": [],
-                        "verification_summary": f"验证命令执行异常: {str(e)}",
-                    }
+                    logger.warning(f"CI 命令执行异常: {e}")
 
-            # ---- 步骤2: 降级验证（原始命令不可用或pytest无测试用例）----
-            logger.info("使用降级验证（Code Interpreter / AST / 兜底命令）")
-            fallback_result = await self._fallback_verify(
-                error_locations, ci_logs=ci_logs, diff_content=diff_content
-            )
+            # ---- 步骤3: 全部不确定 ----
+            if source_result:
+                return source_result
 
-            # 补充与原始 fix 兼容的字段
-            fallback_result["test_passed"] = (
-                fallback_result["validation_status"] == "success"
-            )
-            fallback_result["failed_tests"] = []
-            fallback_result["test_output"] = fallback_result.get("output", "")
-            fallback_result["verification_summary"] = fallback_result.get("details", "")
-
-            logger.info(
-                f"降级验证完成: {fallback_result['validation_status']}"
-            )
-            return fallback_result
+            confidence = self._estimate_confidence(error_locations, diff_content)
+            return {
+                "validation_status": "uncertain",
+                "validation_method": "none",
+                "command_used": "",
+                "test_passed": False,
+                "test_output": "无法验证: 未能提取源文件且无 CI 日志",
+                "failed_tests": [],
+                "verification_summary": f"无法自动验证修复正确性。置信度: {confidence}",
+                "details": f"置信度: {confidence}",
+            }
 
         except Exception as e:
             logger.error(f"测试Agent执行失败: {e}", exc_info=True)

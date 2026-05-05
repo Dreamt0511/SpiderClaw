@@ -502,10 +502,45 @@ def parse_python_errors(log_content: str) -> List[Dict]:
             return fp[2:]
         return fp
 
-    # ===================== 3. 核心模式匹配 =====================
+    # ===================== 3. 通用文件路径提取 =====================
+    # 用多种正则同时匹配所有已知的 Python 文件引用格式，不依赖特定 traceback 结构。
+    # 这样无论日志来自 pytest、coloredlogs、loguru、unittest 还是其他工具，
+    # 只要包含 .py 文件路径就能提取出来。
+    _UNIVERSAL_FILE_PATTERNS = [
+        re.compile(r'File "([^"]+\.py)", line (\d+)'),              # 标准 Python: File "path.py", line 42
+        re.compile(r'(/[^\s:"<>]+\.py):(\d+):'),                    # pytest 绝对路径: /abs/path.py:42:
+        re.compile(r'(?<!\S)([^\s:"<>*?]+\.py):(\d+):'),            # pytest 相对路径: src/path.py:42:
+    ]
+
+    def _extract_file_refs_universal(text: str) -> List[tuple]:
+        """从任意文本中提取所有 .py 文件引用（路径 + 行号），不依赖特定格式。
+
+        返回 [(file_path, line_number), ...]，按出现顺序排列。
+        调用方应取最后一个（最接近实际错误位置）。
+        """
+        refs = []
+        for pat in _UNIVERSAL_FILE_PATTERNS:
+            for m in pat.finditer(text):
+                fp = m.group(1)
+                ln = int(m.group(2))
+                # 排除系统路径和临时文件
+                if not _is_system_path(fp) and not fp.startswith('<'):
+                    refs.append((fp, ln))
+        return refs
+
+    # ===================== 3b. 核心模式匹配 =====================
     def _match_patterns(content: str, ci_stage: str = "") -> List[Dict]:
         """对给定内容运行所有错误匹配模式，返回错误列表"""
         local_errors: List[Dict] = []
+
+        # ----- 清理 ANSI 转义序列（pytest、coloredlogs 等输出的颜色代码）-----
+        ansi_escape = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07')
+        content = ansi_escape.sub('', content)
+        # ----- 还原转义换行（日志传输中 \\n → 真正的 \n）-----
+        content = content.replace('\\n', '\n').replace('\\t', '\t')
+
+        # DEBUG: 打印清理后的内容前 500 字符
+        logger.debug(f"_match_patterns 内容前500字: {repr(content[:500])}")
 
         # ----- 3a. 编译正则 -----
 
@@ -515,6 +550,16 @@ def parse_python_errors(log_content: str) -> List[Dict]:
             r'(?:  File "([^"]+)", line (\d+)[^\n]*\n.*?\n)+?'
             r'([^\n:]+): (.*?)\n',
             re.DOTALL | re.MULTILINE,
+        )
+
+        # pytest 简化 Traceback 格式（支持绝对路径和相对路径）
+        # 绝对路径：/usr/lib/python3.10/importlib/__init__.py:126: in import_module
+        # 相对路径：app/src/tests/test_user_service.py:7: in <module>
+        pytest_traceback_pattern = re.compile(
+            r'Traceback:\n'
+            r'((?:[^\s].*\.py:\d+:\s+in\s+[^\n]+\n(?:\s+[^\n]+\n)*)+)'
+            r'(?:E\s+)?(\w+(?:Error|Exception|Warning|Fault|Failure)):\s*(.*?)$',
+            re.MULTILINE,
         )
 
         # 语法错误（无 Traceback 头部）
@@ -591,6 +636,30 @@ def parse_python_errors(log_content: str) -> List[Dict]:
                     "ci_stage": ci_stage,
                 })
 
+        # pytest 简化 Traceback 格式处理
+        for match in pytest_traceback_pattern.finditer(content):
+            full_tb = match.group(0)
+            tb_body = match.group(1)
+            error_type = match.group(2)
+            error_message = match.group(3)
+
+            # 从 traceback 提取最后一个文件路径和行号（支持绝对路径和相对路径）
+            file_matches = re.findall(r'([^\s].*\.py):(\d+):\s+in\s+', tb_body)
+            if file_matches:
+                file_path = _normalize_ci_path(file_matches[-1][0])
+                line_number = int(file_matches[-1][1])
+
+                if not _is_system_path(file_path):
+                    local_errors.append({
+                        "type": "pytest_traceback",
+                        "file_path": file_path,
+                        "line_number": line_number,
+                        "error_type": error_type,
+                        "error_message": error_message,
+                        "traceback": full_tb,
+                        "ci_stage": ci_stage,
+                    })
+
         # ----- 3c. 语法错误匹配（去重键包含 file_path） -----
         existing_keys = {
             (e["file_path"], e["line_number"], e["error_type"], e["error_message"])
@@ -654,8 +723,11 @@ def parse_python_errors(log_content: str) -> List[Dict]:
             candidate_paths = list(dict.fromkeys([direct_path, short_path, src_path]))
             fallback_file_path = candidate_paths[0]
 
+            logger.info(f"runtime_log message 二次解析: {repr(message[:800])}")
             # === 尝试从 message 中提取嵌套的标准 traceback ===
-            nested_errors = _match_patterns(message, ci_stage=ci_stage)
+            # message 中的换行可能被转义为 \\n，需要还原为真正的换行符
+            message_unescaped = message.replace('\\n', '\n')
+            nested_errors = _match_patterns(message_unescaped, ci_stage=ci_stage)
             if nested_errors:
                 for ne in nested_errors:
                     if not ne.get("file_path"):
@@ -848,6 +920,56 @@ def parse_python_errors(log_content: str) -> List[Dict]:
                     "ci_stage": ci_stage,
                 })
 
+        # ===================== 通用后处理：修正 error_type =====================
+        # Python 异常类命名规范：以 Error/Exception/Warning/Fault/Failure 结尾。
+        # 无论哪个 pattern 产生的结果，都验证 error_type 是否像一个异常类名，
+        # 不像的（如 logger 名 __main__、模块名等）都从 traceback 全文重新提取。
+        _EXCEPTION_SUFFIX_RE = re.compile(
+            r'(?:Error|Exception|Warning|Fault|Failure|Exit)$'
+        )
+        _GENERIC_ERROR_TYPES = {"UnknownError", "RuntimeError", "Exception", "Error"}
+
+        def _extract_error_type_from_text(text: str) -> str:
+            """从 traceback 全文中提取最具体的异常类型（取最后一个）"""
+            candidates = re.findall(
+                r'(\w+(?:Error|Exception|Warning|Fault|Failure))\b', text
+            )
+            if not candidates:
+                return ""
+            return candidates[-1]
+
+        for err in local_errors:
+            et = err.get("error_type", "")
+            tb = err.get("traceback", "")
+            if not tb:
+                continue
+            # 条件1: 泛型类型（UnknownError、RuntimeError 等）→ 尝试升级
+            # 条件2: 不像异常类名（如 __main__、module_name）→ 重新提取
+            if et in _GENERIC_ERROR_TYPES or not _EXCEPTION_SUFFIX_RE.search(et):
+                real_et = _extract_error_type_from_text(tb)
+                if real_et and real_et != et:
+                    logger.debug(f"error_type 修正: {et!r} -> {real_et}")
+                    err["error_type"] = real_et
+
+        # ===================== 通用后处理：修正 file_path =====================
+        # 对于所有 file_path 为空但有 traceback 的错误，用通用提取器扫描 traceback 全文，
+        # 尝试从任意格式中提取 .py 文件路径（标准 Python、pytest、loguru 等）。
+        # 不依赖特定 traceback 头部格式，只找 .py 文件引用。
+        for err in local_errors:
+            if err.get("file_path"):
+                continue
+            tb = err.get("traceback", "")
+            if not tb:
+                continue
+            refs = _extract_file_refs_universal(tb)
+            if refs:
+                fp, ln = refs[-1]  # 取最后一个（最接近实际错误位置）
+                fp = _normalize_ci_path(fp)
+                if not _is_system_path(fp):
+                    err["file_path"] = fp
+                    err["line_number"] = ln
+                    logger.debug(f"通用文件路径提取: {fp}:{ln}")
+
         return local_errors
 
     # ===================== 4. CI 文件组解析 =====================
@@ -996,46 +1118,6 @@ def parse_python_errors(log_content: str) -> List[Dict]:
         err.setdefault("ci_stage", "")
 
     return unique_errors
-
-
-@tool
-def run_tests(test_command: str = "pytest") -> str:
-    """
-    在仓库目录下运行测试命令。
-
-    Args:
-        test_command: 测试命令，默认为"pytest"
-
-    Returns:
-        str: 测试输出内容，如果运行失败返回错误信息
-    """
-    repo_path = get_tool_context().get("repo_path", "")
-    if not repo_path:
-        return "Error: 仓库路径未设置，请先克隆仓库"
-
-    try:
-        logger.info(f"运行测试命令: {test_command}")
-
-        result = subprocess.run(
-            test_command,
-            shell=True,
-            cwd=repo_path,
-            capture_output=True,
-            text=True,
-            timeout=300  # 5分钟超时
-        )
-
-        output = f"Exit code: {result.returncode}\n\n"
-        if result.stdout:
-            output += f"STDOUT:\n{result.stdout}\n"
-        if result.stderr:
-            output += f"STDERR:\n{result.stderr}\n"
-
-        return output
-    except subprocess.TimeoutExpired:
-        return "Error: 测试运行超时（超过5分钟）"
-    except Exception as e:
-        return f"Error: 运行测试失败: {str(e)}"
 
 
 @tool
@@ -1254,7 +1336,7 @@ commit_changes = _wrap_tool(commit_changes)
 get_diff = _wrap_tool(get_diff)
 download_ci_logs = _wrap_tool(download_ci_logs)
 parse_python_errors = _wrap_tool(parse_python_errors)
-run_tests = _wrap_tool(run_tests)
+
 push_branch = _wrap_tool(push_branch)
 create_pull_request = _wrap_tool(create_pull_request)
 execute_python_code = _wrap_tool(execute_python_code)
@@ -1271,7 +1353,6 @@ all_tools = [
     get_diff,
     download_ci_logs,
     parse_python_errors,
-    run_tests,
     push_branch,
     create_pull_request,
     execute_python_code,

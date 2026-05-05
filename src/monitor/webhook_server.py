@@ -18,7 +18,7 @@ from .base import BaseMonitor
 from src.bus import GitHubEvent, EventBus
 from src.bus.schemas import RuntimeLogEvent
 from src.config.service_registry import get_service_registry
-from src.store.repair_store import get_pending_event_store
+from src.store.repair_store import get_pending_event_store, get_pending_push_store
 from src.utils.audit import audit_logger
 from src.utils.rate_limiter import ServiceRateLimiter
 from src.utils.version_manager import pre_sync_repos
@@ -979,6 +979,131 @@ def run_webhook_server(
                 log.error(f"[approval] 处理审批事件异常: {e}", exc_info=True)
                 await asyncio.sleep(1)
 
+    async def _retry_pending_push(record: dict) -> bool:
+        """重试单条待推送记录，成功返回 True"""
+        from src.agent.tools import push_branch, create_pull_request, set_tool_context
+        from src.store.repair_store import get_repair_store, RepairLifecycleStatus
+        from git import Repo
+
+        branch_name = record["branch_name"]
+        repo_path = record["repo_path"]
+
+        # 检查仓库目录是否存在
+        if not os.path.isdir(os.path.join(repo_path, ".git")):
+            log.warning(f"仓库目录不存在: {repo_path}，跳过推送 {branch_name}")
+            return False
+
+        try:
+            repo = Repo(repo_path)
+
+            # 关键：checkout 到 autofix 分支，否则 push_branch 会推送 HEAD（可能是 main）
+            try:
+                repo.git.checkout(branch_name)
+            except Exception as e:
+                log.warning(f"checkout 到 {branch_name} 失败: {e}，跳过")
+                return False
+
+            set_tool_context({
+                "repo": repo,
+                "repo_path": repo_path,
+                "github_token": settings.github.token,
+            })
+
+            push_result = push_branch.invoke({"branch_name": branch_name})
+            if push_result != "Success":
+                log.warning(f"重试推送仍失败: {branch_name} — {push_result}")
+                return False
+
+            pr_url = create_pull_request.invoke({
+                "repo_full_name": record["repo_full_name"],
+                "head_branch": branch_name,
+                "base_branch": record["base_branch"],
+                "title": record["pr_title"],
+                "body": record["pr_body"],
+            })
+
+            if pr_url.startswith("Error:"):
+                log.error(f"重试创建PR失败: {branch_name} — {pr_url}")
+                return False
+
+            # 更新 repair_records 状态
+            fp = record.get("fingerprint", "")
+            if fp:
+                repair_store = get_repair_store()
+                repair_store.upsert(fp, RepairLifecycleStatus.PENDING_DEPLOY.value,
+                                    fix_pr_url=pr_url)
+
+            log.info(f"重试推送成功: {branch_name} → {pr_url}")
+
+            # 发飞书通知
+            if settings.lark.enabled and settings.lark.notify_users:
+                from src.notify.lark_notify import send_markdown_message
+                md = (
+                    f"**遗留推送重试成功**\n\n"
+                    f"- 服务: {record.get('service', 'N/A')}\n"
+                    f"- 分支: `{branch_name}`\n"
+                    f"- PR: [查看PR]({pr_url})\n"
+                    f"- 修复描述: {record.get('fix_description', '')[:100]}"
+                )
+                for user_id in settings.lark.notify_users:
+                    await send_markdown_message(user_id, md, title="SpiderClaw 推送恢复")
+
+            return True
+
+        except Exception as e:
+            log.error(f"重试推送异常: {branch_name} — {e}", exc_info=True)
+            return False
+
+    async def recover_pending_pushes():
+        """启动时重试推送失败的修复分支"""
+        push_store = get_pending_push_store()
+        pending = push_store.get_all()
+        if not pending:
+            return
+
+        log.info(f"发现 {len(pending)} 个待推送的修复分支，开始重试...")
+
+        # 发飞书通知：有积压推送
+        if settings.lark.enabled and settings.lark.notify_users:
+            from src.notify.lark_notify import send_markdown_message
+            branch_list = "\n".join(f"- `{r['branch_name']}` ({r.get('service', 'N/A')})" for r in pending)
+            md = (
+                f"**发现 {len(pending)} 个待推送的修复分支，正在重试...**\n\n"
+                f"{branch_list}"
+            )
+            for user_id in settings.lark.notify_users:
+                await send_markdown_message(user_id, md, title="SpiderClaw 推送恢复")
+
+        for record in pending:
+            success = await _retry_pending_push(record)
+            if success:
+                push_store.delete(record["id"])
+            else:
+                push_store.increment_retry(record["id"])
+
+    async def _pending_push_timer():
+        """每 10 分钟检查积压的待推送记录并自动重试"""
+        TIMER_INTERVAL = 600  # 10 分钟
+        while True:
+            await asyncio.sleep(TIMER_INTERVAL)
+            try:
+                push_store = get_pending_push_store()
+                pending = push_store.get_all()
+                if not pending:
+                    continue
+
+                log.info(f"[定时重试] 发现 {len(pending)} 个待推送记录，开始重试...")
+                for record in pending:
+                    success = await _retry_pending_push(record)
+                    if success:
+                        push_store.delete(record["id"])
+                    else:
+                        push_store.increment_retry(record["id"])
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.error(f"[定时重试] 异常: {e}", exc_info=True)
+
     async def _run():
         def _task_done_callback(task: asyncio.Task):
             """任务结束回调：记录异常或意外退出"""
@@ -993,6 +1118,7 @@ def run_webhook_server(
         ]
         if orchestrator:
             tasks.append(asyncio.create_task(event_consumer(), name="event_consumer"))
+            tasks.append(asyncio.create_task(_pending_push_timer(), name="pending_push_timer"))
         # 始终启动审批事件监听（WebSocket 客户端），即使没有待处理事件
         approval_task = asyncio.create_task(approval_event_listener(), name="approval_listener")
         approval_task.add_done_callback(_task_done_callback)
@@ -1001,6 +1127,10 @@ def run_webhook_server(
         if orchestrator:
             registry = get_service_registry()
             await pre_sync_repos(registry.all())
+
+        # 启动时重试推送失败的修复分支（异步执行，不阻塞启动）
+        if orchestrator:
+            asyncio.create_task(recover_pending_pushes(), name="recover_pending_pushes")
 
         # 启动时恢复上次中断的未处理事件（在 WebSocket 启动之后）
         await recover_pending_events()

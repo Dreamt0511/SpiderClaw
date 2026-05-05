@@ -53,12 +53,17 @@ INSTRUCTION_TEMPLATES = {
 
     # === Gate 拒绝：变更行数超限 ===
     "change_limit_exceeded": (
-        "🚨 强制性指令：上次修复修改了 {actual_changes} 行，超过上限 {max_allowed} 行。\n"
-        "本次必须严格限制修改范围：\n"
-        "1. 只修复 CI 日志中的实际错误，禁止任何安全改进\n"
-        "2. 禁止 eval→ast.literal_eval、os.system→subprocess 等安全替代\n"
-        "3. 禁止硬编码密钥提取等安全优化\n"
-        "4. 总计修改行数不超过 {max_allowed} 行，单个文件修改不超过 10 行\n"
+        "🚨 强制性指令：上次修复修改了 {actual_changes} 行，超过上限 {max_allowed} 行，超出 {overage} 行。\n\n"
+        "## 裁剪策略（必须严格执行）\n"
+        "1. 只保留对 CI 错误的**直接修复**，删除所有「额外改进」\n"
+        "2. 禁止：安全优化、代码风格、类重构、函数重命名、添加注释/docstring\n"
+        "3. 禁止：eval→ast.literal_eval、os.system→subprocess 等安全替代\n"
+        "4. 如果原始文件是模块级函数，禁止重构为类\n"
+        "5. 如果原始代码已有 try/except，禁止改为更复杂的错误处理\n\n"
+        "## 具体操作\n"
+        "- 对比原始代码和你的修复代码，找到与 CI 错误**无关**的变更\n"
+        "- 将这些无关变更**回退到原始代码**\n"
+        "- 只保留修复 CI 错误所需的**最小变更**\n\n"
         "再次越界则修复直接失败。"
     ),
 

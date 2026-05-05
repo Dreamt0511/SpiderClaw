@@ -7,6 +7,7 @@ import re
 from langchain.agents import create_agent
 from langchain.agents.middleware import ToolCallLimitMiddleware
 from langchain_core.tools import tool
+from langchain_core.messages import AIMessage as _AIM
 from langchain_openai import ChatOpenAI
 
 from src.agent.state import ErrorLocation, FixAttempt
@@ -68,11 +69,21 @@ class FixAgent:
 
         self.read_target_file_tool = read_target_file
 
-    def _create_agent(self, run_limit: int):
-        """创建 Agent，run_limit = 目标文件数量（每个文件最多读一次）"""
+    def _create_agent(self, run_limit: int, target_constraint: str = ""):
+        """创建 Agent，run_limit = 目标文件数量（每个文件最多读一次）
+
+        系统提示词优先级（从高到低）：
+        1. orchestrator 的 system_prompt_override（重试警告 + 累积的强制指令）
+        2. target_constraint（目标文件硬约束，每次调用都注入）
+        3. 基础系统提示词（输出格式 + 核心约束）
+        """
         prompt = FIX_AGENT_SYSTEM_PROMPT.replace(
             "__MAX_CHANGE_LINES__", str(self.max_change_lines)
         )
+        # 目标文件硬约束：始终注入到系统提示词中（首次调用也生效）
+        if target_constraint:
+            prompt = target_constraint + "\n\n" + prompt
+        # orchestrator 的覆盖（重试警告等）：最高优先级
         if self.system_prompt_override:
             prompt = self.system_prompt_override + "\n\n" + prompt
 
@@ -210,6 +221,8 @@ class FixAgent:
         mandatory_instructions: str = "",
         fix_history: list[FixAttempt] | None = None,
         retry_count: int = 0,
+        previous_code_changes: dict[str, str] | None = None,
+        previous_fix_description: str = "",
     ) -> Dict[str, Any]:
         """
         生成修复代码
@@ -364,15 +377,28 @@ class FixAgent:
                 if test_parts else ""
             )
 
-            # 强制性指令：首次调用时给 LLM 明确的行动指令，避免"无特殊指令"导致 LLM 选择不行动
-            mandatory_section = mandatory_instructions if mandatory_instructions else (
-                "请立即分析上方「解析后的错误位置」中的 error_type 和 error_message，"
-                "结合「错误代码上下文」中的代码片段，生成修复代码。"
-                "所有必要信息已提供，无需额外查询。"
-            )
+            # 重试时展示上一轮的代码变更，让 LLM 知道自己改了什么、为什么被拒绝
+            previous_changes_section = ""
+            if previous_code_changes and retry_count > 0:
+                prev_parts = [f"**上一轮修复描述**：{previous_fix_description}"]
+                for fp, code in previous_code_changes.items():
+                    # 截断过长的代码，只展示前2000字符
+                    display_code = code[:2000]
+                    if len(code) > 2000:
+                        display_code += "\n... (已截断)"
+                    prev_parts.append(f"### {fp}\n```python\n{display_code}\n```")
+                previous_changes_section = (
+                    "## ⚠️ 上一轮修复代码（已被拒绝，不要原样重复）\n\n"
+                    + "\n\n".join(prev_parts)
+                    + "\n\n**请基于上述代码进行修正，不要原样重复。**"
+                )
 
             # 历史修复摘要
             fix_history_summary = self._build_fix_history_summary(fix_history)
+            fix_history_section = (
+                "## 历史修复记录（避免重复同样的错误）\n" + fix_history_summary
+                if fix_history_summary != "无历史记录" else ""
+            )
 
             # 根因错误识别与优先处理
             root_cause_errors = []
@@ -435,15 +461,36 @@ class FixAgent:
             logger.info(f"error_locations JSON 内容:\n{error_locations_json[:1000]}")
             logger.info(f"目标修复文件列表: {tf}")
 
-            # 构建错误代码上下文区块（仅展示与错误相关的代码片段，而非完整文件）
+            # 构建错误代码上下文区块
+            # 小文件（<5000字符）直接全量注入，大文件只给错误行附近片段
             error_context_section = ""
             if original_codes and tf and error_locations:
-                error_context_section = build_error_context_section(
-                    original_codes=original_codes,
-                    error_locations=error_locations,
-                    target_files=tf,
-                    context_lines=8,
-                )
+                SMALL_FILE_THRESHOLD = 5000
+                small_files = {fp: code for fp, code in original_codes.items() if len(code) < SMALL_FILE_THRESHOLD and fp in tf}
+                large_files = [fp for fp in tf if fp not in small_files]
+
+                parts = []
+                if small_files:
+                    full_code_parts = []
+                    for fp, code in small_files.items():
+                        full_code_parts.append(f"### {fp}（完整源码）\n```python\n{code}\n```")
+                    parts.append(
+                        "## 📂 小文件完整源码（可直接修改）\n\n"
+                        + "\n\n".join(full_code_parts)
+                    )
+                    logger.info(f"全量注入 {len(small_files)} 个小文件: {list(small_files.keys())}")
+
+                if large_files:
+                    snippet_section = build_error_context_section(
+                        original_codes=original_codes,
+                        error_locations=error_locations,
+                        target_files=large_files,
+                        context_lines=8,
+                    )
+                    if snippet_section:
+                        parts.append(snippet_section)
+
+                error_context_section = "\n\n".join(parts) if parts else ""
                 logger.info(
                     f"错误代码上下文区块构建完成: {len(error_context_section)} 字符"
                 )
@@ -452,9 +499,6 @@ class FixAgent:
 
             # 设置目标文件 ID 映射（read_target_file 工具使用）
             self._target_file_map = {i: fp for i, fp in enumerate(tf)} if tf else {}
-
-            # 创建 Agent：run_limit = 目标文件数（每个文件最多读一次完整代码）
-            agent = self._create_agent(run_limit=max(len(tf), 1))
 
             # 构建可读取文件列表（注入 prompt，让 Agent 知道可用的文件 ID）
             target_file_list_section = ""
@@ -474,33 +518,65 @@ class FixAgent:
                 )
                 logger.info(f"目标文件 ID 映射: {self._target_file_map}")
 
-            # 构建目标文件指令
-            force_instruction_content = ""
+            # === 构建目标文件硬约束（注入系统提示词，最高优先级之一） ===
+            target_constraint = ""
             if tf:
+                files_json = '", "'.join(tf)
                 if len(tf) == 1:
-                    file_path = tf[0]
-                    force_instruction_content = f"""1. **唯一修复目标文件：{file_path}**
-   - 你 **只能** 修复这个文件，绝对不允许修改或返回其他任何文件
-   - 在你的JSON响应中，`modified_files`数组 **必须** 只包含["{file_path}"]
-   - 在你的JSON响应中，`code_changes`对象的key **必须** 是"{file_path}"
-2. **只修复上报的错误本身**：不要做安全替代（eval→ast.literal_eval 等）、代码优化、重构。
-   只修改与错误直接相关的代码行，其他代码原样保留。
-"""
+                    target_constraint = (
+                        f"## 🔴 目标文件锁定\n"
+                        f"你只能修改 `{tf[0]}`。\n"
+                        f"`code_changes` 的唯一 key 必须是 `\"{tf[0]}\"`，"
+                        f"`modified_files` 只能是 `[\"{tf[0]}\"]`。\n"
+                        f"返回任何其他文件 = 直接失败。"
+                    )
                 else:
-                    files_str = "、".join(tf)
-                    files_json = '", "'.join(tf)
-                    force_instruction_content = f"""1. **修复目标文件列表：{files_str}**
-   - 你 **只能** 修复列表中的这些文件，绝对不允许修改或返回其他任何文件
-   - 在你的JSON响应中，`modified_files`数组 **必须** 只包含["{files_json}"]
-   - 在你的JSON响应中，`code_changes`对象的key **必须** 是上述列表中的文件路径
-   - **`code_changes` 必须包含列表中的每一个文件**，遗漏任何一个文件都会导致校验失败，消耗一次重试机会
-2. **只修复上报的错误本身**：不要做安全替代（eval→ast.literal_eval 等）、代码优化、重构。
-   只修改与错误直接相关的代码行，其他代码原样保留。
+                    target_constraint = (
+                        f"## 🔴 目标文件锁定\n"
+                        f"你只能修改以下文件：{', '.join(tf)}。\n"
+                        f"`code_changes` 的 key 集合必须恰好是 `[\"{files_json}\"]`，"
+                        f"一个不能多，一个不能少。\n"
+                        f"返回任何其他文件 = 直接失败。"
+                    )
+                logger.info(f"构建目标文件约束: {target_constraint[:200]}...")
 
-🔄 **输出前请确认**：`code_changes` 的 key 集合 = ["{files_json}"]，一个都不能少。"""
-                logger.info(f"构建目标文件指令: {force_instruction_content[:300]}...")
-            else:
-                logger.info("没有找到带文件路径的错误，不添加目标文件指令")
+            # === 构建动态错误类型规则（只注入当前错误类型相关的规则） ===
+            error_types = set()
+            for err in error_locations:
+                et = err.error_type if isinstance(err, ErrorLocation) else err.get("error_type", "")
+                if et:
+                    error_types.add(et)
+
+            dynamic_error_rules = ""
+            rules = []
+            if error_types & {"ModuleNotFoundError", "ImportError"}:
+                rules.append(
+                    "- **导入错误**：只允许修改 import/from 行（增、删、try/except 包裹）。"
+                    "禁止修改函数体、类定义等其他代码。"
+                    "优先用 try/except ImportError 包裹，禁止 pip install。"
+                )
+            if error_types & {"SyntaxError", "IndentationError", "TabError"}:
+                rules.append(
+                    "- **语法错误**：只允许修改错误行及上下各3行。"
+                )
+            if error_types & {"NameError"}:
+                rules.append(
+                    "- **NameError**：只允许添加缺失的 import 或声明变量，修正拼写。"
+                )
+            if error_types & {"TypeError", "ValueError", "AttributeError", "KeyError", "IndexError"}:
+                rules.append(
+                    "- **运行时错误**（TypeError/ValueError/AttributeError/KeyError/IndexError）："
+                    "只允许修改出错的函数/方法体内部，禁止改变函数签名。"
+                )
+            if rules:
+                dynamic_error_rules = "## 错误类型修改边界\n" + "\n".join(rules)
+                logger.info(f"注入动态错误规则，涉及类型: {error_types}")
+
+            # 创建 Agent：run_limit = 目标文件数 * 2（允许重读，应对重试和复杂场景）
+            agent = self._create_agent(
+                run_limit=max(len(tf) * 2, 2),
+                target_constraint=target_constraint,
+            )
 
             # ci_logs 仅记录到 debug 日志，不注入 prompt
             logger.debug(f"ci_logs 长度: {len(ci_logs)}（不注入 prompt，仅 debug）")
@@ -508,18 +584,37 @@ class FixAgent:
             # 错误摘要头（替代 ci_logs 展示）
             error_summary_header = self._build_error_summary_header(error_locations)
 
+            # 构建文件大小约束区块 — 让 LLM 知道原始文件行数，估算修改占比
+            file_size_section = ""
+            if original_codes and tf:
+                size_lines = []
+                for fp in tf:
+                    if fp in original_codes:
+                        line_count = len(original_codes[fp].splitlines())
+                        size_lines.append(f"| {fp} | {line_count} 行 |")
+                if size_lines:
+                    file_size_section = (
+                        "## 📏 目标文件原始大小\n\n"
+                        "| 文件 | 原始行数 |\n|------|----------|\n"
+                        + "\n".join(size_lines)
+                        + f"\n\n**约束**：修复后每个文件的总行数不得超过原始行数的 120%，"
+                        f"且总修改行数（新增+删除）不超过 {self.max_change_lines} 行。"
+                    )
+
             user_input = FIX_AGENT_USER_PROMPT.format(
-                force_instruction_content=force_instruction_content,
+                target_constraint=target_constraint,
+                dynamic_error_rules=dynamic_error_rules,
+                mandatory_instructions=mandatory_instructions or "",
+                file_size_section=file_size_section,
                 error_summary_header=error_summary_header,
                 error_locations=error_locations_json,
-                repo_path=self.repo_path,
                 root_cause_section=root_cause_section,
                 target_file_list_section=target_file_list_section,
                 error_context_section=error_context_section,
                 review_feedback_section=review_feedback_section,
                 test_feedback_section=test_feedback_section,
-                mandatory_instructions=mandatory_section,
-                fix_history_summary=fix_history_summary,
+                previous_changes_section=previous_changes_section,
+                fix_history_section=fix_history_section,
             )
 
             logger.info(f"用户提示词构建完成，长度: {len(user_input)}")
@@ -529,7 +624,6 @@ class FixAgent:
 
             # 获取token用量（遍历所有AIMessage累加，agent循环中每次LLM调用都有独立的token_usage）
             try:
-                from langchain_core.messages import AIMessage as _AIM
                 for msg in result.get("messages", []):
                     if isinstance(msg, _AIM) and hasattr(msg, "response_metadata") and msg.response_metadata:
                         usage = msg.response_metadata.get("token_usage", {})
@@ -691,6 +785,89 @@ class FixAgent:
                         f"修复后代码仍有语法错误（交由validation_gate处理）: "
                         f"{file_path}: {e}"
                     )
+
+            # === 预发行数自纠正 ===
+            # 在返回前检查 diff 行数，超限时注入裁剪指令并重试一次
+            # 不消耗 orchestrator 的 retry_count，让 LLM 在 validation_gate 前自我修正
+            if original_codes and fix_result.get("code_changes") and retry_count == 0:
+                import difflib
+                over_limit_files = []
+                for fp, new_code in fix_result["code_changes"].items():
+                    orig = original_codes.get(fp, "")
+                    if not orig:
+                        continue
+                    diff = list(difflib.unified_diff(
+                        orig.splitlines(keepends=True),
+                        new_code.splitlines(keepends=True),
+                        n=0,
+                    ))
+                    added = sum(1 for l in diff if l.startswith("+") and not l.startswith("+++"))
+                    removed = sum(1 for l in diff if l.startswith("-") and not l.startswith("---"))
+                    total = added + removed
+                    if total > self.max_change_lines:
+                        over_limit_files.append((fp, total, added, removed))
+
+                if over_limit_files:
+                    details = "; ".join(
+                        f"{fp} 变动 {t} 行(+{a}/-{r})"
+                        for fp, t, a, r in over_limit_files
+                    )
+                    logger.warning(f"预发行数检查超限: {details}，执行内部自纠正")
+
+                    # 构建裁剪指令，注入到用户提示词末尾
+                    cutting_instruction = (
+                        "\n\n🚨🚨🚨 预发行数检查失败：你的修复超出了行数上限！🚨🚨🚨\n"
+                        f"超限详情：{details}\n"
+                        f"上限：{self.max_change_lines} 行\n\n"
+                        "你必须立即裁剪：\n"
+                        "1. 只保留对 CI 错误的直接修复\n"
+                        "2. 删除所有额外改进（安全优化、代码风格、类重构等）\n"
+                        "3. 将无关变更回退到原始代码\n"
+                        f"4. 总修改行数必须不超过 {self.max_change_lines} 行\n"
+                    )
+                    corrected_user_input = user_input + cutting_instruction
+
+                    # 重新调用 Agent（复用同一个 agent 实例）
+                    corrected_result = await agent.ainvoke(
+                        {"input": corrected_user_input}, config=config
+                    )
+                    corrected_content = corrected_result["messages"][-1].content
+                    logger.info(f"自纠正响应长度: {len(corrected_content)}")
+
+                    # 解析自纠正响应
+                    json_match2 = _re.search(
+                        r"```json\s*(.*?)\s*```", corrected_content, _re.DOTALL
+                    )
+                    if json_match2:
+                        json_content2 = json_match2.group(1)
+                    else:
+                        json_match2 = _re.search(r"\{.*\}", corrected_content, _re.DOTALL)
+                        json_content2 = json_match2.group(0) if json_match2 else corrected_content
+
+                    fix_result2 = self._parse_json_safely(json_content2)
+                    if fix_result2 and fix_result2.get("code_changes"):
+                        # 合并 token 用量
+                        try:
+                            for msg in corrected_result.get("messages", []):
+                                if isinstance(msg, _AIM) and hasattr(msg, "response_metadata") and msg.response_metadata:
+                                    usage = msg.response_metadata.get("token_usage", {})
+                                    token_usage += usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+                        except Exception:
+                            pass
+                        # 路径规范化
+                        fix_result2["modified_files"] = [
+                            normalize_path(f) for f in fix_result2.get("modified_files", [])
+                        ]
+                        normalized2 = {}
+                        for path, content in fix_result2["code_changes"].items():
+                            normalized2[normalize_path(path)] = content
+                        fix_result2["code_changes"] = normalized2
+
+                        logger.info("自纠正成功，使用修正后的修复结果")
+                        fix_result2["token_usage"] = token_usage
+                        return fix_result2
+                    else:
+                        logger.warning("自纠正未能生成有效修复，回退到原始结果")
 
             fix_result["token_usage"] = token_usage
             return fix_result

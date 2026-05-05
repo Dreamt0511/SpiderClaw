@@ -216,7 +216,11 @@ def _check_change_limit(
     original_codes: dict[str, str],
     max_allowed: int = 50,
 ) -> ValidationResult:
-    """检查总修改行数是否超过上限，防止过度修复"""
+    """检查总修改行数是否超过上限，防止过度修复
+
+    计数时排除非功能性行：空行、纯注释行、docstring 行。
+    避免 LLM 因添加注释/docstring 而被误拦。
+    """
     for fp, new_code in fix_result.get("code_changes", {}).items():
         orig = original_codes.get(fp, "")
         if not orig:
@@ -227,8 +231,8 @@ def _check_change_limit(
             new_code.splitlines(keepends=True),
             n=0,
         ))
-        added = sum(1 for l in diff if l.startswith("+") and not l.startswith("+++"))
-        removed = sum(1 for l in diff if l.startswith("-") and not l.startswith("---"))
+        added = sum(1 for l in diff if l.startswith("+") and not l.startswith("+++") and _is_functional_line(l[1:]))
+        removed = sum(1 for l in diff if l.startswith("-") and not l.startswith("---") and _is_functional_line(l[1:]))
         total = added + removed
 
         if total > max_allowed:
@@ -248,6 +252,24 @@ def _check_change_limit(
             )
 
     return ValidationResult(passed=True)
+
+
+def _is_functional_line(line: str) -> bool:
+    """判断一行是否为功能性代码（非空行、非纯注释、非docstring定界符）"""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    # 纯注释行
+    if stripped.startswith("#"):
+        return False
+    # docstring 定界符行（单独一行的 """ 或 '''）
+    if stripped in ('"""', "'''", '"""', "'''"):
+        return False
+    if stripped.startswith('"""') and stripped.endswith('"""') and len(stripped) <= 6:
+        return False
+    if stripped.startswith("'''") and stripped.endswith("'''") and len(stripped) <= 6:
+        return False
+    return True
 
 
 def _check_file_completeness(

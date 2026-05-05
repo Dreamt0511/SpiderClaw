@@ -1,0 +1,152 @@
+name: CI Check
+
+on:
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+    - name: 拉取代码
+      uses: actions/checkout@v4
+
+    - name: 安装 Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: 安装依赖
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+    # ============================================================
+    # 1. 语法检查（ast.parse 逐文件）
+    # 捕获: SyntaxError, IndentationError, TabError
+    # ============================================================
+    - name: 语法检查
+      id: syntax
+      continue-on-error: true
+      run: |
+        HAS_ERROR=0
+        while IFS= read -r -d '' f; do
+          python - "$f" << 'PYEOF' || HAS_ERROR=1
+        import ast, sys
+
+        filepath = sys.argv[1]
+        with open(filepath) as fh:
+            lines = fh.read().splitlines()
+
+        found = set()
+        while True:
+            try:
+                ast.parse("\n".join(lines))
+                break
+            except SyntaxError as e:
+                if e.lineno is None or e.lineno <= 0:
+                    break
+                key = (filepath, e.lineno)
+                if key in found:
+                    break
+                found.add(key)
+                print(f'  File "{filepath}", line {e.lineno}')
+                if e.text:
+                    print(f'    {e.text.rstrip()}')
+                if e.offset:
+                    print(f'    {" " * (e.offset - 1)}^')
+                print(f'SyntaxError: {e.msg}')
+                # 注释掉出错行，继续检测下一个
+                lines[e.lineno - 1] = f"# <<<SYNTAX_ERROR_{e.lineno}>>>"
+
+        if found:
+            print(f"\n  共发现 {len(found)} 个语法错误")
+            sys.exit(1)
+        PYEOF
+        done < <(find . -name "*.py" -not -path "./.venv/*" -not -path "./.git/*" -print0)
+        exit $HAS_ERROR
+
+    # ============================================================
+    # 2. 运行时检查（逐文件 import + 有 __main__ 则执行）
+    # 捕获: ImportError, ModuleNotFoundError, NameError,
+    #       TypeError, ValueError, AttributeError 等
+    # ============================================================
+    - name: 运行时检查
+      id: runtime
+      timeout-minutes: 5
+      continue-on-error: true
+      run: |
+        HAS_ERROR=0
+        for f in $(find . -name "*.py" -not -path "./.venv/*" -not -path "./.git/*" -not -path "./tests/*" -type f); do
+          echo "::group::检查: $f"
+          
+          # 获取相对于仓库根目录的模块路径
+          MODULE_PATH=$(echo "$f" | sed 's|^\./||' | sed 's|/|.|g' | sed 's|\.py$||')
+          
+          if grep -q 'if __name__ == .__main__.:' "$f" 2>/dev/null; then
+            # 有主入口：直接执行
+            echo "执行: python $f"
+            timeout 20 python "$f" 2>&1 || HAS_ERROR=1
+          else
+            # 无主入口：尝试导入（捕获 ImportError / ModuleNotFoundError / 顶层运行时错误）
+            echo "导入: $MODULE_PATH"
+            timeout 20 python -c "import sys; exec('try: __import__(\"$MODULE_PATH\")\\nexcept Exception as e: print(f\"{type(e).__name__}: {e}\", file=sys.stderr); sys.exit(1)')" 2>&1 || HAS_ERROR=1
+          fi
+          
+          echo "::endgroup::"
+        done
+        exit $HAS_ERROR
+
+    # ============================================================
+    # 3. 运行测试（pytest）
+    # 捕获: 测试失败、AssertionError、未预期异常
+    # ============================================================
+    - name: 运行测试
+      id: test
+      continue-on-error: true
+      run: |
+        echo "::group::收集测试用例"
+        pytest --collect-only -q 2>&1 || true
+        echo "::endgroup::"
+        
+        echo "::group::运行测试"
+        pytest -v --tb=long --showlocals 2>&1
+        PYTEST_EXIT=$?
+        echo "::endgroup::"
+        exit $PYTEST_EXIT
+
+    # ============================================================
+    # 4. 汇总所有错误输出（单一日志块，便于自动修复系统解析）
+    # ============================================================
+    - name: 输出错误汇总
+      if: always()
+      run: |
+        echo "========================================="
+        echo "  CI 错误汇总（供 SpiderClaw 自动修复系统解析）"
+        echo "========================================="
+        
+        if [ "${{ steps.syntax.outcome }}" = "failure" ] || [ "${{ steps.runtime.outcome }}" = "failure" ] || [ "${{ steps.test.outcome }}" = "failure" ]; then
+          echo "语法检查: ${{ steps.syntax.outcome == 'success' && 'PASS' || 'FAIL' }}"
+          echo "运行时检查: ${{ steps.runtime.outcome == 'success' && 'PASS' || 'FAIL' }}"
+          echo "测试: ${{ steps.test.outcome == 'success' && 'PASS' || 'FAIL' }}"
+          echo ""
+          echo "ERRORS_DETECTED=true"
+          exit 1
+        else
+          echo "语法检查: PASS"
+          echo "运行时检查: PASS"
+          echo "测试: PASS"
+          echo ""
+          echo "ERRORS_DETECTED=false"
+          exit 0
+        fi
