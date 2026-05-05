@@ -1211,6 +1211,8 @@ def execute_python_code(file_path: str, timeout: int = 10) -> str:
     在隔离子进程中执行指定的 Python 文件，捕获异常并返回结果。
     用于验证修复后的代码是否能正常运行。
 
+    自动剥离 if __name__ == "__main__" 块，避免测试/演示代码干扰验证。
+
     Args:
         file_path: 要执行的 Python 文件路径（相对于仓库根目录）
         timeout: 执行超时时间（秒），默认 10 秒
@@ -1218,6 +1220,7 @@ def execute_python_code(file_path: str, timeout: int = 10) -> str:
     Returns:
         str: JSON格式的执行结果 {success, exit_code, stdout, stderr, error_type, error_message, error_line}
     """
+    import ast as _ast
     import json
 
     repo_path = get_tool_context().get("repo_path", "")
@@ -1231,9 +1234,32 @@ def execute_python_code(file_path: str, timeout: int = 10) -> str:
     if not os.path.exists(full_path):
         return json.dumps({"success": False, "error_message": f"文件不存在: {file_path}"}, ensure_ascii=False)
 
+    # 读取源码，剥离 if __name__ == "__main__" 块
+    with open(full_path, 'r', encoding='utf-8') as f:
+        source = f.read()
+
+    exec_path = full_path
+    if 'if __name__' in source:
+        try:
+            tree = _ast.parse(source, full_path)
+            if (tree.body and isinstance(tree.body[-1], _ast.If)
+                    and isinstance(tree.body[-1].test, _ast.Compare)
+                    and isinstance(tree.body[-1].test.left, _ast.Name)
+                    and tree.body[-1].test.left.id == '__name__'):
+                # 剥离 __main__ 块，只验证模块级代码
+                tree.body = tree.body[:-1]
+                stripped_source = _ast.unparse(tree)
+                tmp = tempfile.NamedTemporaryFile(
+                    mode='w', suffix='.py', delete=False, encoding='utf-8')
+                tmp.write(stripped_source)
+                tmp.close()
+                exec_path = tmp.name
+        except SyntaxError:
+            pass  # ast.parse 已在前一步检查过，这里不会命中
+
     try:
         result = subprocess.run(
-            ["python", full_path],
+            ["python", exec_path],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -1242,6 +1268,13 @@ def execute_python_code(file_path: str, timeout: int = 10) -> str:
             errors='replace',
             env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         )
+
+        # 清理临时文件
+        if exec_path != full_path:
+            try:
+                os.unlink(exec_path)
+            except OSError:
+                pass
 
         error_type = ""
         error_message = ""

@@ -180,8 +180,8 @@ class RepairOrchestrator:
 
     # ==================== 重试上下文构建 ====================
 
-    @staticmethod
     def _build_retry_context(
+        self,
         state: RepairState,
         rejection_source: str,
         violation_type: str = "",
@@ -210,6 +210,13 @@ class RepairOrchestrator:
                 instruction_kwargs["all_target_files"] = ", ".join(ctx.get("all_target_files", []))
             if violation_type == "syntax_line_violation":
                 instruction_kwargs["target_files"] = ", ".join(state.get("target_files", []))
+            if violation_type == "error_uncovered":
+                uncovered = ctx.get("uncovered_errors", [])
+                instruction_kwargs["uncovered_count"] = len(uncovered)
+                instruction_kwargs["uncovered_list"] = "\n".join(
+                    f"  - {e.get('file_path', '?')}:L{e.get('line_number', 0)} {e.get('error_type', '?')}"
+                    for e in uncovered
+                )
             instruction = generate_instruction(reason, **instruction_kwargs)
             reason_for_history = reason
 
@@ -263,6 +270,14 @@ class RepairOrchestrator:
             "fix_history": state.fix_history + [attempt],
             "mandatory_instructions": instruction,
         }
+
+    # ==================== 重试策略 ====================
+
+    _MAX_TOKEN_BUDGET = 20000
+
+    def _can_retry(self, retry_count: int, max_retries: int, total_token_usage: int) -> bool:
+        """是否允许继续重试：次数未用尽 或 token 预算未耗尽"""
+        return retry_count < max_retries or total_token_usage < self._MAX_TOKEN_BUDGET
 
     # ==================== 节点: collect_context ====================
 
@@ -1044,7 +1059,7 @@ class RepairOrchestrator:
                     f"期望: {expected}, 实际返回: {list(fix_result.get('code_changes', {}).keys())}"
                 )
 
-                if state.get("retry_count", 0) < state.get("max_retries", 3):
+                if self._can_retry(state.get("retry_count", 0), state.get("max_retries", 3), state.get("total_token_usage", 0)):
                     # 回滚后重试，注入强警告
                     repo = Repo(state["repo_path"])
                     repo.git.checkout("--", ".")
@@ -1093,7 +1108,12 @@ class RepairOrchestrator:
 
             if not fix_result.get("code_changes"):
                 return Command(
-                    update={"success": False, "error_message": "修复Agent未能生成有效修复代码", "total_token_usage": total_token},
+                    update={
+                        "success": False,
+                        "error_message": "修复Agent未能生成有效修复代码",
+                        "total_token_usage": total_token,
+                        "is_api_failure": fix_result.get("is_api_failure", False),
+                    },
                     goto="handle_failure",
                 )
 
@@ -1178,7 +1198,7 @@ class RepairOrchestrator:
             },
         )
 
-        if state["retry_count"] < state["max_retries"]:
+        if self._can_retry(state["retry_count"], state["max_retries"], state.get("total_token_usage", 0)):
             audit_logger.log_event("node_exit", node="validation_gate")
             return Command(
                 update={
@@ -1548,6 +1568,17 @@ class RepairOrchestrator:
     async def _handle_failure(self, state: RepairState) -> dict[str, Any]:
         audit_logger.log_event("node_enter", node="handle_failure")
         error_msg = state.get("error_message", "未知错误")
+
+        # API请求失败不视为修复失败，跳过通知/状态记录，让调用方回退到待修复队列
+        if state.get("is_api_failure"):
+            logger.info(f"API请求失败，跳过失败通知和状态记录，等待定时恢复重试: {error_msg}")
+            event = state.event
+            fixing_lock_key = f"__fixing__:{event.service}"
+            async with self.lock:
+                self.processed_events.discard(fixing_lock_key)
+            audit_logger.log_event("node_exit", node="handle_failure")
+            return {"success": False, "is_api_failure": True, "error_message": error_msg}
+
         logger.error(f"修复流程失败: {error_msg}")
 
         # 根据事件源确定目标表名（先在通知前解析，供通知和上报使用）
@@ -1728,13 +1759,13 @@ class RepairOrchestrator:
             return "handle_failure"
 
         if state.get("has_high_risks", False) or risk_level == "HIGH":
-            if retry_count < state.get("max_retries", 3):
+            if self._can_retry(retry_count, state.get("max_retries", 3), state.get("total_token_usage", 0)):
                 logger.info(f"高危风险，重试 ({retry_count}/{state['max_retries']})")
                 return "fix_agent"
             return "create_pr"
 
         if not state.get("review_passed", False):
-            if retry_count < state.get("max_retries", 3):
+            if self._can_retry(retry_count, state.get("max_retries", 3), state.get("total_token_usage", 0)):
                 logger.info(f"审查未通过，重试 ({retry_count}/{state['max_retries']})")
                 return "fix_agent"
             return "handle_failure"
@@ -1767,7 +1798,7 @@ class RepairOrchestrator:
                 logger.info("导入类错误，验证失败是预期的，创建 PR")
                 return "create_pr"
 
-            if state.get("retry_count", 0) < state.get("max_retries", 3):
+            if self._can_retry(state.get("retry_count", 0), state.get("max_retries", 3), state.get("total_token_usage", 0)):
                 logger.info(f"验证失败，重试 ({state.get('retry_count', 0)}/{state['max_retries']})")
                 return "fix_agent"
 
@@ -1777,7 +1808,7 @@ class RepairOrchestrator:
         # 向后兼容：validation_status 为空
         logger.warning("validation_status 为空，回退到旧逻辑")
         if not state.get("test_passed", False):
-            if state.get("retry_count", 0) < state.get("max_retries", 3):
+            if self._can_retry(state.get("retry_count", 0), state.get("max_retries", 3), state.get("total_token_usage", 0)):
                 return "fix_agent"
             return "create_pr"
         return "create_pr"
@@ -1836,6 +1867,7 @@ class RepairOrchestrator:
                 "max_retries": self.max_retries,
                 "max_change_lines": self.max_change_lines,
                 "current_phase": "",
+                "is_api_failure": False,
             }
 
             final_state = await self.graph.ainvoke(initial_state)

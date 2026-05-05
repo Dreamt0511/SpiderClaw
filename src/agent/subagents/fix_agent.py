@@ -787,39 +787,55 @@ class FixAgent:
                     )
 
             # === 预发行数自纠正 ===
-            # 在返回前检查 diff 行数，超限时注入裁剪指令并重试一次
-            # 不消耗 orchestrator 的 retry_count，让 LLM 在 validation_gate 前自我修正
-            if original_codes and fix_result.get("code_changes") and retry_count == 0:
+            # 在返回前检查 diff 行数，超限时循环纠正（最多 3 次）
+            if original_codes and fix_result.get("code_changes"):
                 import difflib
-                over_limit_files = []
-                for fp, new_code in fix_result["code_changes"].items():
-                    orig = original_codes.get(fp, "")
-                    if not orig:
-                        continue
-                    diff = list(difflib.unified_diff(
-                        orig.splitlines(keepends=True),
-                        new_code.splitlines(keepends=True),
-                        n=0,
-                    ))
-                    added = sum(1 for l in diff if l.startswith("+") and not l.startswith("+++"))
-                    removed = sum(1 for l in diff if l.startswith("-") and not l.startswith("---"))
-                    total = added + removed
-                    if total > self.max_change_lines:
-                        over_limit_files.append((fp, total, added, removed))
+                MAX_CORRECT_ATTEMPTS = 3
+                current_result = fix_result
 
-                if over_limit_files:
+                for attempt in range(MAX_CORRECT_ATTEMPTS):
+                    current_changes = current_result.get("code_changes", {})
+                    if not current_changes:
+                        break
+
+                    over_limit_files = []
+                    for fp, new_code in current_changes.items():
+                        orig = original_codes.get(fp, "")
+                        if not orig:
+                            continue
+                        diff = list(difflib.unified_diff(
+                            orig.splitlines(keepends=True),
+                            new_code.splitlines(keepends=True),
+                            n=0,
+                        ))
+                        added = sum(1 for l in diff if l.startswith("+") and not l.startswith("+++"))
+                        removed = sum(1 for l in diff if l.startswith("-") and not l.startswith("---"))
+                        total = added + removed
+                        if total > self.max_change_lines:
+                            over_limit_files.append((fp, total, added, removed))
+
+                    if not over_limit_files:
+                        break  # 达标
+
                     details = "; ".join(
                         f"{fp} 变动 {t} 行(+{a}/-{r})"
                         for fp, t, a, r in over_limit_files
                     )
-                    logger.warning(f"预发行数检查超限: {details}，执行内部自纠正")
 
-                    # 构建裁剪指令，注入到用户提示词末尾
+                    if attempt + 1 >= MAX_CORRECT_ATTEMPTS:
+                        logger.warning(
+                            f"预发行数检查超限（第{attempt+1}/{MAX_CORRECT_ATTEMPTS}次）: {details}，"
+                            "已达最大尝试次数，接受当前结果"
+                        )
+                        break
+
+                    logger.warning(f"预发行数检查超限（第{attempt+1}次）: {details}，执行裁剪")
+
                     cutting_instruction = (
-                        "\n\n🚨🚨🚨 预发行数检查失败：你的修复超出了行数上限！🚨🚨🚨\n"
+                        "\n\n🚨🚨🚨 你的修复超出了行数上限！必须立即裁剪！🚨🚨🚨\n"
                         f"超限详情：{details}\n"
                         f"上限：{self.max_change_lines} 行\n\n"
-                        "你必须立即裁剪：\n"
+                        "你必须严格做到：\n"
                         "1. 只保留对 CI 错误的直接修复\n"
                         "2. 删除所有额外改进（安全优化、代码风格、类重构等）\n"
                         "3. 将无关变更回退到原始代码\n"
@@ -827,14 +843,12 @@ class FixAgent:
                     )
                     corrected_user_input = user_input + cutting_instruction
 
-                    # 重新调用 Agent（复用同一个 agent 实例）
                     corrected_result = await agent.ainvoke(
                         {"input": corrected_user_input}, config=config
                     )
                     corrected_content = corrected_result["messages"][-1].content
                     logger.info(f"自纠正响应长度: {len(corrected_content)}")
 
-                    # 解析自纠正响应
                     json_match2 = _re.search(
                         r"```json\s*(.*?)\s*```", corrected_content, _re.DOTALL
                     )
@@ -844,40 +858,62 @@ class FixAgent:
                         json_match2 = _re.search(r"\{.*\}", corrected_content, _re.DOTALL)
                         json_content2 = json_match2.group(0) if json_match2 else corrected_content
 
-                    fix_result2 = self._parse_json_safely(json_content2)
-                    if fix_result2 and fix_result2.get("code_changes"):
-                        # 合并 token 用量
-                        try:
-                            for msg in corrected_result.get("messages", []):
-                                if isinstance(msg, _AIM) and hasattr(msg, "response_metadata") and msg.response_metadata:
-                                    usage = msg.response_metadata.get("token_usage", {})
-                                    token_usage += usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
-                        except Exception:
-                            pass
-                        # 路径规范化
-                        fix_result2["modified_files"] = [
-                            normalize_path(f) for f in fix_result2.get("modified_files", [])
-                        ]
-                        normalized2 = {}
-                        for path, content in fix_result2["code_changes"].items():
-                            normalized2[normalize_path(path)] = content
-                        fix_result2["code_changes"] = normalized2
+                    corrected = self._parse_json_safely(json_content2)
+                    if not corrected or not corrected.get("code_changes"):
+                        logger.warning(f"自纠正未能生成有效修复（第{attempt+1}次），回退到本次结果")
+                        break
 
-                        logger.info("自纠正成功，使用修正后的修复结果")
-                        fix_result2["token_usage"] = token_usage
-                        return fix_result2
-                    else:
-                        logger.warning("自纠正未能生成有效修复，回退到原始结果")
+                    # 合并 token 用量
+                    try:
+                        for msg in corrected_result.get("messages", []):
+                            if isinstance(msg, _AIM) and hasattr(msg, "response_metadata") and msg.response_metadata:
+                                usage = msg.response_metadata.get("token_usage", {})
+                                token_usage += usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+                    except Exception:
+                        pass
 
-            fix_result["token_usage"] = token_usage
-            return fix_result
+                    corrected["modified_files"] = [
+                        normalize_path(f) for f in corrected.get("modified_files", [])
+                    ]
+                    normalized2 = {}
+                    for path, content in corrected["code_changes"].items():
+                        normalized2[normalize_path(path)] = content
+                    corrected["code_changes"] = normalized2
+
+                    current_result = corrected
+                    # 继续循环检查是否达标
+
+                current_result["token_usage"] = token_usage
+                return current_result
 
         except Exception as e:
             logger.error(f"生成修复失败: {e}", exc_info=True)
+            error_str = str(e)
+            is_api_failure = _is_api_failure(error_str)
+            if is_api_failure:
+                logger.warning(f"检测到API请求失败（非代码错误），将回退到待修复队列: {error_str[:200]}")
             return {
-                "fix_description": f"生成修复失败: {str(e)}",
+                "fix_description": f"生成修复失败: {error_str}",
                 "modified_files": [],
                 "code_changes": {},
-                "error": str(e),
+                "error": error_str,
                 "token_usage": token_usage,
+                "is_api_failure": is_api_failure,
             }
+
+
+def _is_api_failure(error_str: str) -> bool:
+    """判断异常是否由 LLM API 请求失败引起（可重试），而非代码错误"""
+    import re as _re
+    indicators = [
+        r"429", r"RateLimitExceeded", r"TooManyRequests", r"TPMExceeded",
+        r"rate.?limit", r"quota.?exceeded",
+        r"ConnectionError", r"ConnectTimeout", r"ReadTimeout",
+        r"RemoteDisconnected", r"Connection refused",
+        r"ServiceUnavailable", r"503", r"502", r"BadGateway",
+        r"InternalServerError", r"500",
+        r"overloaded", r"server.?error",
+        r"TimedOut", r"timeout", r"TimedOutError",
+        r"TemporaryFailure", r"temporarily unavailable",
+    ]
+    return any(_re.search(pat, error_str, _re.IGNORECASE) for pat in indicators)

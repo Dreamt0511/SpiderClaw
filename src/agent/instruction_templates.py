@@ -83,6 +83,13 @@ INSTRUCTION_TEMPLATES = {
         "如果再次修改非目标文件则修复直接失败。"
     ),
 
+    "error_uncovered": (
+        "🚨 强制性指令：以下 {uncovered_count} 个错误位置的邻近代码未被修改，说明你遗漏了这些修复：\n"
+        "{uncovered_list}\n\n"
+        "这些错误仍然存在，你必须逐一修复。本次修复的 code_changes 必须覆盖上述每一个错误位置。\n"
+        "再次遗漏任何一个则修复直接失败。"
+    ),
+
     # === ValidationGate 其他 ===
     "boundary_violation": (
         "🚨 强制性指令：你的修改超出了允许的范围。"

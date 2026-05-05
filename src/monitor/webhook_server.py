@@ -803,12 +803,18 @@ def run_webhook_server(
 
             try:
                 async with _repair_lock:
-                    await orchestrator.run(merged_event)
+                    result = await orchestrator.run(merged_event)
             except Exception as e:
                 log.error(f"处理合并事件失败: {e}", exc_info=True)
-            finally:
+                result = {"success": False}
+
+            # API请求失败：回退到待修复队列，等待定时恢复重试
+            if result.get("is_api_failure"):
+                log.warning(f"API请求失败，事件回退到待修复队列: {merged_event.event_id}")
+                pending_store.mark_pending(merged_event.event_id)
+            else:
                 pending_store.delete(merged_event.event_id)
-                event_bus.mark_done()
+            event_bus.mark_done()
 
         while True:
             try:
@@ -849,9 +855,15 @@ def run_webhook_server(
                     async def process_and_mark_done(evt=event):
                         try:
                             async with _repair_lock:
-                                await orchestrator.run(evt)
-                        finally:
+                                result = await orchestrator.run(evt)
+                            if result.get("is_api_failure"):
+                                log.warning(f"API请求失败，事件回退到待修复队列: {evt.event_id}")
+                                pending_store.mark_pending(evt.event_id)
+                            else:
+                                pending_store.delete(evt.event_id)
+                        except Exception:
                             pending_store.delete(evt.event_id)
+                        finally:
                             event_bus.mark_done()
 
                     asyncio.create_task(
@@ -1104,6 +1116,39 @@ def run_webhook_server(
             except Exception as e:
                 log.error(f"[定时重试] 异常: {e}", exc_info=True)
 
+    async def _pending_event_recovery_timer():
+        """每 15 分钟检查积压的待修复事件并自动恢复到事件总线
+
+        与启动时 recover_pending_events() 不同：不触发审批，直接恢复所有事件。
+        这确保因 API 限流等原因回退到 pending 队列的事件能自动重试。
+        """
+        TIMER_INTERVAL = 900  # 15 分钟
+        while True:
+            await asyncio.sleep(TIMER_INTERVAL)
+            try:
+                pending_store = get_pending_event_store()
+                pending = pending_store.get_all_pending()
+                if not pending:
+                    continue
+
+                log.info(f"[定时恢复] 发现 {len(pending)} 个待修复事件，恢复到事件总线")
+                for record in pending:
+                    try:
+                        payload = json.loads(record["payload"])
+                        if record["event_type"] == "runtime_log":
+                            event_obj = RuntimeLogEvent(**payload)
+                        else:
+                            event_obj = GitHubEvent(**payload)
+                        await event_bus.publish(event_obj)
+                        log.info(f"[定时恢复] 已恢复事件: {record['event_id']} ({record['source']})")
+                    except Exception as e:
+                        log.error(f"[定时恢复] 恢复事件 {record['event_id']} 失败: {e}")
+                        pending_store.delete(record["event_id"])
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.error(f"[定时恢复] 异常: {e}", exc_info=True)
+
     async def _run():
         def _task_done_callback(task: asyncio.Task):
             """任务结束回调：记录异常或意外退出"""
@@ -1119,6 +1164,7 @@ def run_webhook_server(
         if orchestrator:
             tasks.append(asyncio.create_task(event_consumer(), name="event_consumer"))
             tasks.append(asyncio.create_task(_pending_push_timer(), name="pending_push_timer"))
+            tasks.append(asyncio.create_task(_pending_event_recovery_timer(), name="pending_event_recovery_timer"))
         # 始终启动审批事件监听（WebSocket 客户端），即使没有待处理事件
         approval_task = asyncio.create_task(approval_event_listener(), name="approval_listener")
         approval_task.add_done_callback(_task_done_callback)

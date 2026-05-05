@@ -17,7 +17,7 @@ webhook:
 agent:
   enabled: true                              # 是否启用自动修复功能
   max_retries: 3                              # 最大修复重试次数
-  max_change_lines: 20                        # 最大允许变更行数
+  max_change_lines: 50                        # 最大允许变更行数
   auto_create_pr: true                        # 是否自动创建PR
   require_human_approval: false               # 创建PR前是否需要人工审批
   pending_event_auto_threshold: 5             # 自动恢复待处理事件的数量阈值，超过此数量需人工确认

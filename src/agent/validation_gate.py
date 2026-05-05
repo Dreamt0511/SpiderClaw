@@ -68,6 +68,10 @@ def validate_fix(
     if not result.passed:
         return result
 
+    result = _check_error_coverage(fix_result, original_codes, errors)
+    if not result.passed:
+        return result
+
     result = _check_change_limit(fix_result, original_codes, max_change_lines)
     if not result.passed:
         return result
@@ -211,6 +215,147 @@ def _check_syntax_error(
     return ValidationResult(passed=True)
 
 
+def _check_error_coverage(
+    fix_result: dict,
+    original_codes: dict[str, str],
+    error_locations: list[dict],
+) -> ValidationResult:
+    """逐错误覆盖检查：确保每个错误位置的邻近代码都发生了变更
+
+    当多个错误集中在同一文件时，_check_file_completeness 无法检测
+    LLM 是否遗漏了部分错误。本函数检查每个 error_location 的
+    ±5 行范围内是否有实际代码变更，防止"部分修复"通过验证。
+    """
+    if not error_locations:
+        return ValidationResult(passed=True)
+
+    code_changes = fix_result.get("code_changes", {})
+    if not code_changes:
+        return ValidationResult(passed=True)
+
+    WINDOW = 3
+    uncovered: list[dict] = []
+
+    for err in error_locations:
+        fp = err.get("file_path", "")
+        ln = err.get("line_number", 0)
+        if not fp or ln <= 0 or fp == "<string>":
+            continue
+
+        # 文件未被修改 → 直接标记为遗漏
+        if fp not in code_changes:
+            uncovered.append(err)
+            continue
+
+        orig = original_codes.get(fp, "")
+        new_code = code_changes[fp]
+        if not orig:
+            continue
+
+        orig_lines = orig.splitlines()
+        new_lines = new_code.splitlines()
+
+        # 检查错误行 ±WINDOW 窗口内是否有任何行变更
+        window_start = max(0, ln - WINDOW - 1)  # 0-indexed
+        window_end = min(len(orig_lines), ln + WINDOW)
+
+        changed = False
+        for i in range(window_start, window_end):
+            if i >= len(new_lines):
+                # 行数比原始更少 → 有删除
+                changed = True
+                break
+            if orig_lines[i] != new_lines[i]:
+                changed = True
+                break
+
+        # 检查1：函数开头新增参数校验（错误行在函数内部，函数前几行有新增）
+        if not changed:
+            # 尝试找到错误行所在的函数
+            import ast
+            try:
+                tree = ast.parse(orig)
+                func_node = None
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if node.lineno <= ln <= _get_func_end(node):
+                            func_node = node
+                            break
+                if func_node:
+                    # 函数前10行有变更 → 视为参数校验修改
+                    func_start = func_node.lineno - 1  # 0-indexed
+                    func_window_end = min(func_start + 10, len(orig_lines), ln)
+                    for i in range(func_start, func_window_end):
+                        if i >= len(new_lines) or orig_lines[i] != new_lines[i]:
+                            changed = True
+                            break
+            except SyntaxError:
+                pass
+
+        # 检查2：异常处理逻辑修改（try/except块内的代码变更，即使错误行本身不变）
+        if not changed:
+            # 查找错误行附近的try-except块
+            error_line_idx = ln - 1  # 0-indexed
+            # 向上查找try关键字
+            try_line_idx = -1
+            for i in range(max(0, error_line_idx - 20), error_line_idx):
+                if orig_lines[i].strip().startswith("try:"):
+                    try_line_idx = i
+                    break
+            if try_line_idx != -1:
+                # 向下查找except关键字
+                except_line_idx = -1
+                for i in range(try_line_idx, min(len(orig_lines), error_line_idx + 20)):
+                    if orig_lines[i].strip().startswith("except"):
+                        except_line_idx = i
+                        break
+                if except_line_idx != -1:
+                    # 检查整个try-except块是否有变更
+                    block_end = min(len(orig_lines), except_line_idx + 20)
+                    for i in range(try_line_idx, block_end):
+                        if i >= len(new_lines) or orig_lines[i] != new_lines[i]:
+                            changed = True
+                            break
+
+        # 检查3：新代码比原始多出很多行（新增代码在错误行附近）
+        if not changed and len(new_lines) > len(orig_lines):
+            # 窗口内原始行不变，但新代码在窗口后有新增行
+            for i in range(window_start, min(window_end, len(new_lines))):
+                if i >= len(orig_lines) or (i < len(orig_lines) and new_lines[i] != orig_lines[i]):
+                    changed = True
+                    break
+
+        if not changed:
+            uncovered.append(err)
+
+    if uncovered:
+        summary = "; ".join(
+            f"{e.get('file_path', '?')}:L{e.get('line_number', 0)} {e.get('error_type', '?')}"
+            for e in uncovered
+        )
+        logger.warning(
+            f"错误覆盖检查失败: {len(uncovered)}/{len(error_locations)} 个错误位置无变更"
+        )
+        return ValidationResult(
+            passed=False,
+            violation_type="error_uncovered",
+            details=f"以下 {len(uncovered)} 个错误位置的邻近代码未被修改（遗漏修复）: {summary}",
+            error_context={
+                "uncovered_errors": [
+                    {
+                        "file_path": e.get("file_path", ""),
+                        "line_number": e.get("line_number", 0),
+                        "error_type": e.get("error_type", ""),
+                        "error_message": (e.get("error_message", "") or "")[:80],
+                    }
+                    for e in uncovered
+                ],
+            },
+        )
+
+    return ValidationResult(passed=True)
+
+
 def _check_change_limit(
     fix_result: dict,
     original_codes: dict[str, str],
@@ -218,8 +363,8 @@ def _check_change_limit(
 ) -> ValidationResult:
     """检查总修改行数是否超过上限，防止过度修复
 
-    计数时排除非功能性行：空行、纯注释行、docstring 行。
-    避免 LLM 因添加注释/docstring 而被误拦。
+    计数时排除非功能性行：空行、纯注释行、docstring 行、导入语句行。
+    避免 LLM 因添加注释/docstring/导入语句而被误拦。
     """
     for fp, new_code in fix_result.get("code_changes", {}).items():
         orig = original_codes.get(fp, "")
@@ -231,9 +376,26 @@ def _check_change_limit(
             new_code.splitlines(keepends=True),
             n=0,
         ))
-        added = sum(1 for l in diff if l.startswith("+") and not l.startswith("+++") and _is_functional_line(l[1:]))
-        removed = sum(1 for l in diff if l.startswith("-") and not l.startswith("---") and _is_functional_line(l[1:]))
+
+        # 只统计功能性代码变更，排除非功能性行
+        added = 0
+        removed = 0
+        for l in diff:
+            if l.startswith("+") and not l.startswith("+++"):
+                line_content = l[1:]
+                if _is_functional_line(line_content) and not _is_import_line(line_content):
+                    added += 1
+            elif l.startswith("-") and not l.startswith("---"):
+                line_content = l[1:]
+                if _is_functional_line(line_content) and not _is_import_line(line_content):
+                    removed += 1
+
         total = added + removed
+
+        # 小文件修复（<100行）允许超出限制20%
+        orig_line_count = len(orig.splitlines())
+        if orig_line_count < 100:
+            max_allowed = int(max_allowed * 1.2)
 
         if total > max_allowed:
             logger.warning(
