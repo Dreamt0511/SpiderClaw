@@ -150,7 +150,7 @@ collect_context → fix_agent → validation_gate → review_changes → run_tes
 
 ### 2.2 飞书生态深度融合
 
-SpiderClaw 是目前唯一完整对接飞书全生态（消息通知 + 多维表格 + 审批流程 + WebSocket 长连接 + IM 命令交互）的自动修复平台。
+SpiderClaw是一个完整对接飞书全生态（消息通知 + 多维表格 + 审批流程 + WebSocket 长连接 + IM 命令交互）的自动化修复系统。
 
 #### 2.2.1 飞书消息通知
 
@@ -476,11 +476,11 @@ SUPERSEDED (版本变更，记录过期)
 ## 快速开始
 
 ### 环境要求
-- Python 3.10+
+- Python 3.12+
 - Node.js 16+（飞书 CLI 依赖）
 - GitHub API Token
 - OpenAI / Claude API Key
-- 飞书企业应用
+- 飞书应用
 
 ### 安装部署
 
@@ -557,14 +557,95 @@ spiderclaw init-sidecar -n my-service --log-path /var/log/app/app.log
 pytest tests/ -v
 pytest tests/ -v --asyncio-mode=auto
 
-# 代码检查
-pylint src/
-bandit -r src/
+#测试注册服务，直接用你的仓库比如AutoFix_Test_rep的最新 commit：
+spiderclaw sync -n order-service -v main
 
 # Webhook 调试
 ngrok http 8000
 # 公网地址: https://xxxx.ngrok-free.app/webhook/github
 ```
+
+# Docker 双容器测试环境命令参考
+
+```bash
+cd "D:\U 盘\SpiderClaw"
+
+# ── 查看运行状态 ──
+docker ps
+
+# ── 首次构建 ──
+docker compose up -d --build                        # 构建两个镜像并后台启动
+
+# ── 日常启动/关闭 ──
+docker compose up -d                                # 启动（不重建）
+docker compose down                                 # 停止并删除容器
+docker compose restart                              # 重启所有服务
+docker compose restart spiderclaw                 # 只重启 spiderclaw
+docker compose restart biz-server                   # 只重启 biz-server
+
+# ── 查看日志 ──
+docker logs -f spiderclaw-agent                     # spiderclaw 实时日志（干净，无 TUI）
+docker logs -f biz-server                           # biz-server 实时日志
+docker logs --tail 50 spiderclaw-agent              # 最近 50 行
+
+# ── 仪表盘（TUI）──
+docker exec -it spiderclaw-agent spiderclaw         # 新终端进入仪表盘
+
+docker exec -it -e TERM=xterm-256color spiderclaw-agent spiderclaw   #防止闪屏的指令，运行时加上终端环境变量，临时测试用（不建议运行在poweshell中，在vscode的终端不会闪屏）
+# 退出仪表盘：按 Ctrl+c 或 Ctrl+q
+
+
+=============一行重启查看spiderclaw查看日志===============
+
+docker compose down; docker compose up -d; docker logs -f spiderclaw-agent
+
+=============一行重启查看spiderclaw查看日志===============
+#可以去用这个仓库进行测试，需要测试自己代码的话，替换main.py为自己的代码即可。
+https://github.com/Dreamt0511/AutoFix_Test_rep
+
+  # ── 手动触发测试，全部测试文件 ──
+  docker exec -it biz-server bash -c "cd /opt/biz-app && /opt/agent-sidecar/collector.sh exec python3 -m pytest app/src/tests/ -v --tb=long"
+
+  # ── 测试 test_user_service.py 文件 ──
+  docker exec -it biz-server bash -c "cd /opt/biz-app && /opt/agent-sidecar/collector.sh exec python3 -m pytest app/src/tests/test_user_service.py -v --tb=long"
+
+  # ── 测试 test_calculator.py 文件 ──
+  docker exec -it biz-server bash -c "cd /opt/biz-app && /opt/agent-sidecar/collector.sh exec python3 -m pytest app/src/tests/test_calculator.py -v --tb=long"
+
+# ── 测试 main.py 文件 ──
+  docker exec -it biz-server bash -c "cd /opt/biz-app && /opt/agent-sidecar/collector.sh exec python3 app/src/main.py"
+
+# ── 测试 小米写的脚本.py 文件 ──
+  docker exec -it biz-server bash -c "cd /opt/biz-app && /opt/agent-sidecar/collector.sh exec python3 app/小米写的脚本.py"
+
+
+# ── 进入容器调试 ──
+docker exec -it spiderclaw-agent bash               # 进 spiderclaw 容器
+docker exec -it biz-server bash                     # 进 biz-server 容器
+
+# ── 改了代码后 ──
+docker compose restart                              # 改了 src/ 或 app/ 代码
+
+# ── 改了依赖后 ──
+docker compose up -d --build                        # 改了 requirements.txt 或 pyproject.toml
+
+# ── 只重建单个服务 ──
+docker compose up -d --build spiderclaw             # 只重建 spiderclaw
+docker compose up -d --build biz-server             # 只重建 biz-server
+
+# ── 彻底重来 ──
+docker compose down -v                              # 停止 + 删除容器和数据卷
+docker compose up -d --build                        # 重新构建
+```
+
+## 说明
+
+- spiderclaw 容器默认以 `--no-dashboard` 模式运行，`docker logs` 输出干净
+- 仪表盘需另开终端通过 `docker exec -it spiderclaw-agent spiderclaw` 查看
+- `src/` 和 `app/` 代码改动只需 `restart`，无需重建镜像
+- 依赖变更（requirements.txt / pyproject.toml）需要 `--build` 重建
+
+
 
 ---
 
@@ -573,7 +654,7 @@ ngrok http 8000
 - [ ] 扩展 Java/Go/JavaScript 多语言支持
 - [ ] 接入 Sentry / Prometheus 等告警事件源
 - [ ] 基于修复历史数据的 Fine-tuning 提升特定场景准确率
-- [ ] 飞书群组机器人交互增强（主动查询修复历史/统计）
+- [ ] 优化项目细节，当前项目仍处于早期阶段，存在一些未完善的功能和性能问题等。
 
 ---
 
@@ -583,4 +664,4 @@ MIT License
 
 ---
 
-**SpiderClaw 不只是自动修 Bug 的工具，它重新定义了研发团队与代码错误的关系：让 AI 承担重复性的排障工作，人专注于真正需要创造力的决策。**
+**SpiderClaw 不只是自动修 Bug 的工具，它还重新定义了研发团队与代码错误的关系：让 AI 承担重复性的排障工作，人专注于真正需要创造力的决策。**
