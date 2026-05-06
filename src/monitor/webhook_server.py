@@ -657,8 +657,11 @@ def run_webhook_server(
 
     # 更新状态的启动时间，确保运行时长正确
     if dashboard_state:
-        # 带仪表盘模式：使用传入的dashboard_state
+        # 带仪表盘模式：使用传入的dashboard_state，并同步为全局单例
+        from src.monitor.dashboard.global_state import get_global_dashboard_state, set_global_dashboard_state
         dashboard_state.start_time = monitor.start_time
+        set_global_dashboard_state(dashboard_state)
+        log.info("[webhook] 仪表盘状态已同步到全局单例")
     else:
         # 无仪表盘模式：使用全局状态，并启动AuditReader更新统计数据
         from src.monitor.dashboard.global_state import get_global_dashboard_state

@@ -38,30 +38,33 @@ def compute_traceback_fingerprint(traceback_text: str) -> str:
 
     策略：
     1. 排除 site-packages/、lib/python 等框架代码行
-    2. 提取第一个应用文件名（不含路径、不含行号）
+    2. 提取应用代码调用链（文件名:函数名，不含行号）
     3. 提取异常类型（如 ValueError）
     4. 提取错误消息前 50 字符
     5. 拼接后 MD5 取前 12 位
+
+    相较之前仅用第一个文件名，现在加入调用链上下文后，
+    同一文件不同代码路径的错误会产生不同的指纹，
+    减少误判重复。
     """
     if not traceback_text:
         return ""
 
     lines = traceback_text.splitlines()
 
-    # 过滤掉框架代码行
-    app_lines = [
-        ln for ln in lines
-        if not any(fw in ln for fw in _FRAMEWORK_PATHS)
-    ]
-
-    # 提取第一个应用文件名
-    app_file = ""
-    for ln in app_lines:
-        m = re.search(r'File "([^"]+)"', ln)
+    # 提取应用代码调用帧（文件, 函数名），排除框架代码
+    app_frames = []
+    for ln in lines:
+        m = re.search(r'File "([^"]+)", line \d+(?:, in (\S+))?', ln)
         if m:
             full_path = m.group(1)
-            app_file = full_path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-            break
+            func_name = m.group(2) or ""
+            if not any(fw in full_path for fw in _FRAMEWORK_PATHS):
+                file_name = full_path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                app_frames.append(f"{file_name}:{func_name}" if func_name else file_name)
+
+    # 取最后 3 个应用帧（最接近错误发生位置的调用链）
+    call_chain = " -> ".join(app_frames[-3:])
 
     # 提取异常类型
     error_type = ""
@@ -83,11 +86,11 @@ def compute_traceback_fingerprint(traceback_text: str) -> str:
                 error_msg = stripped.split(":", 1)[1].strip()[:50]
                 break
 
-    if not error_type and not app_file:
+    if not error_type and not call_chain:
         # 无法提取特征，用原始内容的前 200 字符
         key = traceback_text[:200]
     else:
-        key = f"{error_type}:{app_file}:{error_msg}"
+        key = f"{error_type}:{call_chain}:{error_msg}"
 
     return hashlib.md5(key.encode("utf-8")).hexdigest()[:12]
 

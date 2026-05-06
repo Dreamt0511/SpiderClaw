@@ -7,6 +7,8 @@ import os
 import re
 from typing import Any
 
+import httpx
+
 from git import Repo
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Command
@@ -35,6 +37,7 @@ from src.utils.audit import audit_logger
 from src.utils.path_mapping import apply_path_mapping
 from src.utils.version_manager import ensure_repo_with_version
 from src.config.service_registry import get_service_registry
+from src.monitor.dashboard.global_state import get_global_dashboard_state
 
 logger = logging.getLogger(__name__)
 
@@ -279,6 +282,19 @@ class RepairOrchestrator:
         """是否允许继续重试：次数未用尽 或 token 预算未耗尽"""
         return retry_count < max_retries or total_token_usage < self._MAX_TOKEN_BUDGET
 
+    def _sync_global_stats(self, total_tokens: int = 0, total_errors: int = 0):
+        """同步统计数据到全局 DashboardState（无仪表盘模式也生效）"""
+        try:
+            state = get_global_dashboard_state()
+            with state.atomic():
+                if total_tokens > state.total_tokens:
+                    state.total_tokens = total_tokens
+                if total_errors > state.total_errors:
+                    state.total_errors = total_errors
+            state.signal_refresh()
+        except Exception:
+            pass
+
     # ==================== 节点: collect_context ====================
 
     async def _collect_context(self, state: RepairState) -> dict[str, Any]:
@@ -375,6 +391,30 @@ class RepairOrchestrator:
                 async with self.lock:
                     self.processed_events.discard(event_key)
                 return {"success": False, "error_message": "过滤后没有有效错误"}
+
+            # 4.5 PR变更文件范围过滤：只修复当前PR实际改动文件中的错误（不影响web服务日志流程）
+            if event.pr_number and isinstance(event, GitHubEvent):
+                try:
+                    changed_files = await self._fetch_pr_changed_files(event.repository, event.pr_number)
+                    if changed_files:
+                        changed_set = set(changed_files)
+                        before = len(error_locations)
+                        error_locations = [
+                            err for err in error_locations
+                            if err.file_path in changed_set
+                        ]
+                        filtered = before - len(error_locations)
+                        if filtered:
+                            logger.info(
+                                f"PR #{event.pr_number} 变更文件过滤: 移除 {filtered} 个无关错误 "
+                                f"({before} → {len(error_locations)})"
+                            )
+                        if not error_locations:
+                            async with self.lock:
+                                self.processed_events.discard(event_key)
+                            return {"success": False, "error_message": "PR变更文件范围过滤后无有效错误"}
+                except Exception as e:
+                    logger.warning(f"获取PR #{event.pr_number} 变更文件失败（降级为全量修复）: {e}")
 
             # 5. 错误分类处理
             classification = self._classify_errors(error_locations, repo_path, ci_logs)
@@ -645,6 +685,29 @@ class RepairOrchestrator:
         if head_sha:
             return f"{event.repository}:sha:{head_sha}"
         return f"{event.repository}:event:{event.event_id}"
+
+    async def _fetch_pr_changed_files(self, repo_full_name: str, pr_number: int) -> list[str]:
+        """获取 PR 中变更的文件列表（用于过滤无关错误）"""
+        url = f"https://api.github.com/repos/{repo_full_name}/pulls/{pr_number}/files"
+        headers = {
+            "Authorization": f"Bearer {self.github_token}",
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "SpiderClaw",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(url, headers=headers)
+                resp.raise_for_status()
+                files = resp.json()
+                changed = [f["filename"] for f in files]
+                logger.info(
+                    f"PR #{pr_number} 变更文件: {len(changed)} 个, "
+                    f"{changed[:10]}{'...' if len(changed) > 10 else ''}"
+                )
+                return changed
+        except Exception as e:
+            logger.warning(f"获取 PR #{pr_number} 变更文件失败: {e}")
+            return []
 
     @staticmethod
     def _filter_valid_errors(error_locations: list[dict], repo_path: str, path_mapping: dict = None) -> list[ErrorLocation]:
@@ -1042,6 +1105,7 @@ class RepairOrchestrator:
             total_token = state.get("total_token_usage", 0) + token_usage
             if token_usage > 0:
                 logger.debug(f"修复Agent调用消耗token: {token_usage}，累计: {total_token}")
+            self._sync_global_stats(total_tokens=total_token)
 
             # 环境错误 → 直接结束
             if fix_result.get("is_env_error", False):
@@ -1244,6 +1308,7 @@ class RepairOrchestrator:
             total_token = state.get("total_token_usage", 0) + review_token
             if review_token > 0:
                 logger.debug(f"审查Agent消耗token: {review_token}，累计: {total_token}")
+            self._sync_global_stats(total_tokens=total_token)
 
             # 如果 Phase 2 安全修复生成了新的 code_changes，写入文件
             if review_result.get("security_fixes_applied") and review_result.get("code_changes"):
@@ -1552,6 +1617,18 @@ class RepairOrchestrator:
                 except Exception as e:
                     logger.error(f"状态机 pending_deploy 写入失败: {e}")
 
+                # 同步成功修复到 DashboardState
+                try:
+                    gs = get_global_dashboard_state()
+                    with gs.atomic():
+                        gs.total_repair_success += 1
+                        token_val = state.get("total_token_usage", 0)
+                        if token_val > gs.total_tokens:
+                            gs.total_tokens = token_val
+                    gs.signal_refresh()
+                except Exception:
+                    pass
+
                 return {"pr_url": pr_url, "pr_number": pr_number, "success": True, "diff_content": real_diff}
             else:
                 return {"success": False, "error_message": pr_url}
@@ -1736,6 +1813,16 @@ class RepairOrchestrator:
                 async with self.lock:
                     self.processed_events.discard(fixing_lock_key)
             audit_logger.log_event("node_exit", node="handle_failure")
+
+        # 同步失败修复到 DashboardState（排除 is_api_failure，已在前面提前返回）
+        try:
+            gs = get_global_dashboard_state()
+            with gs.atomic():
+                gs.total_repair_failures += 1
+                gs.total_errors += 1
+            gs.signal_refresh()
+        except Exception:
+            pass
 
         return {"success": False, "error_message": error_msg}
 

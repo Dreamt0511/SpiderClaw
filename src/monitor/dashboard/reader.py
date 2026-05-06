@@ -48,13 +48,20 @@ class AuditReader:
     # ── audit.jsonl 审计事件 ──
 
     def _tail_audit(self):
+        # 记录启动时的文件大小（0 表示文件还不存在），
+        # 之后 seek 到该位置，避免遗漏文件创建后写入的前几条事件
+        try:
+            start_pos = self.log_path.stat().st_size
+        except OSError:
+            start_pos = 0
+
         while self._running and not self.log_path.exists():
             time.sleep(0.5)
         if not self._running:
             return
 
         with open(self.log_path, "r", encoding="utf-8") as f:
-            f.seek(0, 2)
+            f.seek(start_pos)
             while self._running:
                 line = f.readline()
                 if not line:
@@ -180,14 +187,7 @@ class AuditReader:
                 "duration": None,
             })
             entry["summary"] = friendly
-            # 修复流程完结时统计成功/失败次数
-            if node == "repair_complete":
-                if data.get("success"):
-                    with self.state.atomic():
-                        self.state.total_repair_success += 1
-                else:
-                    with self.state.atomic():
-                        self.state.total_repair_failures += 1
+            # 修复流程完结 — 不在此处计数（orchestrator 直接更新 state，避免 double-counting）
 
     # ── spiderclaw.log 应用日志 ──
 
