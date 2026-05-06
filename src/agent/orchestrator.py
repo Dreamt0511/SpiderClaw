@@ -1429,7 +1429,10 @@ class RepairOrchestrator:
             if not pr_url.startswith("Error:"):
                 pr_number = int(pr_url.split("/")[-1]) if pr_url else 0
                 # 根据事件源确定目标表名（先在通知前解析，供通知和上报使用）
-                table_name = self.SOURCE_TABLE_MAP.get(event.source, f"{event.service}-修复表")
+                if event.source in self.SOURCE_TABLE_MAP:
+                    table_name = self.SOURCE_TABLE_MAP[event.source]
+                else:
+                    table_name = f"{event.service}-修复表"
 
                 # 提前缓存表ID，确保通知中的链接包含 ?table= 参数
                 await ensure_table_ready(table_name)
@@ -1557,10 +1560,11 @@ class RepairOrchestrator:
             logger.error(f"创建PR失败: {e}", exc_info=True)
             return {"success": False, "error_message": f"创建PR失败: {str(e)}"}
         finally:
-            # 释放服务级别修复锁
-            fixing_lock_key = f"__fixing__:{event.service}"
-            async with self.lock:
-                self.processed_events.discard(fixing_lock_key)
+            # 释放服务级别修复锁（仅运行时日志事件有service字段）
+            if hasattr(event, "service") and event.service:
+                fixing_lock_key = f"__fixing__:{event.service}"
+                async with self.lock:
+                    self.processed_events.discard(fixing_lock_key)
             audit_logger.log_event("node_exit", node="create_pr")
 
     # ==================== 节点: handle_failure ====================
@@ -1573,9 +1577,11 @@ class RepairOrchestrator:
         if state.get("is_api_failure"):
             logger.info(f"API请求失败，跳过失败通知和状态记录，等待定时恢复重试: {error_msg}")
             event = state.event
-            fixing_lock_key = f"__fixing__:{event.service}"
-            async with self.lock:
-                self.processed_events.discard(fixing_lock_key)
+            # 释放服务级别修复锁（仅运行时日志事件有service字段）
+            if hasattr(event, "service") and event.service:
+                fixing_lock_key = f"__fixing__:{event.service}"
+                async with self.lock:
+                    self.processed_events.discard(fixing_lock_key)
             audit_logger.log_event("node_exit", node="handle_failure")
             return {"success": False, "is_api_failure": True, "error_message": error_msg}
 
@@ -1583,7 +1589,10 @@ class RepairOrchestrator:
 
         # 根据事件源确定目标表名（先在通知前解析，供通知和上报使用）
         event = state.event
-        table_name = self.SOURCE_TABLE_MAP.get(event.source, f"{event.service}-修复表")
+        if event.source in self.SOURCE_TABLE_MAP:
+            table_name = self.SOURCE_TABLE_MAP[event.source]
+        else:
+            table_name = f"{event.service}-修复表"
 
         # 提前缓存表ID，确保通知中的链接包含 ?table= 参数
         await ensure_table_ready(table_name)
@@ -1721,10 +1730,11 @@ class RepairOrchestrator:
             logger.error(f"状态机 failed 写入失败: {e}")
 
         finally:
-            # 释放服务级别修复锁
-            fixing_lock_key = f"__fixing__:{event.service}"
-            async with self.lock:
-                self.processed_events.discard(fixing_lock_key)
+            # 释放服务级别修复锁（仅运行时日志事件有service字段）
+            if hasattr(event, "service") and event.service:
+                fixing_lock_key = f"__fixing__:{event.service}"
+                async with self.lock:
+                    self.processed_events.discard(fixing_lock_key)
             audit_logger.log_event("node_exit", node="handle_failure")
 
         return {"success": False, "error_message": error_msg}
