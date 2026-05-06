@@ -112,6 +112,13 @@ case "$SCENARIO" in
             echo "(请确认容器内端口 9000 已映射)"
         ;;
 
+    # 只运行自定义测试（main.py）
+    main)
+        echo "执行自定义测试: src/main.py..."
+        docker exec biz-server bash /opt/agent-sidecar/collector.sh exec \
+            python3 /opt/biz-app/app/src/main.py
+        ;;
+
     # 直接使用 collector 的 exec 模式运行 pytest
     pytest)
         echo "通过 collector 运行 pytest 测试（会触发所有 bug）..."
@@ -125,10 +132,11 @@ case "$SCENARIO" in
         ;;
 
     *)
-        echo "用法: $0 [场景名|continuous|web|pytest]"
+        echo "用法: $0 [场景名|continuous|web|main|pytest]"
         echo ""
         echo "场景:"
         echo "  all                    — 依次触发所有错误（默认）"
+        echo "  main                   — 只运行 src/main.py 自定义测试"
         echo "  continuous [间隔]      — 持续模式，每 N 秒触发一次"
         echo "  web                    — 启动 HTTP 接口，通过 curl 控制"
         echo "  pytest                 — 运行 pytest 测试触发错误"

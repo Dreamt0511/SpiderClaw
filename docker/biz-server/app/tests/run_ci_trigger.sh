@@ -28,7 +28,7 @@ run_test() {
     cd "$APP_DIR"
     python3 -m src.service_simulator \
         --mode single \
-        --trigger "$scenario"
+        --trigger "$scenario" || true
 
     # 等待 collector 处理并上报
     sleep 3
@@ -45,6 +45,16 @@ case "$SCENARIO" in
         run_test "user_not_found"
         run_test "delete_nonexistent_user"
         run_test "chain_reaction"
+
+        # 执行自定义测试（main.py）
+        echo ""
+        echo "=========================================="
+        echo "  执行自定义测试: src/main.py"
+        echo "=========================================="
+        cd "$APP_DIR"
+        python3 -m src.main || true
+        sleep 3
+
         echo ""
         echo "所有场景已触发完毕。"
         echo "查看 Agent 日志: docker logs spiderclaw-agent -f"

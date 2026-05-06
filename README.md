@@ -534,18 +534,31 @@ agent:
   max_change_lines: 50
 ```
 
-### 注册生产服务
+### 生产服务部署流程
 
 ```bash
-# 交互式注册
+# 1. 生成 Sidecar 采集模板（collector.sh + agent-mapping.conf）
+spiderclaw init-sidecar -o ./sidecar
+
+# 2. 注册服务到 services.yaml（交互式填写 repo_url、path_mapping 等）
 spiderclaw config  # 选择 "服务注册"
 
-# 或手动编辑 src/config/services.yaml
-# 同步代码到指定版本
-spiderclaw sync -n order-service -v abc1234
+# 3. 同步服务代码到指定版本
+spiderclaw sync -n <服务名> -v <版本号>
 
-# 生成 Sidecar 采集脚本
-spiderclaw init-sidecar -n my-service --log-path /var/log/app/app.log
+# 4. 确认 path_mapping 正确（在 services.yaml 中编辑，可选）
+#    容器路径 → 仓库路径映射，例如 /app/ → src/ 表示容器 /app/main.py
+#    对应仓库 src/main.py
+```
+
+**部署流程说明**：每个需要监控的业务服务容器中，都需部署 `collector.sh` + `agent-mapping.conf`。服务上线时按上述步骤在 SpiderClaw 端注册后，collector 上报的日志就能通过 `services.yaml` 中的 `path_mapping` 正确定位到代码仓库中的文件，实现自动化根因分析和修复。
+
+**`agent-mapping.conf` 配置示例**：
+```bash
+SERVICE_NAME="order-service"    # 与 services.yaml 中的服务名对应
+SERVICE_VERSION="main"
+LOG_PATH="/var/log/app/app.log" # 业务应用的日志路径
+AGENT_URL="http://spiderclaw:8000/webhook/log"  # SpiderClaw 服务地址
 ```
 
 ---
@@ -565,85 +578,310 @@ ngrok http 8000
 # 公网地址: https://xxxx.ngrok-free.app/webhook/github
 ```
 
-# Docker 双容器测试环境命令参考
+---
+
+## Docker 双容器测试环境
+
+SpiderClaw 提供双容器 Docker 测试环境，用于在不影响生产的情况下验证自动修复流程。
+
+### 架构概览
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         docker-compose.yml                          │
+│                                                                     │
+│  ┌──────────────────────────┐    ┌──────────────────────────────┐   │
+│  │     spiderclaw-agent     │    │         biz-server           │   │
+│  │  (AutoFix 核心引擎)       │    │     (业务服务模拟器)          │   │
+│  │                          │    │                              │   │
+│  │  ┌────────────────────┐  │    │  ┌────────────────────────┐  │   │
+│  │  │  FastAPI Webhook   │◀─┼────┼──│ collector.sh 采集脚本  │  │   │
+│  │  │  /webhook/github   │  │    │  │ (tail -F 监控日志文件)  │  │   │
+│  │  │  /webhook/log      │──┼────┼─▶│                        │  │   │
+│  │  └────────────────────┘  │    │  └──────────┬─────────────┘  │   │
+│  │         │                │    │             │                 │   │
+│  │  ┌──────▼───────┐       │    │  ┌──────────▼─────────────┐  │   │
+│  │  │  EventBus    │       │    │  │  service_simulator.py  │  │   │
+│  │  │  队列(10000)  │       │    │  │  (模拟业务操作+触发bug) │  │   │
+│  │  └──────┬───────┘       │    │  └────────────────────────┘  │   │
+│  │         │                │    │                              │   │
+│  │  ┌──────▼───────┐       │    │  ┌────────────────────────┐  │   │
+│  │  │  RepairOrch  │       │    │  │  AutoFix_Test_rep      │  │   │
+│  │  │  (自动修复)   │       │    │  │  (源码卷挂载)           │  │   │
+│  │  └──────────────┘       │    │  └────────────────────────┘  │   │
+│  └──────────────────────────┘    └──────────────────────────────┘   │
+│                                                                     │
+│  主机 data/ 目录 (持久化):                                           │
+│    data/repair_records.db  ← SQLite 修复记录数据库                   │
+│    data/repos/             ← 克隆的代码仓库                         │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 容器说明
+
+| 容器 | 镜像源 | 角色 | 关键挂载 |
+|------|--------|------|----------|
+| `spiderclaw-agent` | `Dockerfile` (项目根目录) | AutoFix 核心引擎：接收事件 → 分析 → 修复 → 提PR | `./src:/app/src` (代码热更新), `./data:/app/data` (数据库+仓库) |
+| `biz-server` | `docker/biz-server/Dockerfile` | 业务服务模拟器：产生错误日志，测试采集链路 | `AutoFix_Test_rep:/opt/biz-app/app` (源码) |
+
+#### 数据流说明
+
+1. **biz-server** 内的 `service_simulator.py` 执行带 bug 的操作，产生 Python 异常日志写入 `/var/log/app/app.log`
+2. **collector.sh** 通过 `tail -F` 监控日志文件，匹配到 ERROR/Traceback 关键词后收集上下文
+3. 采集到的错误通过 HTTP POST 发送到 `spiderclaw-agent` 的 `/webhook/log` 端点
+4. **spiderclaw-agent** 接收到错误后，经过 5 秒缓冲窗口（合并同服务多个错误）→ 事件总线 → 修复编排器
+5. 修复完成后自动创建 GitHub PR，并通过飞书通知开发者
+
+### 启动与重启
 
 ```bash
 cd "D:\U 盘\SpiderClaw"
 
-# ── 查看运行状态 ──
-docker ps
+# 首次构建（构建两个镜像并后台启动）
+docker compose up -d --build
 
-# ── 首次构建 ──
-docker compose up -d --build                        # 构建两个镜像并后台启动
+# 日常启动
+docker compose up -d
 
-# ── 日常启动/关闭 ──
-docker compose up -d                                # 启动（不重建）
-docker compose down                                 # 停止并删除容器
-docker compose restart                              # 重启所有服务
-docker compose restart spiderclaw                 # 只重启 spiderclaw
-docker compose restart biz-server                   # 只重启 biz-server
+# 重启（改了 src/ 代码后只需 restart，无需重建）
+docker compose restart
+docker compose restart spiderclaw     # 只重启 spiderclaw
+docker compose restart biz-server     # 只重启 biz-server
 
-# ── 查看日志 ──
-docker logs -f spiderclaw-agent                     # spiderclaw 实时日志（干净，无 TUI）
-docker logs -f biz-server                           # biz-server 实时日志
-docker logs --tail 50 spiderclaw-agent              # 最近 50 行
+# 修改了依赖（requirements.txt / pyproject.toml）后需要重建
+docker compose up -d --build
+docker compose up -d --build spiderclaw   # 只重建 spiderclaw
+docker compose up -d --build biz-server   # 只重建 biz-server
 
-# ── 仪表盘（TUI）──
-docker exec -it spiderclaw-agent spiderclaw         # 新终端进入仪表盘
+# 停止
+docker compose down
+docker compose down -v     # 停止 + 删除数据卷
 
-docker exec -it -e TERM=xterm-256color spiderclaw-agent spiderclaw   #防止闪屏的指令，运行时加上终端环境变量，临时测试用（不建议运行在poweshell中，在vscode的终端不会闪屏）
-# 退出仪表盘：按 Ctrl+c 或 Ctrl+q
-
-
-=============一行重启查看spiderclaw查看日志===============
-
+# 彻底重启（一行命令）
 docker compose down; docker compose up -d; docker logs -f spiderclaw-agent
-
-=============一行重启查看spiderclaw查看日志===============
-#可以去用这个仓库进行测试，需要测试自己代码的话，替换main.py为自己的代码即可。
-https://github.com/Dreamt0511/AutoFix_Test_rep
-
-  # ── 手动触发测试，全部测试文件 ──
-  docker exec -it biz-server bash -c "cd /opt/biz-app && /opt/agent-sidecar/collector.sh exec python3 -m pytest app/src/tests/ -v --tb=long"
-
-  # ── 测试 test_user_service.py 文件 ──
-  docker exec -it biz-server bash -c "cd /opt/biz-app && /opt/agent-sidecar/collector.sh exec python3 -m pytest app/src/tests/test_user_service.py -v --tb=long"
-
-  # ── 测试 test_calculator.py 文件 ──
-  docker exec -it biz-server bash -c "cd /opt/biz-app && /opt/agent-sidecar/collector.sh exec python3 -m pytest app/src/tests/test_calculator.py -v --tb=long"
-
-# ── 测试 main.py 文件 ──
-  docker exec -it biz-server bash -c "cd /opt/biz-app && /opt/agent-sidecar/collector.sh exec python3 app/src/main.py"
-
-# ── 测试 小米写的脚本.py 文件 ──
-  docker exec -it biz-server bash -c "cd /opt/biz-app && /opt/agent-sidecar/collector.sh exec python3 app/小米写的脚本.py"
-
-
-# ── 进入容器调试 ──
-docker exec -it spiderclaw-agent bash               # 进 spiderclaw 容器
-docker exec -it biz-server bash                     # 进 biz-server 容器
-
-# ── 改了代码后 ──
-docker compose restart                              # 改了 src/ 或 app/ 代码
-
-# ── 改了依赖后 ──
-docker compose up -d --build                        # 改了 requirements.txt 或 pyproject.toml
-
-# ── 只重建单个服务 ──
-docker compose up -d --build spiderclaw             # 只重建 spiderclaw
-docker compose up -d --build biz-server             # 只重建 biz-server
-
-# ── 彻底重来 ──
-docker compose down -v                              # 停止 + 删除容器和数据卷
-docker compose up -d --build                        # 重新构建
 ```
 
-## 说明
+### 查看日志
 
-- spiderclaw 容器默认以 `--no-dashboard` 模式运行，`docker logs` 输出干净
-- 仪表盘需另开终端通过 `docker exec -it spiderclaw-agent spiderclaw` 查看
-- `src/` 和 `app/` 代码改动只需 `restart`，无需重建镜像
-- 依赖变更（requirements.txt / pyproject.toml）需要 `--build` 重建
+```bash
+# SpiderClaw 引擎日志（推荐，干净无 TUI）
+docker logs -f spiderclaw-agent
+docker logs --tail 50 spiderclaw-agent
+
+# biz-server 日志（包含模拟器输出和 collector 日志）
+docker logs -f biz-server
+
+# 仪表盘模式（另开终端执行）
+docker exec -it spiderclaw-agent spiderclaw
+# 如果闪屏，加上 TERM 环境变量：(推荐在vscode打开的终端中进行查看)
+docker exec -it -e TERM=xterm-256color spiderclaw-agent spiderclaw
+# 退出仪表盘：按 Ctrl+C 或 Ctrl+Q
+
+# 进入容器内部调试
+docker exec -it spiderclaw-agent bash
+docker exec -it biz-server bash
+```
+
+### 业务服务模拟器
+
+`biz-server` 容器内置一个业务服务模拟器（`src/service_simulator.py`），模拟真实业务系统运行并产生错误日志，用于测试 AutoFix 的采集 → 分析 → 修复 → 通知完整链路。
+
+#### 8 个错误场景
+
+| 场景名 | 错误类型 | 触发方式 | 说明 |
+|--------|----------|----------|------|
+| `divide_by_zero` | `ZeroDivisionError` | `divide(10, 0)` | 除零错误 |
+| `empty_average` | `ZeroDivisionError` | `average([])` | 空列表求平均 |
+| `negative_sqrt` | `ValueError` | `sqrt_approx(-1)` | 负数平方根 |
+| `user_not_found` | `KeyError` | `get_user(999)` | 查询不存在用户 |
+| `delete_nonexistent_user` | `KeyError` | `delete_user(999)` | 删除不存在用户 |
+| `chain_reaction` | `ZeroDivisionError` | 先除零再空列表 | 连锁异常 |
+| `discount_negative_rate` | 逻辑错误（不抛异常） | `discount(100, -0.5)` | 折扣率为负，结果错误 |
+| `create_duplicate_email` | 逻辑错误（不抛异常） | 重复创建 email | email 未校验唯一性 |
+
+> 注：前 6 个场景会抛出异常，能被 collector 采集到 traceback 并触发自动修复流程。后 2 个为逻辑错误，日志中会记录 ERROR 但无 traceback，不会触发修复。
+
+#### 模拟器三种运行模式
+
+| 模式 | 命令 | 用途 |
+|------|------|------|
+| **持续模式**（默认） | `docker exec biz-server python3 -m src.service_simulator` | 随机间隔触发各场景，模拟真实业务 |
+| **Web 模式** | `docker exec biz-server python3 -m src.service_simulator --mode web` | 通过 HTTP API 远程控制触发 |
+| **单次触发** | `python3 -m src.service_simulator --mode single --trigger divide_by_zero` | 手动指定场景测试 |
+
+环境变量控制：`ERROR_RATE`（错误概率，默认 0.3）、`INTERVAL`（操作间隔，默认 15s）。
+
+### 一键触发测试
+
+测试脚本 `tests/test_biz_error_trigger.sh` 提供多种测试方式，从宿主机直接控制：
+
+#### 方式一：一键触发所有场景（推荐）
+
+```bash
+bash tests/test_biz_error_trigger.sh all
+```
+
+执行顺序：
+1. `divide_by_zero` → `empty_average` → `negative_sqrt` → `user_not_found` → `delete_nonexistent_user` → `chain_reaction`
+2. 最后执行 `src/main.py`（自定义测试代码）
+3. 每个场景间隔 3 秒，等待 collector 采集上报
+
+#### 方式二：只运行自定义测试
+
+```bash
+bash tests/test_biz_error_trigger.sh main
+```
+
+只执行 `src/main.py`，不跑标准场景。通过 collector 的 `exec` 模式捕获错误并上报。适合调试自己的代码。
+
+#### 方式三：持续随机触发
+
+```bash
+bash tests/test_biz_error_trigger.sh continuous 60
+```
+
+每 60 秒随机触发一个错误场景，适合长时间运行测试采集稳定性。
+
+#### 方式四：单个场景触发
+
+```bash
+bash tests/test_biz_error_trigger.sh divide_by_zero
+bash tests/test_biz_error_trigger.sh user_not_found
+bash tests/test_biz_error_trigger.sh chain_reaction
+```
+
+#### 方式五：Web 模式（HTTP 接口）
+
+```bash
+bash tests/test_biz_error_trigger.sh web
+```
+
+启动后可通过 curl 触发：
+```bash
+curl -X POST http://localhost:9000/trigger \
+  -H "Content-Type: application/json" \
+  -d '{"scenario":"divide_by_zero","trigger_bug":true}'
+```
+
+#### 方式六：运行 pytest 测试
+
+```bash
+bash tests/test_biz_error_trigger.sh pytest
+```
+
+通过 collector 的 `exec` 模式运行 pytest，采集测试失败信息上报。
+
+#### 方式七：环境变量自动启动（容器运行时）
+
+在 `docker-compose.yml` 的 `biz-server` 环境变量中添加：
+```yaml
+environment:
+  - SIMULATOR_MODE=continuous    # 持续模式
+  - SIMULATOR_INTERVAL=30        # 30 秒间隔
+  - SIMULATOR_ERROR_RATE=0.3     # 30% 概率触发 bug
+```
+重启后 biz-server 会自动执行业务模拟。
+
+### 自定义代码测试
+
+#### 测试仓库
+
+SpiderClaw 使用专用测试仓库进行验证：
+```
+https://github.com/Dreamt0511/AutoFix_Test_rep
+```
+
+`biz-server` 容器通过卷挂载将该仓库映射到 `/opt/biz-app/app`。
+
+#### 自定义测试流程
+
+如果你想测试自己的代码，按以下步骤操作：
+
+1. **编辑测试仓库中的 `src/main.py`**
+
+   ```python
+   # AutoFix_Test_rep/src/main.py
+   # 写入你想测试的代码，例如：
+   
+   import logging
+   logger = logging.getLogger(__name__)
+   
+   def my_buggy_function():
+       logger.info("运行自定义测试")
+       # 在这里制造一个错误
+       result = 1 / 0  # ZeroDivisionError
+   
+   if __name__ == "__main__":
+       my_buggy_function()
+   ```
+
+2. **推送到 GitHub**（让 SpiderClaw 能拉取到你的测试代码）
+
+   ```bash
+   cd "D:\U 盘\AutoFix_Test_rep"
+   git add src/main.py
+   git commit -m "添加自定义测试"
+   git push
+   ```
+
+3. **在本地同步代码**（SpiderClaw 仓库是读源码的）
+
+   ```bash
+   cd "D:\U 盘\SpiderClaw\data\repos\order-service"
+   git pull
+   ```
+
+4. **运行测试（二选一）**
+
+   ```bash
+   cd "D:\U 盘\SpiderClaw"
+   bash tests/test_biz_error_trigger.sh all      # 标准场景 + main.py
+   bash tests/test_biz_error_trigger.sh main     # 只运行 main.py
+   ```
+
+   - `all`：先跑标准场景，最后执行 `main.py`
+   - `main`：只执行 `main.py`，适合快速调试自己的代码
+
+#### 通过 collector exec 直接运行脚本
+
+```bash
+# 运行 main.py
+docker exec biz-server bash /opt/agent-sidecar/collector.sh exec \
+  python3 /opt/biz-app/app/src/main.py
+
+# 运行 pytest 测试（所有测试文件）
+docker exec biz-server bash /opt/agent-sidecar/collector.sh exec \
+  python3 -m pytest /opt/biz-app/app/src/tests/ -v --tb=long
+
+# 运行单个测试文件
+docker exec biz-server bash /opt/agent-sidecar/collector.sh exec \
+  python3 -m pytest /opt/biz-app/app/src/tests/test_calculator.py -v --tb=long
+```
+
+### 修复记录持久化
+
+系统将修复记录存储在 SQLite 数据库中，并持久化到宿主机：
+
+| 文件 | 说明 | 操作 |
+|------|------|------|
+| `data/repair_records.db` | 修复记录数据库 | 删除此文件后重建容器可清空记录 |
+| `data/repos/` | 克隆的代码仓库 | 自动同步，无需手动 clone |
+
+**清空修复记录**：
+```bash
+# 1. 删除宿主机数据库文件
+rm data/repair_records.db
+
+# 2. 重建容器（会自动创建新的空数据库）
+docker compose up -d --build spiderclaw
+```
+
+### 常见问题
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| 触发多个错误但只修复了第一个 | `run_ci_trigger.sh` 的 `set -e` 导致脚本在第一个错误退出 | 确保 `python3` 命令后有 `|| true` |
+| 容器重建后修复记录还在 | 数据库文件未持久化到宿主机 | 确保 `docker-compose.yml` 挂载了 `./data:/app/data` |
 
 
 

@@ -840,9 +840,39 @@ class RepairOrchestrator:
                             found = True
                             break
                 if not found:
-                    logger.info(f"丢弃错误: 相对路径文件不存在 {fp} -> {full}")
+                    # 尝试 candidate_paths 兜底（runtime_log 的多个候选路径）
+                    candidates = err.get("candidate_paths", [])
+                    found_candidate = False
+                    for c in candidates:
+                        c_cleaned = c.lstrip("/\\").replace("\\", "/")
+                        if c_cleaned.startswith('./') or c_cleaned.startswith('.\\'):
+                            c_cleaned = c_cleaned[2:]
+                        c_full = os.path.abspath(os.path.join(repo_path, c_cleaned))
+                        if c_full.startswith(repo_path_abs) and os.path.isfile(c_full):
+                            rel = os.path.relpath(c_full, repo_path_abs).replace("\\", "/")
+                            valid.append(ErrorLocation(file_path=rel, **base_fields))
+                            logger.info(f"候选路径命中: {fp} -> {rel}")
+                            found_candidate = True
+                            break
+                    if not found_candidate:
+                        logger.info(f"丢弃错误: 相对路径文件不存在 {fp} -> {full}")
             else:
-                logger.info(f"丢弃错误: 相对路径文件不存在 {fp} -> {full}")
+                # 无 path_mapping：尝试 candidate_paths 兜底
+                candidates = err.get("candidate_paths", [])
+                found_candidate = False
+                for c in candidates:
+                    c_cleaned = c.lstrip("/\\").replace("\\", "/")
+                    if c_cleaned.startswith('./') or c_cleaned.startswith('.\\'):
+                        c_cleaned = c_cleaned[2:]
+                    c_full = os.path.abspath(os.path.join(repo_path, c_cleaned))
+                    if c_full.startswith(repo_path_abs) and os.path.isfile(c_full):
+                        rel = os.path.relpath(c_full, repo_path_abs).replace("\\", "/")
+                        valid.append(ErrorLocation(file_path=rel, **base_fields))
+                        logger.info(f"候选路径命中: {fp} -> {rel}")
+                        found_candidate = True
+                        break
+                if not found_candidate:
+                    logger.info(f"丢弃错误: 相对路径文件不存在 {fp} -> {full}")
 
         logger.info(f"有效错误: {len(valid)}/{len(error_locations)}")
         return valid

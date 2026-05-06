@@ -20,7 +20,6 @@ from src.bus.schemas import RuntimeLogEvent
 from src.config.service_registry import get_service_registry
 from src.store.repair_store import get_pending_event_store, get_pending_push_store
 from src.utils.audit import audit_logger
-from src.utils.rate_limiter import ServiceRateLimiter
 from src.utils.version_manager import pre_sync_repos
 
 class SafeRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
@@ -563,6 +562,7 @@ def run_webhook_server(
     from src.utils.logging import get_logger
     from src.bus import get_event_bus, GitHubEvent
     from src.bus.schemas import RuntimeLogEvent
+    from src.config.service_registry import get_service_registry
     from src.agent.orchestrator import RepairOrchestrator
 
     # 构建配置覆盖
@@ -708,25 +708,49 @@ def run_webhook_server(
     # 显示启动面板（dashboard 模式不重复输出）
     if console_output:
         repair_status = "[green]已启用[/green]" if orchestrator else "[dim]未启用[/dim]"
+        lark_status = "[green]已启用[/green]" if settings.lark.enabled else "[dim]未启用[/dim]"
+
+        # 审批状态
+        require_approval = getattr(settings.agent, "require_human_approval", False)
+        pr_approval_status = "[green]已启用[/green]" if require_approval else "[dim]未启用[/dim]"
+        event_threshold = getattr(settings.agent, "pending_event_auto_threshold", 5)
+        event_approval_status = (
+            f"[green]堆积 >{event_threshold} 个触发[/green]"
+            if settings.lark.enabled else "[dim]飞书未配置[/dim]"
+        )
+
+        # 注册服务统计
+        try:
+            svc_list = get_service_registry().all()
+            svc_count = len(svc_list)
+            svc_names = ", ".join(s.name for s in svc_list[:5])
+            if len(svc_list) > 5:
+                svc_names += f" [#5a6b7c]...等 {svc_count} 个[/#5a6b7c]"
+        except Exception:
+            svc_count = "?"
+            svc_names = "[dim]加载失败[/dim]"
+
+        qsize = getattr(settings.webhook, "event_queue_maxsize", 10000)
+
         console.print(Panel(
             f"[bold #ffffff]SpiderClaw 总监控服务已启动[/bold #ffffff]\n\n"
-            f"监听地址: [bold #20d5f0]http://{host}:{port}[/bold #20d5f0]\n"
-            f"Webhook端点: [bold #20d5f0]/webhook/github[/bold #20d5f0]\n"
-            f"健康检查: [bold #20d5f0]/health[/bold #20d5f0]\n"
-            f"允许事件: [bold #20d5f0]{', '.join(settings.webhook.allowed_events)}[/bold #20d5f0]\n"
-            f"自动修复: [bold #20d5f0]{repair_status}[/bold #20d5f0]\n\n"
+            f"监听地址:          [bold #20d5f0]http://{host}:{port}[/bold #20d5f0]\n"
+            f"GitHub CI 端点:    [bold #20d5f0]/webhook/github[/bold #20d5f0]\n"
+            f"远程日志端点:      [bold #20d5f0]/webhook/log[/bold #20d5f0]\n"
+            f"健康检查:          [bold #20d5f0]/health[/bold #20d5f0]\n"
+            f"允许事件:          [bold #20d5f0]{', '.join(settings.webhook.allowed_events)}[/bold #20d5f0]\n"
+            f"注册服务:          [bold #20d5f0]{svc_names}[/bold #20d5f0]\n"
+            f"事件队列:          [bold #20d5f0]容量 {qsize}，不限流[/bold #20d5f0]\n"
+            f"自动修复:          {repair_status}\n"
+            f"飞书通知:          {lark_status}\n"
+            f"  ├ PR 审批:        {pr_approval_status}\n"
+            f"  └ 事件恢复审批:   {event_approval_status}\n\n"
             f"[#5a6b7c]备注：开发环境下可以使用 ngrok http 8000 来暴露服务，方便外部访问[#5a6b7c]\n",
             title="[bold #20d5f0]SpiderClaw 运行中[/bold #20d5f0]",
             border_style="#20d5f0",
             padding=(1, 2)
         ))
         console.print()
-
-    # 初始化限流器
-    rate_limiter = ServiceRateLimiter(
-        max_per_minute=get_service_registry().rate_limit.max_fixes_per_minute,
-        max_per_hour=get_service_registry().rate_limit.max_fixes_per_hour,
-    )
 
     import threading
     approval_ws_ready = asyncio.Event()
@@ -897,16 +921,9 @@ def run_webhook_server(
                 pending_store.mark_processing(event.event_id)
 
                 # 远程日志事件处理：缓冲聚合，不立即处理
+                # 不限流 — 事件总线有 10000 队列容量，缓冲层 5s 窗口合并同服务事件
+                # 修复锁保证串行执行，不会因并发导致资源竞争
                 if isinstance(event, RuntimeLogEvent):
-                    if not await rate_limiter.check(event.service):
-                        log.warning(f"服务 {event.service} 触发限流，跳过")
-                        if rate_limiter.should_alert(event.service):
-                            log.error(f"服务 {event.service} 持续限流，请人工检查")
-                        pending_store.delete(event.event_id)
-                        event_bus.mark_done()
-                        continue
-                    await rate_limiter.record(event.service)
-
                     # 加入缓冲
                     svc = event.service
                     if svc not in _runtime_buffer:

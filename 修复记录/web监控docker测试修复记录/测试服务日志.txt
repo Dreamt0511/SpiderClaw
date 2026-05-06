@@ -1,0 +1,179 @@
+PS D:\U 盘\SpiderClaw> bash tests/test_biz_error_trigger.sh all
+==========================================
+  SpiderClaw 业务服务错误触发测试
+==========================================
+
+检查环境...
+  ✅ spiderclaw-agent 运行中
+  ✅ biz-server 运行中
+
+SpiderClaw Agent 状态:
+{
+    "status": "ok",
+    "service": "github-webhook",
+    "start_time": "2026-05-06T19:46:32.915271",
+    "queue_size": 0,
+    "published_count": 2,
+    "dropped_count": 0,
+    "duplicate_count": 0,
+    "processed_ids_count": 2,
+    "uptime_seconds": 16877.793705
+}
+
+==========================================
+将在 5 秒后依次触发所有错误场景...
+请观察 SpiderClaw 的修复流程。
+
+查看 Agent 日志: docker logs spiderclaw-agent -f
+查看采集器日志: docker logs biz-server
+查看修复详情: cat src/logs/audit.jsonl
+将在 5 秒后依次触发所有错误场景...
+请确保 SpiderClaw Agent 已启动，并观察修复流程。
+
+==========================================
+  触发场景: divide_by_zero
+==========================================
+2026-05-06 16:28:13 [INFO] service_simulator: 单次触发模式: scenario=divide_by_zero, trigger_bug=True
+2026-05-06 16:28:13 [INFO] calculator: divide(10, 0)
+2026-05-06 16:28:13 [ERROR] calculator: divide(10, 0) 除零异常
+Traceback (most recent call last):
+  File "/opt/biz-app/app/src/calculator.py", line 11, in divide
+    return a / b
+ZeroDivisionError: division by zero
+2026-05-06 16:28:13 [ERROR] service_simulator: [divide_by_zero] 触发 bug — 异常: ZeroDivisionError: division by zero
+Traceback (most recent call last):
+  File "/opt/biz-app/app/src/service_simulator.py", line 92, in run_scenario
+    fn()
+  File "/opt/biz-app/app/src/service_simulator.py", line 41, in <lambda>
+    "buggy": lambda: divide(10, 0),
+  File "/opt/biz-app/app/src/calculator.py", line 11, in divide
+    return a / b
+ZeroDivisionError: division by zero
+
+==========================================
+  触发场景: empty_average
+==========================================
+2026-05-06 16:28:17 [INFO] service_simulator: 单次触发模式: scenario=empty_average, trigger_bug=True
+2026-05-06 16:28:17 [INFO] calculator: average([])
+2026-05-06 16:28:17 [ERROR] calculator: average([]) 空列表求平均异常
+Traceback (most recent call last):
+  File "/opt/biz-app/app/src/calculator.py", line 22, in average
+    return total / len(numbers)
+ZeroDivisionError: division by zero
+2026-05-06 16:28:17 [ERROR] service_simulator: [empty_average] 触发 bug — 异常: ZeroDivisionError: division by zero
+Traceback (most recent call last):
+  File "/opt/biz-app/app/src/service_simulator.py", line 92, in run_scenario
+    fn()
+  File "/opt/biz-app/app/src/service_simulator.py", line 46, in <lambda>
+    "buggy": lambda: average([]),
+  File "/opt/biz-app/app/src/calculator.py", line 22, in average
+    return total / len(numbers)
+ZeroDivisionError: division by zero
+
+==========================================
+  触发场景: negative_sqrt
+==========================================
+2026-05-06 16:28:20 [INFO] service_simulator: 单次触发模式: scenario=negative_sqrt, trigger_bug=True
+2026-05-06 16:28:20 [INFO] calculator: sqrt_approx(-1, guess=1.0)
+2026-05-06 16:28:20 [ERROR] calculator: sqrt_approx(-1) 计算异常
+Traceback (most recent call last):
+  File "/opt/biz-app/app/src/calculator.py", line 41, in sqrt_approx
+    guess = (guess + x / guess) / 2
+ZeroDivisionError: float division by zero
+2026-05-06 16:28:20 [ERROR] service_simulator: [negative_sqrt] 触发 bug — 异常: ZeroDivisionError: float division by zero
+Traceback (most recent call last):
+  File "/opt/biz-app/app/src/service_simulator.py", line 92, in run_scenario
+    fn()
+  File "/opt/biz-app/app/src/service_simulator.py", line 51, in <lambda>
+    "buggy": lambda: sqrt_approx(-1),
+  File "/opt/biz-app/app/src/calculator.py", line 41, in sqrt_approx
+    guess = (guess + x / guess) / 2
+ZeroDivisionError: float division by zero
+
+==========================================
+  触发场景: user_not_found
+==========================================
+2026-05-06 16:28:24 [INFO] service_simulator: 单次触发模式: scenario=user_not_found, trigger_bug=True
+2026-05-06 16:28:24 [INFO] user_service: get_user(999)
+2026-05-06 16:28:24 [ERROR] user_service: get_user(999) 用户不存在
+Traceback (most recent call last):
+  File "/opt/biz-app/app/src/user_service.py", line 17, in get_user
+    return USERS[user_id]
+KeyError: 999
+2026-05-06 16:28:24 [ERROR] service_simulator: [user_not_found] 触发 bug — 异常: KeyError: 999
+Traceback (most recent call last):
+  File "/opt/biz-app/app/src/service_simulator.py", line 92, in run_scenario
+    fn()
+  File "/opt/biz-app/app/src/service_simulator.py", line 56, in <lambda>
+    "buggy": lambda: get_user(999),
+  File "/opt/biz-app/app/src/user_service.py", line 17, in get_user
+    return USERS[user_id]
+KeyError: 999
+
+==========================================
+  触发场景: delete_nonexistent_user
+==========================================
+2026-05-06 16:28:27 [INFO] service_simulator: 单次触发模式: scenario=delete_nonexistent_user, trigger_bug=True
+2026-05-06 16:28:27 [INFO] user_service: delete_user(999)
+2026-05-06 16:28:27 [ERROR] user_service: delete_user(999) 用户不存在，删除失败
+Traceback (most recent call last):
+  File "/opt/biz-app/app/src/user_service.py", line 46, in delete_user
+    del USERS[user_id]
+KeyError: 999
+2026-05-06 16:28:27 [ERROR] service_simulator: [delete_nonexistent_user] 触发 bug — 异常: KeyError: 999
+Traceback (most recent call last):
+  File "/opt/biz-app/app/src/service_simulator.py", line 92, in run_scenario
+    fn()
+  File "/opt/biz-app/app/src/service_simulator.py", line 61, in <lambda>
+    "buggy": lambda: delete_user(999),
+  File "/opt/biz-app/app/src/user_service.py", line 46, in delete_user
+    del USERS[user_id]
+KeyError: 999
+
+==========================================
+  触发场景: chain_reaction
+==========================================
+2026-05-06 16:28:30 [INFO] service_simulator: 单次触发模式: scenario=chain_reaction, trigger_bug=True
+2026-05-06 16:28:30 [INFO] calculator: divide(10, 0)
+2026-05-06 16:28:30 [ERROR] calculator: divide(10, 0) 除零异常
+Traceback (most recent call last):
+  File "/opt/biz-app/app/src/calculator.py", line 11, in divide
+    return a / b
+ZeroDivisionError: division by zero
+2026-05-06 16:28:30 [ERROR] service_simulator: [chain_reaction] 触发 bug — 异常: ZeroDivisionError: division by zero
+Traceback (most recent call last):
+  File "/opt/biz-app/app/src/service_simulator.py", line 92, in run_scenario
+    fn()
+  File "/opt/biz-app/app/src/service_simulator.py", line 77, in <lambda>
+    "buggy": lambda: (divide(10, 0), average([])),
+  File "/opt/biz-app/app/src/calculator.py", line 11, in divide
+    return a / b
+ZeroDivisionError: division by zero
+
+==========================================
+  执行自定义测试: src/main.py
+==========================================
+2026-05-06 16:28:34,079 [INFO] __main__: divide(10, 0)
+2026-05-06 16:28:34,079 [ERROR] __main__: divide(10, 0) 除零异常
+Traceback (most recent call last):
+  File "/opt/biz-app/app/src/main.py", line 18, in divide
+    return a / b
+ZeroDivisionError: division by zero
+Traceback (most recent call last):
+  File "/usr/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/usr/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/opt/biz-app/app/src/main.py", line 82, in <module>
+    divide(10, 0)
+  File "/opt/biz-app/app/src/main.py", line 18, in divide
+    return a / b
+ZeroDivisionError: division by zero
+
+所有场景已触发完毕。
+查看 Agent 日志: docker logs spiderclaw-agent -f
+查看 biz-server 日志: docker logs biz-server
+
+测试完成。
+查看修复流程: docker logs spiderclaw-agent -f
+PS D:\U 盘\SpiderClaw>

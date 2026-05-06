@@ -27,7 +27,7 @@ MAX_BACKOFF="${MAX_BACKOFF:-300}"
 LAST_HASH=""
 BACKOFF=1
 ERROR_CACHE=""
-LAST_SEND_TIME=0
+LAST_SEND_TIME=$(date +%s)
 LINE_COUNT=0
 COLLECTING=0
 
@@ -171,46 +171,58 @@ flush_cache() {
 
 start_monitoring() {
     echo "SpiderClaw collector started: service=$SERVICE_NAME log=$LOG_PATH"
-    tail -n0 -F "$LOG_PATH" 2>/dev/null | while IFS= read -r line; do
-        # 移除 Windows 换行符
-        line="${line%$'\r'}"
+    touch "$LOG_PATH" 2>/dev/null || true
+    while true; do
+        # 内层循环：读取日志行，超时则退出（避免 while read 永久阻塞导致最后一批错误无法刷出）
+        # 注意：|| true 防止 set -e 因 read -t 超时 SIGPIPE 退出脚本
+        tail -n0 -F "$LOG_PATH" 2>/dev/null | while IFS= read -r -t "$BATCH_INTERVAL" line; do
+            # 移除 Windows 换行符
+            line="${line%$'\r'}"
 
-        # ── 1. 时间戳行：新日志条目的开始 ──
-        if echo "$line" | grep -qP '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}'; then
-            if [ "$COLLECTING" -eq 1 ]; then
-                COLLECTING=0
-            fi
-            if echo "$line" | grep -qiE "$ERROR_KEYWORDS"; then
+            # ── 1. 时间戳行：新日志条目的开始 ──
+            if echo "$line" | grep -qP '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}'; then
+                if [ "$COLLECTING" -eq 1 ]; then
+                    COLLECTING=0
+                    # 新错误到来，先把上一组错误的缓存刷出
+                    flush_cache
+                fi
+                if echo "$line" | grep -qiE "$ERROR_KEYWORDS"; then
+                    ERROR_CACHE="${ERROR_CACHE}${line}\n"
+                    LINE_COUNT=$((LINE_COUNT + 1))
+                    COLLECTING=1
+                    # 等待 traceback 写入（避免竞态条件）
+                    sleep 0.5
+                fi
+
+            # ── 2. Python 解释器输出（无时间戳的 Traceback/语法错误等）──
+            elif echo "$line" | grep -qE "$PYTHON_INTERPRETER_PATTERN"; then
+                if [ "$COLLECTING" -eq 0 ]; then
+                    COLLECTING=1
+                    ERROR_CACHE="[no-timestamp at $(date '+%Y-%m-%d %H:%M:%S')]\n"
+                    LINE_COUNT=0
+                fi
                 ERROR_CACHE="${ERROR_CACHE}${line}\n"
                 LINE_COUNT=$((LINE_COUNT + 1))
-                COLLECTING=1
-                # 等待 traceback 写入（避免竞态条件）
-                sleep 0.5
+
+            # ── 3. 采集模式下的续行（堆栈帧、异常描述等）──
+            elif [ "$COLLECTING" -eq 1 ]; then
+                ERROR_CACHE="${ERROR_CACHE}${line}\n"
+                LINE_COUNT=$((LINE_COUNT + 1))
+
             fi
 
-        # ── 2. Python 解释器输出（无时间戳的 Traceback/语法错误等）──
-        elif echo "$line" | grep -qE "$PYTHON_INTERPRETER_PATTERN"; then
-            if [ "$COLLECTING" -eq 0 ]; then
-                COLLECTING=1
-                ERROR_CACHE="[no-timestamp at $(date '+%Y-%m-%d %H:%M:%S')]\n"
-                LINE_COUNT=0
+            # 批量发送（基于行数）
+            if [ "$LINE_COUNT" -ge "$MAX_BATCH_LINES" ]; then
+                COLLECTING=0
+                flush_cache
             fi
-            ERROR_CACHE="${ERROR_CACHE}${line}\n"
-            LINE_COUNT=$((LINE_COUNT + 1))
-
-        # ── 3. 采集模式下的续行（堆栈帧、异常描述等）──
-        elif [ "$COLLECTING" -eq 1 ]; then
-            ERROR_CACHE="${ERROR_CACHE}${line}\n"
-            LINE_COUNT=$((LINE_COUNT + 1))
-
-        fi
-
-        # 批量发送
-        if [ "$LINE_COUNT" -ge "$MAX_BATCH_LINES" ] || \
-           ([ $(( $(date +%s) - LAST_SEND_TIME )) -ge "$BATCH_INTERVAL" ] && [ "$LINE_COUNT" -gt 0 ]); then
+        done || true
+        # 超时或管道断开：刷出最后一批错误
+        if [ "$LINE_COUNT" -gt 0 ]; then
             COLLECTING=0
             flush_cache
         fi
+        sleep 1
     done
 }
 

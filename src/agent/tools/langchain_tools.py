@@ -760,6 +760,7 @@ def parse_python_errors(log_content: str) -> List[Dict]:
                 local_errors.append({
                     "type": "runtime_log",
                     "file_path": file_path,
+                    "candidate_paths": candidate_paths,
                     "line_number": line_number,
                     "error_type": error_type,
                     "error_message": message,

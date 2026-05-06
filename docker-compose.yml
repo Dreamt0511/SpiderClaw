@@ -15,7 +15,9 @@ services:
       - C:\Users\dream time\.gitconfig:/root/.gitconfig:ro
       - C:\Users\dream time\.ssh:/root/.ssh:ro
       # 直接挂载你本地已经克隆好的仓库，不需要容器内clone
-      - ./data/repos:/app/data/repos
+      # data/ 包含 repos/ 子目录和 repair_records.db 数据库文件
+      # 删除主机 data/repair_records.db 并重建容器即可清空修复记录
+      - ./data:/app/data
       # 日志挂载
       - spiderclaw-logs:/app/src/logs
     env_file:
